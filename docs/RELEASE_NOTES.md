@@ -6,8 +6,8 @@
 
 | 类型 | 文件 | SHA-256 |
 | --- | --- | --- |
-| 安装版 | [Web-Harness-3.1.2-Setup.exe](https://github.com/jamesmendax/chatgpt-web-harness/releases/download/v3.1.2/Web-Harness-3.1.2-Setup.exe) | `63c815f61f8c598685c3bfee48a59e833cc6cae932ecdf4d611b782d65142bb6` |
-| 便携版 | [Web-Harness-3.1.2-Portable.exe](https://github.com/jamesmendax/chatgpt-web-harness/releases/download/v3.1.2/Web-Harness-3.1.2-Portable.exe) | `ca3ec04d6368477ff63407da209ad216971fb94cad96dd97b624c3e914ca9d9c` |
+| 安装版 | [Web-Harness-3.1.2-Setup.exe](https://github.com/jamesmendax/chatgpt-web-harness/releases/download/v3.1.2/Web-Harness-3.1.2-Setup.exe) | `596c2ff5084c53145c526a5ed0dd8ee3178503b560562e8b926f545d5332da2b` |
+| 便携版 | [Web-Harness-3.1.2-Portable.exe](https://github.com/jamesmendax/chatgpt-web-harness/releases/download/v3.1.2/Web-Harness-3.1.2-Portable.exe) | `58166614285f27c04378e886fcfc4c737eeb493f4fa716344c70e40a27c31c48` |
 
 ## 功能
 

@@ -1,6 +1,6 @@
 {
   "name": "chatgpt-web-harness-isolated",
-  "version": "3.1.0-alpha.2",
+  "version": "3.1.2",
   "description": "ChatGPT Web Harness 桌面启动器：多账号隔离配置、独立 MCP / Secure MCP Tunnel 生命周期与实时活动日志",
   "private": true,
   "main": "src/main.js",
