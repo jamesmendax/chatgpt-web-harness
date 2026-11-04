@@ -1,0 +1,18 @@
+"use strict";
+const {test}=require("node:test"), assert=require("node:assert/strict"), fs=require("node:fs"), path=require("node:path"), vm=require("node:vm");
+const html=fs.readFileSync(path.join(__dirname,"../renderer/index.html"),"utf8");
+const source=fs.readFileSync(path.join(__dirname,"../renderer/app.js"),"utf8");
+function harness(){
+ const nodes=new Map();
+ for(const match of html.matchAll(/\bid="([^"]+)"/g)) nodes.set(match[1],{textContent:"",title:"",value:"",checked:false,disabled:false,hidden:false,innerHTML:"",classList:{toggle(){},add(){},remove(){}},label:{textContent:""},dot:{className:""},querySelector(q){if(q==="[data-label]")return this.label;if(q===".dot")return this.dot;return null;}});
+ const ctx=vm.createContext({console,document:{getElementById(id){assert.ok(nodes.has(id),"Missing renderer element: "+id);return nodes.get(id);}}});
+ assert.match(source,/\ninit\(\);\s*$/);vm.runInContext(source.replace(/\ninit\(\);\s*$/,"\n"),ctx);
+ function render(tunnel={}){ctx.snapshot={at:Date.now(),busy:false,config:{setupDone:true,tunnelId:"tunnel_fixture",mcpPort:3000,adminPort:3001,tunnelPort:8080,workspacePath:"D:/fixture"},mcp:{healthy:true,managed:true,state:"running",pid:1,toolCount:30,toolProfile:"slim"},tunnel:{state:"running",managed:true,ready:true,reachable:true,pid:2,cloudState:"unknown",...tunnel},paths:{codeRoot:"fixture-code",runtimeDir:"fixture-runtime"}};vm.runInContext("renderStatus(snapshot)",ctx);return nodes;}
+ return {render,ctx,nodes};
+}
+test("local ready alone never means cloud online",()=>{for(const managed of [true,false]){const {render}=harness();const n=render({managed});assert.match(n.get("badge-tunnel").label.textContent,/云端待确认/);assert.match(n.get("tunnel-ready").textContent,/仅本地/);assert.doesNotMatch(n.get("badge-tunnel").dot.className,/\bok\b/);}});
+test("EOF is a cloud-network warning, not a credential rejection",()=>{const {render}=harness();const n=render({cloudState:"error",metaError:{line:"poll failed; backing off: unexpected EOF"}});assert.match(n.get("badge-tunnel").label.textContent,/云端连接异常/);assert.match(n.get("tunnel-cloud").textContent,/代理.*网络/);assert.doesNotMatch(n.get("tunnel-cloud").textContent,/认证失败/);});
+test("authentication error is shown distinctly",()=>{const {render}=harness();const n=render({authError:{line:"status=401 unauthorized"},cloudState:"error"});assert.match(n.get("badge-tunnel").label.textContent,/401/);assert.match(n.get("tunnel-cloud").textContent,/认证失败/);});
+test("fresh cloud metric permits online and shows current proxy route",()=>{const {render}=harness();const n=render({cloudState:"online",lastPollSuccessAt:Date.now(),proxyRoute:{mode:"proxy",source:"system",url:"http://127.0.0.1:7890"}});assert.equal(n.get("badge-tunnel").label.textContent,"云端已连接");assert.match(n.get("tunnel-cloud").textContent,/最近成功/);assert.match(n.get("tunnel-route").textContent,/127.0.0.1:7890/);});
+test("stale cloud metric warns despite local readiness",()=>{const {render}=harness();const n=render({cloudState:"stale",lastPollSuccessAt:Date.now()-120000});assert.match(n.get("badge-tunnel").label.textContent,/过期/);assert.match(n.get("tunnel-cloud").textContent,/长时间/);});
+test("proxy configuration fields round-trip with safe defaults",()=>{const h=harness();h.render();vm.runInContext("fillSetupForm()",h.ctx);assert.equal(h.nodes.get("f-tunnel-proxy-mode").value,"auto");assert.equal(h.nodes.get("f-tunnel-proxy-url").disabled,true);h.nodes.get("f-tunnel-proxy-mode").value="custom";h.nodes.get("f-tunnel-proxy-url").value="http://127.0.0.1:7890";const payload=vm.runInContext("readSetupForm()",h.ctx);assert.equal(payload.tunnelProxyMode,"custom");assert.equal(payload.tunnelProxyUrl,"http://127.0.0.1:7890");});

@@ -1,0 +1,52 @@
+appId: com.chatgpt-web-harness.isolated
+productName: ChatGPT Web Harness Isolated
+copyright: MIT
+publish: null
+directories:
+  output: release-3.1.0-alpha.2
+  buildResources: build
+files:
+  - src/**
+  - "!src/companion-*.js"
+  - renderer/**
+  - package.json
+extraResources:
+  - from: staging/harness
+    to: harness
+  # electron-builder drops a root-level node_modules directory when it is
+  # copied as part of another resource; map it explicitly to retain runtime deps.
+  - from: staging/harness/node_modules
+    to: harness/node_modules
+  - from: build/icon.png
+    to: icon.png
+  - from: build/aura-icons
+    to: aura-icons
+asar: true
+compression: normal
+win:
+  target:
+    - target: nsis
+      arch: [x64]
+    - target: portable
+      arch: [x64]
+  icon: build/icon.ico
+  artifactName: "${productName}-${version}-${arch}.${ext}"
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: ChatGPT Web Harness Isolated
+  artifactName: "${productName}-${version}-setup.${ext}"
+  include: build/installer.nsh
+  deleteAppDataOnUninstall: false
+portable:
+  artifactName: "${productName}-${version}-portable.${ext}"
+  # The build script patches electron-builder's portable NSIS template to use
+  # a short per-process $TEMP\cgh-<pid> root. This keeps the complete runtime
+  # tree below MAX_PATH while preserving concurrent launch isolation.
+  # NSIS zlib extraction starts the same single-file EXE faster than the
+  # separate LZMA package; the offline browser ZIP stays compressed at boot.
+  useZip: true
+  unpackDirName: true

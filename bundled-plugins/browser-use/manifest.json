@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "id": "browser-use",
+  "name": "Browser Use",
+  "version": "0.13.10+harness.1",
+  "provider": "browser-use-official",
+  "protocol_version": 1,
+  "license": "MIT",
+  "platforms": ["win32-x64"],
+  "runtime": "vendor/browser-use",
+  "tools": ["browser_use_exec", "browser_use_screenshot"],
+  "default_enabled": false,
+  "telemetry_default": "disabled",
+  "upstream": {
+    "repository": "https://github.com/browser-use/browser-use.git",
+    "version": "0.13.10",
+    "commit": "5c892e013a73e6622e6f50336e1eb0aa2c4405f2",
+    "browser_harness_version": "0.1.13",
+    "browser_harness_commit": "c24e5072ee66f8499bacd663f4f4bcb089bc4492"
+  }
+}

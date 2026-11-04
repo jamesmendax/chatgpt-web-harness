@@ -1,0 +1,40 @@
+import assert from 'node:assert/strict';
+import fs from 'node:fs/promises';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import vm from 'node:vm';
+
+const root=path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const source=await fs.readFile(path.join(root,'browser-companion','content.js'),'utf8');
+const patterns=source.match(/const CONNECTION_INTERRUPTED_PATTERNS = \[[\s\S]*?\];/)?.[0];
+const start=source.indexOf('function connectionInterrupted()');
+const end=source.indexOf('function adapterConfidence()',start);
+assert.ok(patterns && start>=0 && end>start);
+let alerts=[], buttons=[], transcript=[];
+const sandbox={visible:element=>!element.hidden,document:{querySelectorAll(selector){
+  if(selector==="[role='alert']") return alerts;
+  if(selector==='button') return buttons;
+  if(selector==='article') return transcript;
+  return [];
+}}};
+vm.createContext(sandbox);
+vm.runInContext(patterns+'\n'+source.slice(start,end),sandbox);
+function reset(){alerts=[];buttons=[];transcript=[];}
+const error='ChatGPT stream recovery polling timed out';
+alerts=[{innerText:error}];
+assert.equal(sandbox.connectionInterrupted(),true,'native stream recovery timeout must be recognized on an actual error surface');
+alerts=[{innerText:'Message delivery timed out'}];
+assert.equal(sandbox.connectionInterrupted(),true,'older delivery error detection must be retained');
+alerts=[{innerText:error,hidden:true}];
+assert.equal(sandbox.connectionInterrupted(),false,'hidden stale alerts must not become live failure truth');
+reset();transcript=[{innerText:'Explain this message: '+error}];
+assert.equal(sandbox.connectionInterrupted(),false,'ordinary transcript discussion is not runtime evidence');
+reset();const surface={innerText:error,parentElement:null};
+buttons=[{textContent:'Retry',getAttribute:()=>null,parentElement:surface}];
+assert.equal(sandbox.connectionInterrupted(),true,'the screenshot-style local Retry/error pair must be recognized');
+reset();buttons=[{textContent:'Retry',getAttribute:()=>null,parentElement:{innerText:'Try your request again',parentElement:null}}];
+assert.equal(sandbox.connectionInterrupted(),false,'generic Retry alone must remain a separate signal, not this error category');
+reset();const page={innerText:'User discussion: '+error,tagName:'MAIN',parentElement:null};
+buttons=[{textContent:'Retry',getAttribute:()=>null,parentElement:{innerText:'Unrelated failure',parentElement:page}}];
+assert.equal(sandbox.connectionInterrupted(),false,'Retry ancestry must not escape into the whole transcript/page');
+console.log('native-stream-failure: 7 scoped DOM regression assertions PASS');

@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Web Harness · 用户通行密钥注册</title>
+<style>
+:root{font-family:system-ui,"Microsoft YaHei",sans-serif;color-scheme:light dark}body{max-width:670px;margin:40px auto;padding:0 24px;line-height:1.6}
+button{font:inherit;font-weight:600;border:0;padding:12px 18px;background:#1b62b8;color:white;border-radius:7px;cursor:pointer}
+pre{white-space:pre-wrap;word-break:break-word;padding:16px;border:1px solid #999;border-radius:6px}p{margin:12px 0}
+.small{font-size:.91em;opacity:.85}
+</style></head><body>
+<h1>注册用户通行密钥</h1>
+<p>这是一个<strong>需要你本人操作</strong>的一次性配置步骤。浏览器会要求使用 Windows Hello、PIN 或安全密钥。</p>
+<p>生成的是新的 WebAuthn 通行密钥，私钥由认证器保管；页面只显示公钥、凭据 ID 和验证来源，不会把密钥发给聊天模型，也不会自动修改运行中的 Web Harness。</p>
+<p class="small">必须从 <code>http://localhost:独立端口/approval/enroll</code> 打开。请勿从第三方网站注册或复制未经核验的“公钥配置”。公开凭据必须由可信运营者独立固定并保护，不能靠模型文本自我认证。</p>
+<button type="button" id="enroll">本人确认，注册新的通行密钥</button>
+<p id="status" role="status"></p>
+<h2>注册结果（仅公钥，需独立固定）</h2><pre id="output">尚未注册</pre>
+<script>
+(() => {
+  const status=document.getElementById("status");
+  const output=document.getElementById("output");
+  const toB64url=(buf)=>{
+    let s="";for(const b of new Uint8Array(buf))s+=String.fromCharCode(b);
+    return btoa(s).replace(/\+/g,"-").replace(/\//g,"_").replace(/=+$/,"");
+  };
+  document.getElementById("enroll").addEventListener("click",async()=>{
+    status.textContent="等待浏览器系统身份验证…";
+    try{
+      if(location.hostname!=="localhost"||!window.isSecureContext)throw Error("必须使用安全的 localhost 页面");
+      const credential=await navigator.credentials.create({publicKey:{
+        rp:{name:"Web Harness · 独立用户批准",id:"localhost"},
+        user:{id:crypto.getRandomValues(new Uint8Array(24)),
+          name:"web-harness-local-owner",displayName:"本机 Web Harness 操作者"},
+        challenge:crypto.getRandomValues(new Uint8Array(32)),
+        pubKeyCredParams:[{type:"public-key",alg:-7}],
+        authenticatorSelection:{residentKey:"preferred",userVerification:"required"},
+        timeout:120000,attestation:"none",
+      }});
+      if(!credential?.response?.getPublicKey)throw Error("当前浏览器不支持读取注册公钥");
+      const spki=credential.response.getPublicKey();
+      const algorithm=credential.response.getPublicKeyAlgorithm();
+      if(!spki||algorithm!==-7)throw Error("仅支持 P-256 ES256 通行密钥");
+      output.textContent=JSON.stringify({
+        schema_version:1,
+        credential_id:toB64url(credential.rawId),
+        public_key_spki_base64url:toB64url(spki),
+        rp_id:"localhost",
+        origin:location.origin,
+      },null,2);
+      status.textContent="注册请求已经由系统认证器处理。请让可信运营者独立核验并固定公钥；此页面不会自动启用批准服务。";
+    }catch(e){status.textContent="注册未完成："+e.message;}
+  });
+})();
+</script></body></html>

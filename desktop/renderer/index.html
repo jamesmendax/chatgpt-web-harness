@@ -1,0 +1,815 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:;"/>
+<meta name="color-scheme" content="light dark"/>
+<meta name="theme-color" content="#16322e"/>
+<title>ChatGPT Web Harness</title>
+<link rel="stylesheet" href="styles.css"/>
+</head>
+<body class="is-loading" data-view="dashboard">
+<a class="skip-link" href="#main-content">跳转到主要内容</a>
+<header class="page-header">
+<div class="brand" title="ChatGPT Web Harness Isolated">
+<span class="brand-logo">
+<svg viewBox="0 0 32 32" aria-hidden="true">
+<path d="M4 4h8v9h8V4h8v24h-8v-9h-8v9H4z" fill="currentColor"/>
+<path d="m12 13 8 6" stroke="var(--header)" stroke-width="2"/>
+</svg>
+</span>
+<span class="wordmark">harness</span>
+<span class="brand-edition">desktop</span>
+</div>
+<nav class="sidebar sidebar-nav" aria-label="主要页面">
+<button class="nav-item active" data-view="dashboard" title="工作空间 · Alt 1">
+<span>工作空间</span>
+<kbd>1</kbd>
+</button>
+<button class="nav-item" data-view="skills" title="能力库 · Alt 2">
+<span>能力库</span>
+<kbd>2</kbd>
+</button>
+<button class="nav-item" data-view="logs" title="事件日志 · Alt 3">
+<span>事件日志</span>
+<kbd>3</kbd>
+</button>
+<button class="nav-item" data-view="settings" title="连接设置 · Alt 4">
+<span>连接设置</span>
+<kbd>4</kbd>
+</button>
+</nav>
+<div class="header-actions">
+<span class="preview-label" id="preview-label" hidden>隔离预览 · 测试数据</span>
+<button class="icon-button" id="btn-diagnostics" title="运行信息" aria-label="查看当前运行信息">
+<span class="icon" data-icon="info" aria-hidden="true">
+</span>
+</button>
+<details class="account-switcher" id="account-popover">
+<summary class="account-trigger">
+<span id="account-avatar" class="account-avatar">H</span>
+<span class="account-trigger-text">
+<strong id="current-account-name">工作账户</strong>
+<small id="current-account-id">正在读取</small>
+</span>
+<span class="chevron" aria-hidden="true">
+</span>
+</summary>
+<div class="account-menu">
+<div class="account-label">工作账户 <span id="account-count">—</span>
+</div>
+<label for="account-select">切换账户</label>
+<select id="account-select" aria-label="选择账户">
+</select>
+<div class="account-meta" id="account-meta">正在读取账户…</div>
+<div class="account-actions">
+<button id="btn-account-create" class="ghost small">
+<span class="icon" data-icon="plus" aria-hidden="true">
+</span>新账户</button>
+<button id="btn-account-rename" class="ghost small">重命名</button>
+</div>
+</div>
+</details>
+</div>
+</header>
+<div class="view-context">
+<div>
+<h1 id="page-title" class="page-title">工作台</h1>
+<span class="context-slash">/</span>
+<span id="page-context">本地运行环境</span>
+</div>
+<span class="header-status" id="header-status">正在同步</span>
+</div>
+<div class="runtime-notice" id="runtime-notice" role="status" hidden>
+</div>
+<main id="main-content" tabindex="-1">
+<section class="view active" id="view-dashboard" aria-label="工作台">
+<div class="dashboard duplex-grid">
+<div class="operating-canvas">
+<section class="account-banner">
+<div class="workspace-topline">
+<span class="workspace-label">当前工作空间</span>
+<span class="account-id" id="dashboard-account-id">—</span>
+<button id="btn-configure-account" class="link small">账户设置 <span class="icon" data-icon="external" aria-hidden="true">
+</span>
+</button>
+</div>
+<div class="account-banner-title" id="dashboard-account-name">当前账户</div>
+<div class="workspace-path">
+<span>
+<span class="icon" data-icon="folder" aria-hidden="true">
+</span>
+</span>
+<span id="dashboard-account-detail" class="path">正在读取工作区</span>
+</div>
+<div class="account-endpoints" id="dashboard-account-endpoints">MCP — · Admin — · Tunnel —</div>
+</section>
+<section class="overview-panel" id="overview-panel" data-tone="busy" aria-label="连接状态">
+<div class="overview-message">
+<span class="overview-symbol" id="overview-symbol">
+<span class="icon" data-icon="activity" aria-hidden="true">
+</span>
+</span>
+<div>
+<h2 id="overview-title">正在读取运行状态</h2>
+<p id="overview-description">
+</p>
+</div>
+</div>
+<p id="connection-caption" class="connection-caption">读取当前账户的运行状态。</p>
+<div class="setup-required" id="setup-required" hidden>
+<span>请填写 Tunnel ID、API Key 和工作区。</span>
+<button id="btn-setup-required" class="link small">去配置</button>
+</div>
+<div class="hero-actions">
+<button id="btn-start-all" class="primary">启动当前账户</button>
+<button id="btn-stop-all" class="ghost">停止当前账户</button>
+<button id="btn-stop-external" class="ghost">接管外部进程</button>
+</div>
+</section>
+<div class="connection-flow" aria-label="连接链路">
+<div class="flow-node" id="flow-mcp">
+<span class="flow-icon">
+<span class="icon" data-icon="server" aria-hidden="true">
+</span>
+</span>
+<span>本地工具</span>
+<small id="flow-mcp-label">读取中</small>
+</div>
+<div class="flow-node" id="flow-local">
+<span class="flow-icon">
+<span class="icon" data-icon="shield" aria-hidden="true">
+</span>
+</span>
+<span>安全隧道</span>
+<small id="flow-local-label">读取中</small>
+</div>
+<div class="flow-node" id="flow-cloud">
+<span class="flow-icon">
+<span class="icon" data-icon="cloud" aria-hidden="true">
+</span>
+</span>
+<span>ChatGPT 云端</span>
+<small id="flow-cloud-label">读取中</small>
+</div>
+</div>
+<div class="services-title">
+<h2>服务台</h2>
+<span>独立进程 · 当前账户</span>
+</div>
+<div class="service-stack">
+<article class="status-card" id="card-mcp">
+<div class="service-head">
+<div class="service-title">
+<span class="service-icon">
+<span class="icon" data-icon="server" aria-hidden="true">
+</span>
+</span>
+<div>
+<h3>MCP Runtime</h3>
+<span>本机工具运行时</span>
+</div>
+</div>
+<span class="badge" id="badge-mcp">
+<i class="dot busy">
+</i>
+<span data-label>读取中</span>
+</span>
+<div class="button-group">
+<button id="btn-mcp-start" class="secondary small">启动</button>
+<button id="btn-mcp-stop" class="ghost small">停止</button>
+<button id="btn-mcp-restart" class="ghost small">重启</button>
+</div>
+</div>
+<div class="service-stats">
+<span class="tool-stat">
+<strong id="mcp-tool-count">—</strong> 个工具</span>
+<span>端口 <b id="mcp-listen-port">—</b>
+</span>
+<span>PID <b id="mcp-pid">—</b>
+</span>
+</div>
+<div class="service-toolbar">
+<div class="service-links">
+<button id="link-health" class="link small">/health</button>
+<button id="link-admin" class="link small">管理页面</button>
+</div>
+</div>
+<div id="mcp-action-error" class="service-error" role="status" hidden>
+</div>
+<details class="service-details">
+<summary>运行详情<span>构建 / 来源 / 工具集</span>
+</summary>
+<dl class="technical-grid">
+<div>
+<dt>工具配置</dt>
+<dd id="mcp-tools">—</dd>
+</div>
+<div>
+<dt>运行来源</dt>
+<dd id="mcp-source">—</dd>
+</div>
+<div>
+<dt>构建版本</dt>
+<dd id="mcp-build">—</dd>
+</div>
+<div>
+<dt>构建状态</dt>
+<dd id="mcp-stale">—</dd>
+</div>
+<div>
+<dt>访问认证</dt>
+<dd id="mcp-auth">—</dd>
+</div>
+</dl>
+</details>
+</article>
+<article class="status-card" id="card-tunnel">
+<div class="service-head">
+<div class="service-title">
+<span class="service-icon">
+<span class="icon" data-icon="shield" aria-hidden="true">
+</span>
+</span>
+<div>
+<h3>Secure Tunnel</h3>
+<span>到 ChatGPT 的独立通道</span>
+</div>
+</div>
+<span class="badge" id="badge-tunnel">
+<i class="dot busy">
+</i>
+<span data-label>读取中</span>
+</span>
+<div class="button-group">
+<button id="btn-tunnel-start" class="secondary small">启动</button>
+<button id="btn-tunnel-stop" class="ghost small">停止</button>
+</div>
+</div>
+<div class="tunnel-chain">
+<div>
+<span>本地链路</span>
+<b id="tunnel-ready">—</b>
+</div>
+<div>
+<span>云端轮询</span>
+<b id="tunnel-cloud">—</b>
+</div>
+</div>
+<div class="service-toolbar">
+<div class="service-links">
+<button id="link-readyz" class="link small">/readyz</button>
+<button id="link-tunnel-ui" class="link small">隧道页面</button>
+</div>
+</div>
+<div id="tunnel-action-error" class="service-error" role="status" hidden>
+</div>
+<details class="service-details">
+<summary>连接详情<span>路由 / 端口 / 工作区</span>
+</summary>
+<dl class="technical-grid">
+<div>
+<dt>进程 PID</dt>
+<dd id="tunnel-pid">—</dd>
+</div>
+<div>
+<dt>本地端口</dt>
+<dd id="tunnel-port">—</dd>
+</div>
+<div>
+<dt>运行来源</dt>
+<dd id="tunnel-source">—</dd>
+</div>
+<div>
+<dt>出站路由</dt>
+<dd id="tunnel-route">—</dd>
+</div>
+<div>
+<dt>Tunnel ID</dt>
+<dd id="tunnel-id">—</dd>
+</div>
+<div>
+<dt>工作区</dt>
+<dd id="tunnel-workspace">—</dd>
+</div>
+</dl>
+</details>
+</article>
+</div>
+<div class="workspace-footnote">
+<span>
+<span class="icon" data-icon="shield" aria-hidden="true">
+</span>账户配置与进程独立</span>
+<span>Isolated <span id="app-version">—</span>
+</span>
+</div>
+</div>
+<div id="dashboard-log-slot" class="event-plane">
+<section class="card logs" id="log-panel" aria-label="实时日志">
+<div class="log-heading">
+<div class="log-heading-title">
+<span class="icon" data-icon="terminal" aria-hidden="true">
+</span>
+<h3>事件现场</h3>
+</div>
+<button class="icon-button" id="btn-expand-log" aria-label="展开日志控制台" title="展开日志控制台">
+<span class="icon" data-icon="expand" aria-hidden="true">
+</span>
+</button>
+</div>
+<div class="log-toolbar">
+<div class="log-tabs" role="tablist" aria-label="日志来源">
+<button class="tab active" data-log="mcp" role="tab" aria-selected="true">MCP</button>
+<button class="tab" data-log="tunnel" role="tab" aria-selected="false">Tunnel</button>
+<button class="tab" data-log="launcher" role="tab" aria-selected="false">启动器</button>
+</div>
+<div class="log-controls">
+<label class="search-field compact-search">
+<span class="icon" data-icon="search" aria-hidden="true">
+</span>
+<input id="log-search" type="search" placeholder="搜索日志…" aria-label="搜索当前日志" />
+<kbd>Ctrl F</kbd>
+</label>
+<select id="log-level" aria-label="按日志级别筛选">
+<option value="all">全部级别</option>
+<option value="error">错误</option>
+<option value="warn">警告</option>
+<option value="info">信息</option>
+</select>
+<button class="icon-button" id="btn-copy-log" title="复制筛选后的日志" aria-label="复制可见日志">
+<span class="icon" data-icon="copy" aria-hidden="true">
+</span>
+</button>
+<button class="icon-button" id="btn-open-log-file" title="打开日志文件" aria-label="打开日志文件">
+<span class="icon" data-icon="external" aria-hidden="true">
+</span>
+</button>
+<button class="icon-button" id="btn-clear-log" title="清空当前日志缓冲" aria-label="清空当前日志">
+<span class="icon" data-icon="trash" aria-hidden="true">
+</span>
+</button>
+</div>
+</div>
+<div class="log-body">
+<pre class="log-view" id="log-view" tabindex="0" aria-label="日志内容">
+</pre>
+<div class="log-empty" id="log-empty" hidden>
+<span class="icon" data-icon="terminal" aria-hidden="true">
+</span>
+<b id="log-empty-title">暂无日志</b>
+<span id="log-empty-detail">
+</span>
+</div>
+</div>
+<div class="log-bottom">
+<div class="log-summary">
+<span id="log-count">0 行</span>
+<span class="log-hint" id="log-hint">
+</span>
+</div>
+<div class="log-options">
+<label class="check small">
+<input type="checkbox" id="log-hide-health" /> 隐藏健康探针</label>
+<label class="check small">
+<input type="checkbox" id="log-autoscroll" checked /> 自动滚动</label>
+</div>
+</div>
+</section>
+</div>
+</div>
+</section>
+<section class="view" id="view-skills">
+<div class="capability-workbench">
+<header class="library-heading">
+<div>
+<span class="page-index">能力库 / 当前账户</span>
+<h2>本机能力</h2>
+</div>
+<p>交互引擎与 Skill 在这里汇合。<br>按账户启用，为工作区装配。</p>
+</header>
+<div class="settings-pane active library-body" id="skills-pane">
+<div class="card engine-strip">
+<div class="section-head">
+<div>
+<h2>交互引擎</h2>
+</div>
+<div class="card-actions">
+<span class="count-chip" id="skills-total">读取中</span>
+<button class="ghost small" id="btn-skills-refresh">刷新</button>
+</div>
+</div>
+<div class="provider-grid">
+<div class="plugin-toggle">
+<span class="icon" data-icon="monitor" aria-hidden="true">
+</span>
+<div>
+<div class="plugin-name">Computer Use <span class="provider-state" id="computer-use-state">读取中</span>
+</div>
+<div class="muted small">控制本机窗口。启用后需新建 MCP 会话。</div>
+</div>
+<label class="switch">
+<input type="checkbox" id="chk-computer-use" aria-label="启用 Computer Use" />
+<span>
+</span>
+</label>
+</div>
+<div class="plugin-toggle">
+<span class="icon" data-icon="globe" aria-hidden="true">
+</span>
+<div>
+<div class="plugin-name">Browser Use <span class="provider-state" id="browser-use-state">读取中</span>
+</div>
+<div class="muted small">控制独立浏览器。启用后需新建 MCP 会话。</div>
+</div>
+<label class="switch">
+<input type="checkbox" id="chk-browser-use" aria-label="启用 Browser Use" />
+<span>
+</span>
+</label>
+</div>
+</div>
+</div>
+<div class="library-columns">
+<div class="library-catalog">
+<div class="card catalog-sheet">
+<div class="section-head">
+<div>
+<h2>已安装 Skill</h2>
+</div>
+<div class="card-actions">
+<button class="ghost small" id="btn-install-skill-folder">安装目录</button>
+<button class="primary small" id="btn-install-skill-zip">安装 zip</button>
+</div>
+</div>
+<div class="catalog-toolbar">
+<label class="search-field">
+<span class="icon" data-icon="search" aria-hidden="true">
+</span>
+<input id="skill-search" type="search" placeholder="搜索名称、描述或路径" aria-label="搜索 Skill" />
+</label>
+<span class="muted small" id="skills-filter-count">
+</span>
+</div>
+<div id="installed-skills-list" class="skill-list" aria-live="polite">
+</div>
+</div>
+<div class="card installation-sheet" id="install-skill-panel" hidden>
+<div class="section-head">
+<div>
+<h2>确认安装</h2>
+<p class="muted">只读取 SKILL.md 元数据；不会运行包内脚本。</p>
+</div>
+<button class="ghost small" id="btn-install-cancel">取消</button>
+</div>
+<div class="install-meta" id="install-skill-source">—</div>
+<label>
+<span>id（目录名，可编辑）</span>
+<input id="f-install-id" type="text" spellcheck="false" />
+</label>
+<div class="muted small" id="install-skill-details">
+</div>
+<div class="skill-warnings" id="install-skill-warnings">
+</div>
+<div class="actions">
+<button class="primary" id="btn-install-confirm">安装</button>
+<button class="ghost" id="btn-install-cancel-2">取消</button>
+</div>
+</div>
+<div class="card discovery-sheet">
+<div class="section-head">
+<div>
+<h2>其他来源</h2>
+</div>
+</div>
+<div class="discovery-grid">
+<div>
+<div class="list-title">项目 Skill · 只读</div>
+<div id="project-skills-list" class="skill-list compact">
+</div>
+</div>
+<div>
+<div class="list-title">内置 Skill · 不可卸载</div>
+<div id="builtin-skills-list" class="skill-list compact">
+</div>
+</div>
+</div>
+</div>
+</div>
+<aside class="library-registry" aria-label="外部 Skill 注册">
+<div class="card registry-sheet">
+<div class="section-head">
+<div>
+<h2>外部注册</h2>
+<p class="muted">配置文件：<code id="skills-config-path">profiles/plugins.json</code>
+</p>
+</div>
+<button class="primary small" id="btn-skills-save">保存外部注册</button>
+</div>
+<div id="registered-skills-list" class="skill-list">
+</div>
+<div class="skill-add">
+<input aria-label="外部 Skill 名称" id="f-skill-name" type="text" placeholder="名称（可选，默认读取 SKILL.md）" />
+<input aria-label="外部 Skill 绝对路径" id="f-skill-path" type="text" placeholder="D:\skills\example\SKILL.md" spellcheck="false" />
+<button class="ghost" id="btn-pick-skill">选择</button>
+<button class="ghost" id="btn-add-skill">添加</button>
+</div>
+</div>
+</aside>
+</div>
+</div>
+</div>
+</section>
+<section class="view" id="view-logs" aria-label="日志控制台">
+<div class="log-page-opening">
+<div>
+<span class="page-index">事件日志</span>
+<h2>追到每一次调用。</h2>
+</div>
+<div class="log-folder-actions">
+<button id="btn-open-logs" class="ghost small">
+<span class="icon" data-icon="folder" aria-hidden="true">
+</span>日志目录</button>
+<button id="btn-open-runtime" class="ghost small">
+<span class="icon" data-icon="external" aria-hidden="true">
+</span>运行目录</button>
+</div>
+</div>
+<div id="full-log-slot">
+</div>
+</section>
+<section class="view connection-workbench" id="view-settings">
+<header class="connection-heading">
+<span class="page-index">连接设置 / 当前账户</span>
+<h2>连接设置</h2>
+<p>从凭据到工作区，让本地工具就绪。</p>
+</header>
+<div class="settings-layout connection-layout">
+<div class="settings-tabs" role="tablist" aria-label="设置分类">
+<button class="settings-tab active" data-settings-tab="setup" role="tab" aria-selected="true" aria-controls="settings-pane-setup">账户与连接</button>
+<button class="settings-tab" data-settings-tab="guide" role="tab" aria-selected="false" aria-controls="settings-pane-guide">ChatGPT 接入指引</button>
+</div>
+<div class="settings-frame">
+<div class="settings-pane active" id="settings-pane-setup" role="tabpanel">
+<div class="card wide connection-sheet">
+<h2 class="connection-sheet-title">连接配置</h2>
+<p class="muted setup-account">当前账户：<b id="setup-account-name">当前账号</b>
+</p>
+<div class="isolation-note">
+<b>账户隔离</b>
+<span>配置与进程独立，但共用 Windows 用户；不是安全沙箱。</span>
+</div>
+<div class="links">
+<button class="link" data-url="https://platform.openai.com/settings/organization/tunnels">获取 Tunnel ID ↗</button>
+<button class="link" data-url="https://platform.openai.com/settings/organization/api-keys">获取 Runtime API Key ↗</button>
+</div>
+<form id="setup-form" autocomplete="off">
+<div class="connection-fields">
+<div class="form-section-heading">
+<h3>凭据与工作区</h3>
+</div>
+<label>
+<span>Tunnel ID</span>
+<input id="f-tunnel-id" type="text" placeholder="tunnel_ 后接 32 位十六进制" spellcheck="false" />
+</label>
+<label>
+<span>Runtime API Key <small id="key-hint" class="muted">
+</small>
+</span>
+<div class="row">
+<input id="f-api-key" type="password" placeholder="sk-..." spellcheck="false" />
+<button type="button" class="ghost" id="btn-toggle-key">显示</button>
+</div>
+<div class="row" id="legacy-import-row" hidden>
+<span class="muted small">从旧脚本保存的加密密钥导入：</span>
+<span id="legacy-import-buttons">
+</span>
+</div>
+</label>
+<label>
+<span>工作区目录</span>
+<div class="row" title="ChatGPT 操作的项目目录，不要选择本软件源码目录。">
+<input id="f-workspace" type="text" placeholder="例如 C:\Users\你\Documents\项目" spellcheck="false" />
+<button type="button" class="ghost" id="btn-pick-workspace">浏览…</button>
+</div>
+</label>
+</div>
+<details class="advanced" open>
+<summary>
+<span>端口与网络</span>
+</summary>
+<div class="grid">
+<label>
+<span>MCP 端口</span>
+<input id="f-mcp-port" type="number" min="1" max="65535" />
+</label>
+<label>
+<span>Tunnel 本地健康端口</span>
+<input id="f-tunnel-port" type="number" min="1" max="65535" />
+</label>
+<label>
+<span>Admin UI 端口</span>
+<input id="f-admin-port" type="number" min="1" max="65535" />
+</label>
+<label>
+<span>工具集</span>
+<select id="f-tool-profile">
+<option value="slim">slim（30 个工具，推荐）</option>
+<option value="full">full（全部工具）</option>
+</select>
+</label>
+</div>
+<div class="grid">
+<label>
+<span>Tunnel 出站代理</span>
+<select id="f-tunnel-proxy-mode">
+<option value="auto">自动（环境变量 → 系统代理/PAC）</option>
+<option value="direct">直连（不使用代理）</option>
+<option value="custom">自定义代理</option>
+</select>
+</label>
+<label>
+<span>自定义代理地址（不含用户名/密码）</span>
+<input id="f-tunnel-proxy-url" type="text" placeholder="http://127.0.0.1:7890" spellcheck="false" disabled />
+</label>
+</div>
+<p class="muted small">仅影响 Tunnel 出站连接，重启 Tunnel 后生效；不修改系统代理。</p>
+</details>
+<details class="advanced relay-section">
+<summary>
+<span>连续执行与接力</span>
+<span class="summary-hint">实验功能</span>
+</summary>
+<div class="isolation-note relay-note">
+<b>Browser Companion</b>
+<span>需安装 Browser Companion 扩展，默认关闭。</span>
+<label class="check">
+<input id="f-relay-enabled" type="checkbox" /> 启用 Relay Core 与 Browser Companion</label>
+<label class="check">
+<input id="f-relay-auto" type="checkbox" /> 自动根据 Turn 风险把 Goal 接力到待机 Chat</label>
+<label class="check">
+<input id="f-relay-recovery" type="checkbox" /> 当前 Driver 完全失联时自动接管已验证的待机 Chat</label>
+<div class="row">
+<button type="button" class="ghost small" id="btn-open-companion">打开扩展目录</button>
+<button type="button" class="ghost small" id="btn-copy-companion-token">复制 Companion Token</button>
+</div>
+<span id="relay-companion-hint" class="muted small">重启 MCP 后生效。Companion Token 与 Admin Token 独立。</span>
+</div>
+</details>
+<div class="preferences-section">
+<div class="form-section-heading">
+<h3>桌面偏好与维护</h3>
+</div>
+<label class="check">
+<input id="f-auto-start" type="checkbox" /> 打开启动器时自动启动服务</label>
+<label class="check">
+<input id="f-tray" type="checkbox" /> 服务运行时关闭窗口最小化到托盘</label>
+<label class="check">
+<input id="f-skip-doctor" type="checkbox" /> 跳过在线校验（tunnel-client doctor）</label>
+<div class="danger-zone">
+<div>
+<b>Skill / 插件配置</b>
+<p class="muted small">重置只影响两个 profile 文件，不删除已安装 Skill 或 Tunnel 配置。</p>
+</div>
+<button type="button" class="ghost small" id="btn-reset-profiles">重置为默认</button>
+</div>
+<div class="danger-zone">
+<div>
+<b>卸载桌面端并清理数据</b>
+<p class="muted small">删除配置、日志和已安装 Skill；portable/zip 的 EXE 需之后手动删除。</p>
+</div>
+<button type="button" class="quiet-danger small" id="btn-uninstall-app">卸载并清理数据</button>
+</div>
+</div>
+<div class="actions form-actions">
+<button type="submit" class="primary" id="btn-run-setup">开始初始化</button>
+<button type="button" class="ghost" id="btn-save-only">仅保存设置</button>
+</div>
+</form>
+<div class="progress" id="setup-progress" hidden>
+<div class="progress-title" id="setup-progress-title">进行中…</div>
+<pre id="setup-progress-log">
+</pre>
+</div>
+</div>
+</div>
+<div class="settings-pane" id="settings-pane-guide" role="tabpanel">
+<div class="card wide guide-card">
+<h2>连接 ChatGPT</h2>
+<p class="muted">每个账户使用独立的 Connector 和 Tunnel ID。</p>
+<ol class="steps">
+<li>确认当前配置档 <b id="guide-account-name">—</b> 的 MCP 与 Tunnel 均已就绪。</li>
+<li>打开 <button class="link" data-url="https://chatgpt.com/#settings/Connectors">ChatGPT 设置 → Connectors ↗</button>，先在 <b>Security and login</b> 里开启 <b>Developer mode</b>。</li>
+<li>新建连接器，建议命名为 <code id="guide-connector-name">Web Harness · 当前账号</code>。Connection 选择 <b>Tunnel</b>（不要填 localhost），在列表中选中当前配置档的 tunnel，或粘贴 Tunnel ID：
+                  <div class="row">
+<code id="guide-tunnel-id">—</code>
+<button class="ghost" id="btn-copy-tunnel">复制</button>
+</div>
+</li>
+<li>Authentication 保持默认，点击 Create → Connect。</li>
+<li>进入 <b>Settings → Apps</b>，找到这个应用，权限设为 <b>Allow all actions / Never ask</b>，否则 Goal 连续执行会被反复弹窗打断。</li>
+<li>新开一个对话，添加该应用，先发一条只读探针：<code>请只读取工作区目录列表，不要修改任何文件。</code> 看到工具卡片并返回本地文件列表即成功。</li>
+<li>其他账户：新建账户，配置独立凭据，再创建对应 Connector。</li>
+</ol>
+</div>
+</div>
+</div>
+</div>
+</section>
+</main>
+<dialog class="account-dialog" id="account-dialog" aria-labelledby="account-dialog-title" aria-describedby="account-dialog-description">
+<form method="dialog" id="account-dialog-form">
+<div class="account-dialog-head">
+<div>
+<div class="account-dialog-title" id="account-dialog-title">新建账号</div>
+<div class="muted small" id="account-dialog-description">不会复制其他账户的密钥。</div>
+</div>
+<button type="button" class="dialog-close" id="account-dialog-close" aria-label="关闭">×</button>
+</div>
+<label class="account-dialog-field">
+<span>账号名称</span>
+<input id="account-dialog-name" type="text" maxlength="64" required autocomplete="off" spellcheck="false" />
+</label>
+<div class="account-dialog-actions">
+<button type="button" class="ghost" id="account-dialog-cancel">取消</button>
+<button type="submit" class="primary" id="account-dialog-submit">创建账号</button>
+</div>
+</form>
+</dialog>
+<dialog class="account-dialog" id="confirm-dialog" aria-labelledby="confirm-title" aria-describedby="confirm-description">
+<form method="dialog" id="confirm-form">
+<h2 id="confirm-title">确认操作</h2>
+<p id="confirm-description">
+</p>
+<div class="account-dialog-actions">
+<button type="button" class="ghost" id="confirm-cancel">取消</button>
+<button type="submit" class="danger-button" id="confirm-submit">确认</button>
+</div>
+</form>
+</dialog>
+<dialog class="account-dialog diagnostics-dialog" id="diagnostics-dialog" aria-labelledby="diagnostics-title">
+<div class="dialog-content">
+<div class="account-dialog-head">
+<div>
+<h2 id="diagnostics-title">当前账户运行信息</h2>
+</div>
+<button class="dialog-close" data-close-dialog="diagnostics-dialog" aria-label="关闭运行信息">×</button>
+</div>
+<dl id="diagnostics-content" class="diagnostics-list">
+</dl>
+<p class="muted small" id="page-subtitle">
+</p>
+</div>
+</dialog>
+<dialog class="account-dialog" id="shortcuts-dialog" aria-labelledby="shortcuts-title">
+<div class="dialog-content">
+<div class="account-dialog-head">
+<h2 id="shortcuts-title">键盘快捷键</h2>
+<button class="dialog-close" data-close-dialog="shortcuts-dialog" aria-label="关闭快捷键">×</button>
+</div>
+<div class="shortcut-row">
+<span>切换工作台 / Skills / 日志 / 设置</span>
+<kbd>Alt 1–4</kbd>
+</div>
+<div class="shortcut-row">
+<span>搜索当前日志</span>
+<kbd>Ctrl F</kbd>
+</div>
+<div class="shortcut-row">
+<span>关闭弹窗</span>
+<kbd>Esc</kbd>
+</div>
+<div class="shortcut-row">
+<span>显示快捷键</span>
+<kbd>?</kbd>
+</div>
+</div>
+</dialog>
+<div class="toasts" id="toasts" aria-live="polite" aria-relevant="additions">
+</div>
+<div class="app-footer">
+<div class="footer-pills">
+<span class="pill" id="pill-mcp">
+<i class="dot busy">
+</i>
+<span data-label>MCP · 读取中</span>
+</span>
+<span class="pill" id="pill-tunnel">
+<i class="dot busy">
+</i>
+<span data-label>Tunnel · 读取中</span>
+</span>
+</div>
+<footer id="footer" class="footer">等待桌面运行时连接…</footer>
+<button class="footer-help" id="btn-shortcuts" aria-label="键盘快捷键">
+<span class="icon" data-icon="keyboard" aria-hidden="true">
+</span>
+<kbd>?</kbd>
+</button>
+</div>
+<script src="ui.js">
+</script>
+<script src="app.js">
+</script>
+</body>
+</html>

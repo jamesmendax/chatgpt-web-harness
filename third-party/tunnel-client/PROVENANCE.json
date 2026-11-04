@@ -1,0 +1,31 @@
+{
+  "component": "OpenAI tunnel-client",
+  "license": "Apache-2.0",
+  "upstream_version": "v0.0.14",
+  "upstream_tag_object": "f80d310ef554bf9547a53c839f9e11abe3c8fa35",
+  "upstream_commit": "0f870e50a973fa820d4c409000059e181e8d242b",
+  "source": "https://github.com/openai/tunnel-client/tree/v0.0.14",
+  "archive_url": "https://github.com/openai/tunnel-client/releases/download/v0.0.14/tunnel-client-v0.0.14-windows-amd64.zip",
+  "checksums_url": "https://github.com/openai/tunnel-client/releases/download/v0.0.14/SHA256SUMS.txt",
+  "official_archive_sha256": "784ab8da7b5a88f0109f1fd8aaf0a1c86067430b896dddf307ef7e3cc49fa1a5",
+  "official_executable_sha256": "fcc85a69ec0ad82518e4f8964f60c45e31787957782a0fc9c1b0c44e82d61b9b",
+  "official_archive_verified": true,
+  "custom_build": true,
+  "custom_commit": "37e36c7371da238518bf2128960958f533c692c7",
+  "patch": "patches/0001-terminal-response-retry-window.patch",
+  "patch_sha256": "1c2e85cb6f02a290e9c143e6fef97d35e9379151589feff9db569a167b49332a",
+  "derived_executable_sha256": "00e8385cb2791f0ec5548e2c27030fb6eafa0e727ab54e51790e290dc2f817a0",
+  "derived_executable_size": 31145984,
+  "bundled_executable_matches_official": false,
+  "build": {
+    "module_go_version": "1.27.0",
+    "goos": "windows",
+    "goarch": "amd64",
+    "cgo_enabled": false,
+    "trimpath": true,
+    "buildvcs": false,
+    "git_sha_ldflag": "37e36c7371da238518bf2128960958f533c692c7"
+  },
+  "local_patch_scope": "Terminal JSON-RPC response delivery only: retain upstream notification anti-replay behavior and 3-attempt notification budget; give terminal responses a 15-minute bounded retry window with a 256-attempt hard cap while preserving parent-context cancellation. The retry loop only resends the already-built terminal TunnelResponse and never re-enters MCP dispatch or tool execution.",
+  "verification": "Targeted Go unit tests passed for terminal retry budget, same-request transport retry, notification anti-replay, pre-write notification retry, parent-context cancellation, non-retryable 4xx, and idempotent terminal 404 handling. The derived Windows executable was statically inspected as a PE built with Go 1.27.0, windows/amd64, CGO disabled and trimpath enabled. No production MCP, Tunnel, or Electron process was started, stopped, restarted, killed, or crash-injected during this acceptance."
+}

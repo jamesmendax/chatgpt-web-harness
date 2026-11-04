@@ -1,0 +1,291 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:;">
+<meta name="color-scheme" content="light dark">
+<title>Web Harness</title>
+<script src="theme-boot.js"></script>
+<link rel="stylesheet" href="aura.css">
+</head>
+<body data-view="workspace" class="booting">
+<a class="skip" href="#main">跳到主要内容</a>
+<canvas id="scene" aria-hidden="true"></canvas>
+
+<header class="bar">
+  <div class="brand">
+    <button class="brand-orb" id="btn-info" type="button" aria-label="当前账户运行信息"><span id="brand-orb" data-orb="presence"></span></button>
+    <span class="brand-name">Web Harness</span>
+    <div class="proto" id="proto"></div>
+  </div>
+  <nav class="nav" id="nav" role="tablist" aria-label="页面">
+    <span class="nav-indicator" id="nav-indicator" aria-hidden="true"></span>
+    <button role="tab" data-view="workspace" aria-selected="true">工作空间</button>
+    <button role="tab" data-view="skills" aria-selected="false">能力库</button>
+    <button role="tab" data-view="logs" aria-selected="false">事件日志</button>
+    <button role="tab" data-view="settings" aria-selected="false">设置</button>
+  </nav>
+  <button class="icon-btn theme-btn" id="btn-theme" type="button" aria-pressed="false" aria-label="切换到夜间模式" title="夜间模式"><i class="ic">&#xE708;</i></button>
+  <div class="account" id="account">
+    <button class="account-btn" id="account-btn" type="button" aria-haspopup="menu" aria-expanded="false"><span class="avatar" id="avatar">默</span><span class="account-name" id="account-name">读取中</span><i class="ic">&#xE70D;</i></button>
+    <div class="menu card" id="account-menu" role="menu" hidden>
+      <p class="menu-title">工作账户 <span id="account-count"></span></p>
+      <div class="menu-list" id="account-list"></div>
+      <div class="menu-actions"><button type="button" id="btn-account-create"><i class="ic">&#xE710;</i>新建账户</button><button type="button" id="btn-account-import"><i class="ic">&#xE8B5;</i>从旧版读取账户</button><button type="button" id="btn-account-rename"><i class="ic">&#xE70F;</i>重命名当前账户</button><button type="button" class="danger" id="btn-account-remove"><i class="ic">&#xE74D;</i>移除当前账户</button></div>
+      <p class="menu-note">账户之间配置与进程独立，但共用 Windows 用户，不是安全沙箱。</p>
+    </div>
+  </div>
+</header>
+
+<main id="main" tabindex="-1">
+  <!-- ===== 工作空间: the presence ===== -->
+  <section class="view" id="view-workspace" aria-label="工作空间">
+    <div class="ws-col">
+      <div class="orb-slot" id="orb-slot" aria-hidden="true"></div>
+      <h1 class="live" id="live" aria-live="polite"><span class="who" id="live-who">正在读取</span><span class="what" id="live-what">当前账户的运行状态</span></h1>
+      <ol class="history" id="history" aria-label="刚才发生的事"></ol>
+    </div>
+    <aside class="ws-side" aria-label="连接">
+      <div class="links">
+        <button class="link-row" id="row-local" type="button" data-pop="local"><span class="k">本机</span><span class="v" id="s-local">—</span><i class="ic">&#xE76C;</i></button>
+        <button class="link-row" id="row-tunnel" type="button" data-pop="tunnel"><span class="k">安全隧道</span><span class="v" id="s-tunnel">—</span><i class="ic">&#xE76C;</i></button>
+        <button class="link-row" id="row-cloud" type="button" data-pop="cloud"><span class="k">ChatGPT</span><span class="v" id="s-cloud">—</span><i class="ic">&#xE76C;</i></button>
+        <button class="link-row" id="row-ws" type="button" data-go="settings" data-pane="workspace"><span class="k">工作区</span><span class="v" id="s-ws">—</span><i class="ic">&#xE76C;</i></button>
+      </div>
+      <div class="actions">
+        <button class="btn" id="btn-primary" type="button"><span>启动当前账户</span></button>
+        <button class="ghost" id="btn-secondary" type="button">重启 MCP</button>
+        <button class="ghost" id="btn-external" type="button" hidden>接管外部进程</button>
+      </div>
+    </aside>
+
+    <div class="pop card" id="pop-local" role="dialog" aria-labelledby="pop-local-title" hidden>
+      <header><div><p class="eyebrow">本机</p><h2 id="pop-local-title">MCP Runtime</h2></div><span class="badge" id="mcp-badge">—</span></header>
+      <dl class="kv" id="mcp-kv"></dl>
+      <div class="pop-actions">
+        <button class="btn small" id="btn-mcp-start" type="button">启动</button>
+        <button class="ghost" id="btn-mcp-stop" type="button">停止</button>
+        <button class="ghost" id="btn-mcp-restart" type="button">重启</button>
+        <span class="links-inline"><button class="text-link" type="button" data-url="health">/health</button><button class="text-link" type="button" data-url="admin">管理页面</button></span>
+      </div>
+    </div>
+    <div class="pop card" id="pop-tunnel" role="dialog" aria-labelledby="pop-tunnel-title" hidden>
+      <header><div><p class="eyebrow">安全隧道</p><h2 id="pop-tunnel-title">Secure Tunnel</h2></div><span class="badge" id="tunnel-badge">—</span></header>
+      <dl class="kv" id="tunnel-kv"></dl>
+      <p class="pop-note">/readyz 只证明本地链路；云端是否可用以成功轮询为准。</p>
+      <div class="pop-actions">
+        <button class="btn small" id="btn-tunnel-start" type="button">启动</button>
+        <button class="ghost" id="btn-tunnel-stop" type="button">停止</button>
+        <span class="links-inline"><button class="text-link" type="button" data-url="readyz">/readyz</button><button class="text-link" type="button" data-url="tunnelUi">隧道页面</button></span>
+      </div>
+    </div>
+    <div class="pop card" id="pop-cloud" role="dialog" aria-labelledby="pop-cloud-title" hidden>
+      <header><div><p class="eyebrow">外部系统 · 只读</p><h2 id="pop-cloud-title">ChatGPT 云端</h2></div><span class="badge" id="cloud-badge">—</span></header>
+      <dl class="kv" id="cloud-kv"></dl>
+      <div class="pop-actions"><button class="btn small" type="button" data-guide="1">接入指引</button><button class="ghost" type="button" data-go="settings" data-pane="credentials">更新凭据</button></div>
+    </div>
+  </section>
+
+  <!-- ===== 能力库: an index of lights ===== -->
+  <section class="view" id="view-skills" aria-label="能力库" hidden>
+    <header class="page-head">
+      <div class="ph-text"><h1>能力库</h1><p class="lede" id="skills-live">—</p></div>
+      <div class="head-tools">
+        <label class="search"><i class="ic">&#xE721;</i><span class="sr">搜索 Skill</span><input id="skill-search" type="search" placeholder="搜索名称、说明或路径" autocomplete="off"></label>
+        <button class="icon-btn refresh-btn" id="btn-skills-refresh" type="button" title="重新读取能力库" aria-label="刷新能力库" aria-busy="false"><i class="ic">&#xE72C;</i></button>
+        <button class="ghost" id="btn-install-folder" type="button"><i class="ic">&#xE8B7;</i>安装目录</button>
+        <button class="btn" id="btn-install-zip" type="button"><i class="ic">&#xE896;</i>安装 zip</button>
+      </div>
+    </header>
+    <div class="sk-grid">
+      <div class="sk-main scroll" id="sk-scroll">
+        <p class="eyebrow" id="installed-title">已安装 <b id="skills-count">0</b></p>
+        <ol class="index" id="installed-list" aria-labelledby="installed-title"></ol>
+        <p class="eyebrow" id="ro-title">项目与内置<span class="hint">随工作区和应用提供，只读</span></p>
+        <ol class="index ro" id="readonly-list" aria-labelledby="ro-title"></ol>
+      </div>
+      <aside class="sk-side">
+        <p class="eyebrow">交互引擎</p>
+        <div class="engine" id="engine-computerUse">
+          <span class="engine-orb" data-orb="engine"></span>
+          <div class="engine-text"><b>Computer Use</b><span>控制本机窗口和桌面应用</span><small id="state-computerUse">—</small></div>
+          <button class="switch" type="button" role="switch" aria-checked="false" data-engine="computerUse" aria-label="启用 Computer Use"><i></i></button>
+        </div>
+        <div class="engine" id="engine-browserUse">
+          <span class="engine-orb" data-orb="engine"></span>
+          <div class="engine-text"><b>Browser Use</b><span>控制独立的浏览器</span><small id="state-browserUse">—</small></div>
+          <button class="switch" type="button" role="switch" aria-checked="false" data-engine="browserUse" aria-label="启用 Browser Use"><i></i></button>
+        </div>
+        <p class="eyebrow ext-title">外部注册<code class="path-chip" id="registry-path">—</code></p>
+        <div class="ext-list" id="external-list"></div>
+        <form class="ext-form" id="external-form" autocomplete="off">
+          <p class="ext-lead">注册一个本机的 SKILL.md</p>
+          <label class="inline grow mono"><span class="sr">SKILL.md 绝对路径</span><input id="ext-path" type="text" placeholder="D:\skills\example\SKILL.md" spellcheck="false"></label>
+          <div class="ext-actions"><label class="inline"><span class="sr">名称</span><input id="ext-name" type="text" placeholder="名称，可选"></label><button class="ghost" type="button" id="btn-ext-pick">选择文件</button><button class="ghost strong" type="submit">添加</button></div>
+          <div class="ext-foot"><span class="hint" id="external-dirty">—</span><button class="btn small" type="button" id="btn-ext-save">保存外部注册</button></div>
+        </form>
+      </aside>
+    </div>
+    <div class="pop card sheet" id="install-sheet" role="dialog" aria-labelledby="install-title" hidden>
+      <header><div><p class="eyebrow">确认安装</p><h2 id="install-title">—</h2></div></header>
+      <p class="pop-note">只读取 SKILL.md 元数据，不会运行包内脚本。</p>
+      <dl class="kv" id="install-meta"></dl>
+      <label class="field labeled"><span>id（目录名，可编辑）</span><input id="install-id" type="text" spellcheck="false"></label>
+      <ul class="warnings" id="install-warnings"></ul>
+      <div class="pop-actions"><button class="btn small" type="button" id="btn-install-confirm">安装</button><button class="ghost" type="button" id="btn-install-cancel">取消</button></div>
+    </div>
+    <div class="pop card" id="skill-pop" role="dialog" aria-labelledby="skill-pop-title" hidden>
+      <header><div><p class="eyebrow" id="skill-pop-sub">—</p><h2 id="skill-pop-title">—</h2></div></header>
+      <p class="pop-desc" id="skill-pop-desc"></p>
+      <dl class="kv" id="skill-pop-kv"></dl>
+      <div class="pop-actions" id="skill-pop-actions"></div>
+    </div>
+  </section>
+
+  <!-- ===== 事件日志: a transcript ===== -->
+  <section class="view" id="view-logs" aria-label="事件日志" hidden>
+    <header class="page-head">
+      <div class="ph-text"><h1>事件日志</h1><p class="lede" id="logs-live">—</p></div>
+      <div class="head-tools">
+        <div class="seg" id="seg-mode" role="tablist" aria-label="显示方式"><span class="seg-ind" aria-hidden="true"></span><button role="tab" data-mode="story" aria-selected="true">叙事</button><button role="tab" data-mode="raw" aria-selected="false">原文</button></div>
+        <span class="icons">
+          <button class="icon-btn" type="button" id="btn-copy-log" title="复制可见日志" aria-label="复制可见日志"><i class="ic">&#xE8C8;</i></button>
+          <button class="icon-btn" type="button" id="btn-open-log" title="打开日志文件" aria-label="打开日志文件"><i class="ic">&#xE8E5;</i></button>
+          <button class="icon-btn" type="button" id="btn-open-logs-dir" title="日志目录" aria-label="打开日志目录"><i class="ic">&#xE8B7;</i></button>
+          <button class="icon-btn" type="button" id="btn-open-runtime" title="运行目录" aria-label="打开运行目录"><i class="ic">&#xE8DA;</i></button>
+          <button class="icon-btn danger" type="button" id="btn-clear-log" title="清空当前来源" aria-label="清空当前来源"><i class="ic">&#xE74D;</i></button>
+        </span>
+      </div>
+    </header>
+    <div class="spectrum" id="spectrum" aria-label="近 30 分钟的工具调用">
+      <div class="spec-bars" id="spec-bars" aria-hidden="true"></div>
+      <div class="spec-axis" aria-hidden="true"><span>30 分钟前</span><span>20 分钟前</span><span>10 分钟前</span><span>现在</span></div>
+      <div class="spec-tip" id="spec-tip" hidden></div>
+    </div>
+    <div class="lg-bar">
+      <div class="tabs" id="seg-source" role="tablist" aria-label="日志来源">
+        <span class="tab-line" aria-hidden="true"></span>
+        <button role="tab" data-source="mcp" aria-selected="true">MCP <b id="count-mcp">0</b></button>
+        <button role="tab" data-source="tunnel" aria-selected="false">Tunnel <b id="count-tunnel">0</b></button>
+        <button role="tab" data-source="launcher" aria-selected="false">启动器 <b id="count-launcher">0</b></button>
+      </div>
+      <label class="search small"><i class="ic">&#xE721;</i><span class="sr">搜索日志</span><input id="log-search" type="search" placeholder="搜索当前来源" autocomplete="off"><kbd>Ctrl F</kbd></label>
+      <div class="seg small" id="seg-level" role="group" aria-label="级别"><span class="seg-ind" aria-hidden="true"></span><button data-level="all" aria-pressed="true">全部</button><button data-level="error" aria-pressed="false">错误</button><button data-level="warn" aria-pressed="false">警告</button><button data-level="info" aria-pressed="false">信息</button></div>
+      <span class="toggle"><button class="switch small" type="button" role="switch" aria-checked="false" id="log-hide-health" aria-label="隐藏健康探针"><i></i></button>隐藏健康探针</span>
+      <span class="toggle"><button class="switch small" type="button" role="switch" aria-checked="true" id="log-autoscroll" aria-label="自动滚动"><i></i></button>自动滚动</span>
+    </div>
+    <div class="transcript scroll" id="log-view" tabindex="0"></div>
+    <p class="foot" id="log-summary">—</p>
+  </section>
+
+  <!-- ===== 设置: written as sentences ===== -->
+  <section class="view" id="view-settings" aria-label="设置" hidden>
+    <header class="page-head">
+      <div class="ph-text"><h1>设置</h1><p class="lede">账户 <b id="setup-account">—</b> 的连接方式与偏好。</p></div>
+      <div class="head-tools"><button class="ghost" id="btn-open-guide" type="button"><i class="ic">&#xE82D;</i>ChatGPT 接入指引</button><button class="btn" id="btn-run-setup" type="button">开始初始化</button></div>
+    </header>
+    <div class="st-grid">
+      <nav class="st-index" id="st-index" aria-label="设置分类"></nav>
+      <form class="prose scroll" id="setup-form" autocomplete="off" novalidate></form>
+    </div>
+    <div class="save-pill" id="save-bar" aria-live="polite">
+      <span class="save-orb" aria-hidden="true"></span><span class="save-status" id="form-status" role="status">修改后保存。</span>
+      <button class="ghost light" type="button" id="btn-discard">放弃修改</button>
+      <button class="btn small inverse" type="button" id="btn-save-only">保存</button>
+    </div>
+  </section>
+</main>
+
+<div class="toast" id="toast" role="status" aria-live="polite"><span class="toast-dot"></span><span id="toast-text"></span></div>
+
+<dialog class="dialog card" id="dlg-confirm" aria-labelledby="confirm-title">
+  <form method="dialog">
+    <p class="eyebrow" id="confirm-eyebrow">请确认</p>
+    <h2 id="confirm-title">确认操作</h2>
+    <p id="confirm-desc"></p>
+    <div class="dlg-actions"><button class="ghost" value="cancel" formnovalidate>取消</button><button class="btn small danger" value="ok" id="confirm-ok">确认</button></div>
+  </form>
+</dialog>
+<dialog class="dialog card" id="dlg-account" aria-labelledby="account-title">
+  <form method="dialog" id="account-form">
+    <p class="eyebrow">账户</p>
+    <h2 id="account-title">新建账户</h2>
+    <p id="account-desc">新账户使用独立端口与配置，不会复制其他账户的密钥。</p>
+    <label class="field labeled"><span>账户名称</span><input id="account-name-input" type="text" maxlength="64" required autocomplete="off" spellcheck="false"></label>
+    <div class="dlg-actions"><button class="ghost" value="cancel" formnovalidate>取消</button><button class="btn small" value="ok" id="account-ok">创建账户</button></div>
+  </form>
+</dialog>
+<dialog class="dialog card" id="dlg-account-import" aria-labelledby="import-title">
+  <form method="dialog">
+    <p class="eyebrow">读取账户</p><h2 id="import-title">继续使用旧账户</h2>
+    <div class="import-body scroll">
+      <div class="import-account"><select id="import-choice" aria-label="旧账户"></select></div>
+      <p id="import-overview" class="import-overview"></p>
+      <p id="import-note" class="import-note" hidden></p>
+      <details class="quiet-details" id="import-details">
+        <summary>查看迁移明细</summary>
+        <p id="import-source" class="import-source"></p>
+        <dl class="kv" id="import-summary"></dl>
+        <p id="import-scope" class="import-scope"></p>
+      </details>
+      <p id="import-error" role="alert" hidden></p>
+    </div>
+    <div class="dlg-actions"><button class="ghost" value="cancel" id="import-cancel">取消</button><button class="btn small" type="button" id="import-confirm">读取账户</button></div>
+  </form>
+</dialog>
+<dialog class="dialog card wide" id="dlg-conversations" aria-labelledby="conversations-title">
+  <form method="dialog">
+    <p class="eyebrow">当前账户</p><h2 id="conversations-title">会话标签</h2>
+    <div class="conversation-toolbar"><span id="conversation-count"></span><button class="ghost" type="button" id="btn-refresh-conversations">刷新</button></div>
+    <div id="conversation-label-list" class="conversation-label-list scroll" aria-live="polite"></div>
+    <div class="dlg-actions"><button class="ghost warn" type="button" id="btn-clear-conversations">清空未保留</button><button class="btn small" value="ok">完成</button></div>
+  </form>
+</dialog>
+<dialog class="dialog card wide" id="dlg-info" aria-labelledby="info-title">
+  <form method="dialog">
+    <p class="eyebrow">运行信息</p>
+    <h2 id="info-title">当前账户</h2>
+    <dl class="kv" id="info-kv"></dl>
+    <div class="dlg-actions"><button class="ghost" type="button" id="btn-copy-info">复制</button><button class="btn small" value="ok">完成</button></div>
+  </form>
+</dialog>
+<dialog class="dialog card" id="dlg-keys" aria-labelledby="keys-title">
+  <form method="dialog">
+    <p class="eyebrow">键盘</p>
+    <h2 id="keys-title">快捷键</h2>
+    <dl class="kv keys"><dt>切换页面</dt><dd><kbd>Alt 1</kbd> – <kbd>Alt 4</kbd></dd><dt>搜索</dt><dd><kbd>Ctrl F</kbd></dd><dt>关闭弹出层</dt><dd><kbd>Esc</kbd></dd><dt>显示快捷键</dt><dd><kbd>?</kbd></dd></dl>
+    <div class="dlg-actions"><button class="btn small" value="ok">知道了</button></div>
+  </form>
+</dialog>
+<dialog class="dialog card journey" id="dlg-guide" aria-labelledby="guide-title">
+  <form method="dialog">
+    <header class="journey-head"><div><p class="eyebrow" id="guide-sub">—</p><h2 id="guide-title">把 ChatGPT 接到这台电脑</h2></div><button class="icon-btn" value="cancel" aria-label="关闭" formnovalidate><i class="ic">&#xE711;</i></button></header>
+    <div class="journey-body">
+      <ol class="journey-steps" id="guide-steps"></ol>
+      <div class="journey-detail" id="guide-detail" aria-live="polite"></div>
+    </div>
+    <footer class="dlg-actions"><button class="ghost" type="button" id="guide-prev">上一步</button><button class="btn small" type="button" id="guide-next">下一步</button></footer>
+  </form>
+</dialog>
+<dialog class="dialog card" id="dlg-setup" aria-labelledby="setup-title">
+  <form method="dialog">
+    <p class="eyebrow" id="setup-eyebrow">初始化</p>
+    <h2 id="setup-title">正在初始化</h2>
+    <p id="setup-desc" role="status">准备本机服务并检查连接配置。</p>
+    <section id="setup-failure" class="setup-failure" hidden aria-label="失败原因">
+      <p id="setup-stage"></p>
+      <ul id="setup-checks"></ul>
+      <p id="setup-next"></p>
+    </section>
+    <details id="setup-details" class="setup-details" open><summary>诊断详情</summary><pre class="progress-log" id="setup-log"></pre></details>
+    <div class="dlg-actions"><button class="ghost" type="button" id="setup-copy">复制诊断</button><button class="ghost" type="button" id="setup-guide" hidden>接入指引</button><button class="ghost strong" type="button" id="setup-switch-account" hidden>切回已有账户</button><button class="ghost strong" type="button" id="setup-retry" hidden>重试</button><button class="btn small" value="ok" id="setup-done" disabled>完成</button></div>
+  </form>
+</dialog>
+
+<script src="../../shared/sim.js"></script>
+<script src="../core/core.js"></script>
+<script src="scene.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,96 @@
+{
+  "schemaVersion": 1,
+  "source": "desktop/renderer/v3/aura/scene.js",
+  "sourceSha256": "5dead3604064e4d2b0c2a9138f21ef67baefd9bf53fd2c5ab7765663b8982566",
+  "method": "Aura orb shader, fixed time 2.8, transparent icon composition and pixel-size exports",
+  "palette": "Pearl, lavender, rose, peach and cyan from the existing Aura shader",
+  "legacyGlyphUsed": false,
+  "transparent": true,
+  "icoSizes": [
+    16,
+    20,
+    24,
+    32,
+    40,
+    48,
+    64,
+    96,
+    128,
+    256
+  ],
+  "icoSha256": "635dc8fb56e1ebc4272772e17127d7ad8436edd0c9f6f509c879511016cbbfea",
+  "files": [
+    {
+      "file": "desktop/build/aura-icons/16.png",
+      "width": 16,
+      "height": 16,
+      "sha256": "3abdd61db6baf21a3d840cc3046daed2f3cdb36240084e0afc367dba24bc81dc"
+    },
+    {
+      "file": "desktop/build/aura-icons/20.png",
+      "width": 20,
+      "height": 20,
+      "sha256": "0408388ad734196927428c2901c4539057db4bbdb776609c7a2b977bc20cb31a"
+    },
+    {
+      "file": "desktop/build/aura-icons/24.png",
+      "width": 24,
+      "height": 24,
+      "sha256": "e6e6bb58e46ce9060352cf4eae1f12942b6db666411c73d705fbf6c9cbb30769"
+    },
+    {
+      "file": "desktop/build/aura-icons/32.png",
+      "width": 32,
+      "height": 32,
+      "sha256": "0bf3a1aeed78ae0a5f44cd2962375a76562bbc433370cceb2345e754a9121bbc"
+    },
+    {
+      "file": "desktop/build/aura-icons/40.png",
+      "width": 40,
+      "height": 40,
+      "sha256": "4396c2ca1a695161b9c9c574b854e13693d2c66620667c6f817b82d693ecdb74"
+    },
+    {
+      "file": "desktop/build/aura-icons/48.png",
+      "width": 48,
+      "height": 48,
+      "sha256": "929027e800ea744c557228d8a1e2153c5a7c6b28f3fb629bce9a261fa5a86eb3"
+    },
+    {
+      "file": "desktop/build/aura-icons/64.png",
+      "width": 64,
+      "height": 64,
+      "sha256": "3fbda5318c20bbd46a4a404875af9e9b5927a3a61ba011a942f6b6f3f7bb111c"
+    },
+    {
+      "file": "desktop/build/aura-icons/96.png",
+      "width": 96,
+      "height": 96,
+      "sha256": "9005c8a608f40cf2202054dc5c72b6bc3d3be3f3a56e65e780f24470ebfaf491"
+    },
+    {
+      "file": "desktop/build/aura-icons/128.png",
+      "width": 128,
+      "height": 128,
+      "sha256": "9d1fcec7b956a927c40e70f43de3b8de68530eaef2d45c9f6e4d492c528c3593"
+    },
+    {
+      "file": "desktop/build/aura-icons/256.png",
+      "width": 256,
+      "height": 256,
+      "sha256": "258aaef859d7eb069de1382f0384dfde189d0eca22757e4f520d244e7e3dd1bf"
+    },
+    {
+      "file": "desktop/build/aura-icons/512.png",
+      "width": 512,
+      "height": 512,
+      "sha256": "285faf3a97174a89fa056788cde707946a2d807fa271705975b4d056ae63f6dd"
+    },
+    {
+      "file": "desktop/build/aura-icons/1024.png",
+      "width": 1024,
+      "height": 1024,
+      "sha256": "97e4c59470337f41997819e2fff9c8a58c120e92d07ea815e7738fb78168dce7"
+    }
+  ]
+}

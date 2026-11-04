@@ -1,0 +1,104 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Web Harness | Windows Hello 独立预览</title><style>
+:root{font-family:system-ui,"Microsoft YaHei",sans-serif;color-scheme:light dark}
+body{max-width:810px;margin:38px auto;padding:0 22px;line-height:1.6}
+h1{font-size:1.75em;margin-bottom:7px}h2{font-size:1.12em;margin:0}
+article{padding:20px;border:1px solid #8887;border-radius:12px;margin:16px 0}
+p{margin:8px 0}.dim{opacity:.76}.note{border-left:4px solid #bb8b38;padding:9px 13px;margin:16px 0}
+button{border:0;background:#2564a7;color:white;padding:12px 16px;border-radius:7px;cursor:pointer;font:inherit;font-weight:600;margin:8px 0}
+button:disabled{opacity:.45;cursor:default}#approval{white-space:pre-wrap;word-break:break-word}
+#status{font-weight:600;min-height:2em;white-space:pre-wrap}
+</style></head><body>
+<p class="dim">WEB HARNESS · 独立演示 | 仅 localhost</p><h1>Windows Hello / 通行密钥验收</h1>
+<p>本页面只操作临时<strong>演示 Goal</strong>，不会连接、停止、重启或修改运行中的 Web Harness 3.0.2。</p>
+<div class="note">这是<strong>隔离测试</strong>，不是正式项目授权，也不是 ChatGPT 用户消息的签名。公钥仅在本演示沙盒中自动登记；正式环境仍需独立可信凭据配置。</div>
+<article><h2>环境检查</h2><p id="support">检查浏览器接口中…</p>
+<p class="dim">有 Windows Hello PIN 不代表浏览器一定支持通行密钥，最终需以系统实际弹窗为准。</p></article>
+<article><h2>第一步：本人注册演示通行密钥</h2>
+<p>点击后，系统可能要求 PIN、指纹、手机或安全密钥。请由你本人操作；程序不会读取、代输或保存 PIN。</p>
+<button type="button" id="register">注册演示用通行密钥</button><p id="registration">尚未注册</p></article>
+<article><h2>第二步：查看并批准演示事项</h2>
+<p>这里绝不会批准你的真实 Web Harness 总项目。</p>
+<button type="button" id="review" disabled>查看要确认的演示事项</button>
+<div id="target" hidden><pre id="approval"></pre>
+<button type="button" id="approve" disabled>核对无误，使用 Windows Hello 确认</button></div></article>
+<div id="status" role="status" aria-live="polite">尚未开始，页面不会自动触发身份验证。</div>
+<p class="dim">注意：Windows/通行密钥管理器可能保留本演示所创建的 localhost 凭据；关闭预览不等于从系统中删除该凭据。</p>
+<script>
+(()=>{
+const q=id=>document.getElementById(id);
+const say=t=>q("status").textContent=t;
+const from64=s=>{const x=s.replace(/-/g,"+").replace(/_/g,"/");return Uint8Array.from(atob(x+"=".repeat((4-x.length%4)%4)),c=>c.charCodeAt(0));};
+const to64=b=>{let s="";for(const v of new Uint8Array(b))s+=String.fromCharCode(v);return btoa(s).replace(/\+/g,"-").replace(/\//g,"_").replace(/=+$/,"");};
+const api=async(name,body=null)=>{
+ const opts={method:body===null?"GET":"POST",cache:"no-store",credentials:"omit",mode:"same-origin"};
+ if(body!==null){opts.headers={"content-type":"application/json"};opts.body=JSON.stringify(body);}
+ const r=await fetch("/preview/"+name,opts),v=await r.json();
+ if(!r.ok||!v.ok)throw Error(v.error||"请求失败");return v;
+};
+let pending=null;
+const supported=window.isSecureContext&&typeof PublicKeyCredential==="function"&&
+  Boolean(navigator.credentials?.create)&&Boolean(navigator.credentials?.get);
+q("support").textContent=supported?"WebAuthn 接口存在，页面处于安全上下文。":"未发现可用的 WebAuthn 接口或安全上下文，请使用 Windows Edge/Chrome 的 localhost 地址。";
+if(supported&&PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable)
+ PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable().then(x=>
+  q("support").textContent+=(x?" 平台认证器报告可用。":" 平台认证器未报告可用，仍可能支持外接安全密钥。"))
+ .catch(()=>{q("support").textContent+=" Windows Hello 能力暂无法确认。";});
+const refresh=async()=>{
+ try{
+  const s=await api("api/status");
+  q("registration").textContent=s.registered?"已登记在本次临时演示中。":"尚未注册";
+  q("register").disabled=!supported||s.registered;
+  q("review").disabled=!s.registered||s.confirmed;
+  if(s.confirmed)say("成功：演示 Goal 已批准，真实项目未改变。");
+ }catch(e){say("状态检查未成功："+e.message);}
+};
+q("register").addEventListener("click",async()=>{
+ if(!supported)return;q("register").disabled=true;say("准备一次性注册挑战…");
+ try{
+  const o=(await api("api/enroll/start",{})).public_key;
+  o.challenge=from64(o.challenge);o.user.id=from64(o.user.id);
+  say("等待你本人完成系统通行密钥注册…");
+  const cred=await navigator.credentials.create({publicKey:o});
+  if(!cred?.response?.getPublicKey)throw Error("浏览器未提供公钥");
+  const key=cred.response.getPublicKey(),alg=cred.response.getPublicKeyAlgorithm?.();
+  if(!key||alg!==-7)throw Error("注册密钥不是支持的 P-256 ES256");
+  await api("api/enroll/finish",{credential_id:to64(cred.rawId),
+   public_key_spki_base64url:to64(key),client_data_json_base64url:to64(cred.response.clientDataJSON),
+   type:cred.type,algorithm:alg});
+  say("演示注册完成。请继续审阅要批准的事项。");
+ }catch(e){say("注册未完成："+e.message);}
+ finally{await refresh();}
+});
+q("review").addEventListener("click",async()=>{
+ pending=null;q("target").hidden=true;q("approve").disabled=true;
+ try{
+  pending=await api("api/approve/start",{});
+  q("approval").textContent="演示 Goal："+pending.goal_id+"\n版本："+pending.goal_revision+
+   "\n目标："+pending.goal_objective+"\n待确认事项："+pending.criterion+
+   "\n失效时间："+new Date(pending.expires_at_ms).toLocaleString();
+  q("target").hidden=false;q("approve").disabled=false;
+  say("请核对具体事项；仅当你主动点击确认按钮才开始系统验证。");
+ }catch(e){say("读取事项未成功："+e.message);}
+});
+q("approve").addEventListener("click",async()=>{
+ if(!pending)return;const p=pending;q("approve").disabled=true;
+ try{
+  const o=p.public_key;say("等待你本人通过 Windows Hello／安全密钥批准…");
+  const cred=await navigator.credentials.get({publicKey:{
+    challenge:from64(o.challenge),rpId:o.rpId,
+    allowCredentials:o.allowCredentials.map(c=>({type:c.type,id:from64(c.id)})),
+    userVerification:"required",timeout:o.timeout}});
+  if(!cred?.response)throw Error("没有得到签名");
+  const res=await api("api/approve/finish",{request_id:p.request_id,assertion:{
+    id:to64(cred.rawId),type:cred.type,client_data_json_base64url:to64(cred.response.clientDataJSON),
+    authenticator_data_base64url:to64(cred.response.authenticatorData),
+    signature_base64url:to64(cred.response.signature)}});
+  if(!res.confirmed)throw Error("后端未完成确认");
+  pending=null;q("target").hidden=true;say("成功：通行密钥已签名并确认隔离演示 Goal。");
+ }catch(e){say("批准未完成："+e.message);}
+ finally{q("approve").disabled=false;await refresh();}
+});
+refresh();
+})();
+</script></body></html>

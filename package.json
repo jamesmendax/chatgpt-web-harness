@@ -1,0 +1,68 @@
+{
+  "name": "chatgpt-local-coder",
+  "version": "3.1.0-alpha.2",
+  "description": "Turn ChatGPT web into a local coding agent via MCP — files, shell, git, apply_patch, semantic code intelligence, and task-driven Skill discovery",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/hoangcoderr/chatgpt-local-coder.git"
+  },
+  "homepage": "https://github.com/hoangcoderr/chatgpt-local-coder#readme",
+  "bugs": {
+    "url": "https://github.com/hoangcoderr/chatgpt-local-coder/issues"
+  },
+  "author": "hoangcoderr",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "codex-mcp-server": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc && node scripts/write-build-manifest.mjs",
+    "test": "npm run build && node scripts/active-test-manifest.mjs daily",
+    "test:all": "node scripts/run-all-tests.mjs",
+    "test:integration": "npm run build && node scripts/test-mcp-bridge-integration.mjs",
+    "test:recovery-supervisor": "npm run build && node scripts/test-service-recovery-supervisor.mjs",
+    "acceptance": "npm --prefix desktop run acceptance",
+    "eval:list": "node scripts/agent-eval.mjs list",
+    "eval:prepare": "node scripts/agent-eval.mjs prepare",
+    "eval:grade": "node scripts/agent-eval.mjs grade",
+    "eval:selftest": "npm run build && node scripts/agent-eval.mjs selftest",
+    "release:bench": "node scripts/release-benchmark-gate.mjs",
+    "test:five-repo": "npm run build && node scripts/test-five-repo-adoption.mjs",
+    "test:providers": "npm run build && node scripts/test-provider-tool-registration.mjs && node scripts/test-provider-health.mjs && node scripts/test-computer-use-session-persistence.mjs && node scripts/test-browser-use-session-lifecycle.mjs && node scripts/test-computer-use-provider.mjs && node scripts/test-browser-use-provider.mjs",
+    "release:candidate": "node .release-tools/build-candidate.cjs",
+    "release:verify": "node .release-tools/verify-stream-release.cjs --check-only",
+    "init-claude-md": "node scripts/init-claude-md.mjs",
+    "start": "node dist/index.js",
+    "dev": "tsx watch src/index.ts",
+    "tunnel": "cloudflared tunnel --url http://localhost:3000"
+  },
+  "keywords": [
+    "mcp",
+    "chatgpt",
+    "coding-agent",
+    "model-context-protocol",
+    "local-development",
+    "filesystem",
+    "git",
+    "apply-patch",
+    "developer-mode",
+    "openai-tunnel"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.30.0",
+    "cors": "2.8.6",
+    "dotenv": "17.4.2",
+    "express": "5.2.1",
+    "playwright-core": "1.62.1",
+    "typescript": "6.0.3",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@types/cors": "2.8.19",
+    "@types/express": "5.0.6",
+    "@types/node": "26.2.0",
+    "tsx": "4.23.11"
+  }
+}

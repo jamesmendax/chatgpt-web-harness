@@ -1,0 +1,299 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "Web Harness · 系统架构",
+    "locale": "zh-CN",
+    "animation": "none",
+    "quality_profile": "showcase",
+    "views": [
+      {
+        "id": "request-path",
+        "label": "ChatGPT 工具调用",
+        "focus": [
+          "web",
+          "tunnel",
+          "mcp",
+          "engine",
+          "filesystem",
+          "computer"
+        ],
+        "note": "请求经安全隧道进入本机 MCP 网关，经权限与意图检查后分派工具。"
+      },
+      {
+        "id": "desktop-and-identity",
+        "label": "桌面与账户边界",
+        "focus": [
+          "aura",
+          "store",
+          "mcp"
+        ],
+        "note": "Aura 负责本机服务和账户，凭据保存在 Windows 用户作用域的加密存储中。"
+      },
+      {
+        "id": "skills-and-state",
+        "label": "Skills 与长任务",
+        "focus": [
+          "engine",
+          "skills",
+          "tasks"
+        ],
+        "note": "按任务路由 Skills，Goal/Task 记录进度、日志和恢复证据。"
+      }
+    ]
+  },
+  "components": [
+    {
+      "id": "web",
+      "type": "external",
+      "label": "ChatGPT 网页端",
+      "sublabel": "MCP 工具调用",
+      "pos": [
+        42,
+        260
+      ],
+      "size": [
+        164,
+        78
+      ]
+    },
+    {
+      "id": "tunnel",
+      "type": "cloud",
+      "label": "安全隧道",
+      "sublabel": "HTTPS · Tunnel",
+      "pos": [
+        264,
+        260
+      ],
+      "size": [
+        160,
+        78
+      ]
+    },
+    {
+      "id": "mcp",
+      "type": "security",
+      "label": "MCP 网关",
+      "sublabel": "本机认证 · 调用准入",
+      "pos": [
+        487,
+        260
+      ],
+      "size": [
+        172,
+        78
+      ]
+    },
+    {
+      "id": "engine",
+      "type": "backend",
+      "label": "工具执行核心",
+      "sublabel": "权限检查 · 能力分发",
+      "pos": [
+        721,
+        260
+      ],
+      "size": [
+        178,
+        78
+      ]
+    },
+    {
+      "id": "skills",
+      "type": "backend",
+      "label": "Skills 智能路由",
+      "sublabel": "发现 · 校验 · 加载",
+      "pos": [
+        721,
+        72
+      ],
+      "size": [
+        178,
+        78
+      ]
+    },
+    {
+      "id": "tasks",
+      "type": "database",
+      "label": "Goal / Task 状态",
+      "sublabel": "日志 · 恢复 · 证据",
+      "pos": [
+        721,
+        455
+      ],
+      "size": [
+        178,
+        78
+      ]
+    },
+    {
+      "id": "filesystem",
+      "type": "backend",
+      "label": "文件 / Shell / Git",
+      "sublabel": "本机工作区操作",
+      "pos": [
+        1036,
+        168
+      ],
+      "size": [
+        180,
+        82
+      ]
+    },
+    {
+      "id": "computer",
+      "type": "backend",
+      "label": "Browser / Computer Use",
+      "sublabel": "网页与桌面操作",
+      "pos": [
+        1036,
+        367
+      ],
+      "size": [
+        180,
+        82
+      ]
+    },
+    {
+      "id": "aura",
+      "type": "frontend",
+      "label": "Aura 桌面客户端",
+      "sublabel": "Electron · 启动与管理",
+      "pos": [
+        264,
+        520
+      ],
+      "size": [
+        194,
+        84
+      ]
+    },
+    {
+      "id": "store",
+      "type": "security",
+      "label": "账户与加密存储",
+      "sublabel": "独立账户 · safeStorage",
+      "pos": [
+        508,
+        520
+      ],
+      "size": [
+        196,
+        84
+      ]
+    }
+  ],
+  "connections": [
+    {
+      "from": "web",
+      "to": "tunnel",
+      "label": "HTTPS",
+      "variant": "emphasis"
+    },
+    {
+      "from": "tunnel",
+      "to": "mcp",
+      "label": "MCP",
+      "variant": "emphasis"
+    },
+    {
+      "from": "mcp",
+      "to": "engine",
+      "label": "校验 / 分发",
+      "variant": "security"
+    },
+    {
+      "from": "engine",
+      "to": "skills",
+      "label": "按任务选择",
+      "variant": "dashed",
+      "fromSide": "top",
+      "toSide": "bottom"
+    },
+    {
+      "from": "engine",
+      "to": "tasks",
+      "label": "状态与回执",
+      "labelAt": [810, 352],
+      "variant": "default",
+      "fromSide": "bottom",
+      "toSide": "top"
+    },
+    {
+      "from": "engine",
+      "to": "filesystem",
+      "label": "受控执行",
+      "variant": "emphasis",
+      "fromSide": "right",
+      "toSide": "left"
+    },
+    {
+      "from": "engine",
+      "to": "computer",
+      "label": "会话操作",
+      "variant": "emphasis",
+      "fromSide": "right",
+      "toSide": "left"
+    },
+    {
+      "from": "aura",
+      "to": "store",
+      "label": "DPAPI",
+      "variant": "security",
+      "fromSide": "right",
+      "toSide": "left"
+    },
+    {
+      "from": "aura",
+      "to": "mcp",
+      "label": "启动与健康状态",
+      "variant": "dashed",
+      "fromSide": "top",
+      "toSide": "bottom"
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "Windows 本机 · 用户隔离环境",
+      "wraps": [
+        "mcp",
+        "engine",
+        "skills",
+        "tasks",
+        "filesystem",
+        "computer",
+        "aura",
+        "store"
+      ],
+      "pad": 18
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "连接路径",
+      "items": [
+        "ChatGPT → HTTPS 隧道 → 本机 MCP",
+        "工具请求先通过身份与执行准入检查"
+      ]
+    },
+    {
+      "dot": "violet",
+      "title": "可扩展能力",
+      "items": [
+        "文件、Shell、Git 与浏览器 / 桌面工具",
+        "Skills 根据任务场景加载对应指导"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "数据边界",
+      "items": [
+        "账户凭据留在本机用户数据目录",
+        "Goal / Task 记录执行进度与恢复状态"
+      ]
+    }
+  ]
+}
