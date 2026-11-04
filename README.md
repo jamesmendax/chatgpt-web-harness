@@ -53,4 +53,4 @@ This is an **unsigned prerelease** and not a fully validated production distribu
 
 ## License & disclaimer
 
-MIT License; see [LICENSE](LICENSE). This project includes MIT-licensed upstream work and third-party notices. Not affiliated with, endorsed by, or operated by OpenAI or GitHub.
+MIT License; see [LICENSE](LICENSE). The tunnel-client component retains its [Apache-2.0 LICENSE](third-party/tunnel-client/LICENSE) and [NOTICE](third-party/tunnel-client/NOTICE); additional third-party notices remain in their respective source directories. Not affiliated with, endorsed by, or operated by OpenAI or GitHub.
