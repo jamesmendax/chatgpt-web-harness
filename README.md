@@ -39,8 +39,8 @@
 
 | 类型 | 下载 |
 | --- | --- |
-| 安装版 | [ChatGPT Web Harness Isolated-3.2.0-setup.exe](https://github.com/jamesmendax/chatgpt-web-harness/releases/download/v3.2.0/ChatGPT%20Web%20Harness%20Isolated-3.2.0-setup.exe) |
-| 便携版 | [ChatGPT Web Harness Isolated-3.2.0-portable.exe](https://github.com/jamesmendax/chatgpt-web-harness/releases/download/v3.2.0/ChatGPT%20Web%20Harness%20Isolated-3.2.0-portable.exe) |
+| 安装版 | [ChatGPT Web Harness Isolated-3.2.0-setup.exe](https://github.com/jamesmendax/chatgpt-web-harness/releases/download/v3.2.0/ChatGPT.Web.Harness.Isolated-3.2.0-setup.exe) |
+| 便携版 | [ChatGPT Web Harness Isolated-3.2.0-portable.exe](https://github.com/jamesmendax/chatgpt-web-harness/releases/download/v3.2.0/ChatGPT.Web.Harness.Isolated-3.2.0-portable.exe) |
 
 安装版按向导安装；便携版直接运行，无需安装。
 

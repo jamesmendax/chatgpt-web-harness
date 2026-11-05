@@ -7,8 +7,8 @@ GitHub 发布标签：`v3.2.0` · 源码：本仓库对应标签
 
 | 类型 | 文件 | SHA-256 |
 | --- | --- | --- |
-| 安装版（Setup） | [ChatGPT Web Harness Isolated-3.2.0-setup.exe](https://github.com/jamesmendax/chatgpt-web-harness/releases/download/v3.2.0/ChatGPT%20Web%20Harness%20Isolated-3.2.0-setup.exe) | `06d85ef8fbe32dc3dc54a1f1dd18ca0661b671b9da8c3be42bec7adb5e3198d5` |
-| 便携版（Portable） | [ChatGPT Web Harness Isolated-3.2.0-portable.exe](https://github.com/jamesmendax/chatgpt-web-harness/releases/download/v3.2.0/ChatGPT%20Web%20Harness%20Isolated-3.2.0-portable.exe) | `81efb476cc08bdff7f7836b82c4d29089e9ce729f270e50db71e9ce9bf6912b8` |
+| 安装版（Setup） | [ChatGPT Web Harness Isolated-3.2.0-setup.exe](https://github.com/jamesmendax/chatgpt-web-harness/releases/download/v3.2.0/ChatGPT.Web.Harness.Isolated-3.2.0-setup.exe) | `06d85ef8fbe32dc3dc54a1f1dd18ca0661b671b9da8c3be42bec7adb5e3198d5` |
+| 便携版（Portable） | [ChatGPT Web Harness Isolated-3.2.0-portable.exe](https://github.com/jamesmendax/chatgpt-web-harness/releases/download/v3.2.0/ChatGPT.Web.Harness.Isolated-3.2.0-portable.exe) | `81efb476cc08bdff7f7836b82c4d29089e9ce729f270e50db71e9ce9bf6912b8` |
 
 建议从 GitHub Releases 下载并验证 SHA-256。Portable 直接运行；Setup 是安装程序。两者与旧版本保持同一产品身份，请在升级前备份既有账号与数据目录，避免在有正在运行的 MCP/Tunnel 时直接替换。
 
