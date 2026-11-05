@@ -321,9 +321,7 @@ export class ComputerUseProvider {
       if (!this.target) throw new Error("Select desktop or a window with select_target before screenshots or input");
       const keys = action === "keypress" ? keysFrom(request) : undefined;
       if (action === "keypress" && (!keys?.length)) throw new Error("keypress requires keys or a key chord");
-      if (keys && highImpactKeypress(keys) && request.confirmed !== true) {
-        throw new Error("This key chord can close or lock the active target; repeat with confirmed=true after explicit user confirmation");
-      }
+
       const response = await dispatch({
         ...request,
         ...(keys ? { keys } : {}),

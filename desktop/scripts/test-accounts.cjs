@@ -10,7 +10,7 @@ const { EventEmitter } = require("node:events");
 const src = path.resolve(__dirname, "../src");
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-function fixture(t) {
+function fixture(t, timers = {}) {
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), "harness-account-test-"));
   const root = path.join(temp, "userData");
   const docs = path.join(temp, "documents");
@@ -32,7 +32,7 @@ function fixture(t) {
       : name.startsWith("./") && !name.endsWith(".json") ? load(real.resolve(name)) : real(name);
     vm.runInNewContext(fs.readFileSync(filename, "utf8"), {
       module, exports: module.exports, require: requireHere, __filename: filename, __dirname: path.dirname(filename),
-      process, Buffer, console, URL, setTimeout, clearTimeout, setInterval, clearInterval, setImmediate,
+      process, Buffer, console, URL, setTimeout: timers.setTimeout || setTimeout, clearTimeout: timers.clearTimeout || clearTimeout, setInterval, clearInterval, setImmediate,
     }, { filename });
     return module.exports;
   }
@@ -413,4 +413,266 @@ test("saving stopped configuration tolerates a status poll but still rejects lif
   assert.throws(() => f.manager.assertStopped("default", { allowStatusRefresh: true }), /先停止/);
   item.services.tunnel.state = "stopped";
   item.refreshing = false;
+});
+
+test("setup IPC admits a read-only refresh and retains live-service fences", async t => {
+  const f = fixture(t), item = f.manager.instance("default"), service = item.services;
+  const main = fs.readFileSync(path.join(src, "main.js"), "utf8");
+  const serviceSource = fs.readFileSync(path.join(src, "services.js"), "utf8");
+  function between(source, start, end) {
+    const first = source.indexOf(start), last = source.indexOf(end, first + start.length);
+    assert(first >= 0 && last > first && source.indexOf(start, first + start.length) < 0, "Expected unique production section: " + start);
+    return source.slice(first, last);
+  }
+  const wrapSource = between(main, "function wrap(handler) {", "\nfunction registerIpc()");
+  const setupSource = between(main, '  ipcMain.handle("setup:run",', '\n  ipcMain.handle("status:get",');
+  const busySource = between(serviceSource, "  async withBusy(fn) {", "\n  async waitFor(");
+  const realWithBusy = vm.runInNewContext("({" + busySource + "})").withBusy;
+  const original = { refresh: service.refresh, collectStatus: service.collectStatus, withBusy: service.withBusy };
+  let release;
+  const heldRefresh = new Promise(resolve => { release = resolve; });
+  const started = [];
+  let handler;
+  try {
+    service.refresh = () => heldRefresh;
+    service.collectStatus = async () => ({});
+    service.withBusy = realWithBusy;
+    const inFlight = f.manager.refreshAll();
+    assert.equal(item.refreshing, true, "Real AccountManager.refreshAll should mark the held poll");
+    assert.throws(() => f.manager.assertStopped(), /先停止/, "Default destructive-operation fence remains in force");
+    vm.runInNewContext(wrapSource + "\n" + setupSource, {
+      accounts: f.manager, services: f.manager.services,
+      isTrustedIpcSource: () => true, mainWindow: {}, expectedAuraUrl: "fixture", quitting: false,
+      runSetup: async payload => { started.push(payload); return { accepted: true }; },
+      ipcMain: { handle(name, fn) { assert.equal(name, "setup:run"); handler = fn; } },
+    });
+    for (const key of ["busy", "mcp", "tunnel"]) {
+      if (key === "busy") service.busy = true;
+      else service[key].state = "running";
+      const denied = await handler({}, { case: key });
+      assert.equal(denied.ok, false, key + " must reject setup");
+      assert.match(denied.error, /先停止/);
+      assert.equal(started.length, 0, key + " must not invoke runSetup");
+      if (key === "busy") service.busy = false;
+      else service[key].state = "stopped";
+    }
+    const pendingSetup = handler({}, { case: "read-only-refresh" });
+    await delay(0);
+    assert.equal(started.length, 1, "A read-only poll must not prevent setup");
+    assert.equal(started[0].case, "read-only-refresh");
+    assert.equal(service.busy, false, "withBusy releases after the setup function, even while its final refresh waits");
+    release();
+    const result = await pendingSetup;
+    assert.equal(result.ok, true, result.error);
+    assert.equal(result.result.accepted, true);
+    await inFlight;
+    assert.equal(item.refreshing, false);
+  } finally {
+    release();
+    if (f.manager.refreshPromise) await f.manager.refreshPromise;
+    service.refresh = original.refresh;
+    service.collectStatus = original.collectStatus;
+    service.withBusy = original.withBusy;
+    service.busy = false;
+    service.mcp.state = "stopped";
+    service.tunnel.state = "stopped";
+  }
+});
+
+test("account removal reserves a stopped target until its active status poll completes", async t => {
+  const f = fixture(t);
+  const workspace = path.join(f.temp, "removal-workspace");
+  fs.mkdirSync(workspace);
+  fs.writeFileSync(path.join(workspace, "keep.txt"), "workspace retained");
+  f.manager.run("default", () => f.config.save({ ...f.config.load(), workspacePath: workspace }));
+  const survivor = await f.manager.create({ name: "survivor" });
+  const survivorFile = path.join(survivor.dataDir, "config.json");
+  const survivorBytes = fs.readFileSync(survivorFile);
+  const registryPath = path.join(f.root, "accounts.json");
+  const originalRegistry = fs.readFileSync(registryPath);
+  const configPath = path.join(f.root, "config.json");
+  const item = f.manager.instance("default");
+  const oldRefresh = item.services.refresh;
+  let release, refreshCalls = 0;
+  const hold = new Promise(resolve => { release = resolve; });
+  let observed;
+  try {
+    item.services.refresh = async () => { refreshCalls++; await hold; return {}; };
+    const poll = f.manager.refreshAll();
+    assert.equal(item.refreshing, true, "actual refreshAll must hold the target poll");
+    const removal = f.manager.remove("default");
+    observed = removal.then(value => ({ value }), error => ({ error }));
+    await delay(0);
+    assert.equal(f.manager.removingIds.has("default"), true, "removal reserves the target while poll is active");
+    assert.equal(fs.readFileSync(registryPath).equals(originalRegistry), true, "registry must remain unchanged while waiting");
+    assert.equal(fs.existsSync(configPath), true, "target configuration must not be archived during refresh");
+    assert.equal(fs.existsSync(path.join(f.root, "account-recovery")), false, "no archive before refresh finishes");
+    assert.throws(() => f.manager.run("default", () => f.manager.services.startMcp()), /正在移除/, "target start must be fenced");
+    const joinedPoll = f.manager.refreshAll();
+    assert.equal(refreshCalls, 1, "no new target poll while the existing batch is active");
+    release();
+    await poll; await joinedPoll;
+    const result = await observed;
+    assert.ifError(result.error);
+    assert.equal(result.value.removedId, "default");
+    assert.equal(result.value.backup.created, true);
+    assert.equal(fs.existsSync(path.join(result.value.backup.path, "config.json")), true);
+    assert.equal(f.manager.removingIds.has("default"), false);
+    assert.equal(fs.readFileSync(survivorFile).equals(survivorBytes), true);
+    assert.equal(fs.readFileSync(path.join(workspace, "keep.txt"), "utf8"), "workspace retained");
+  } finally {
+    release();
+    if (observed) await observed;
+    if (f.manager.refreshPromise) await f.manager.refreshPromise;
+    item.services.refresh = oldRefresh;
+  }
+});
+
+test("account removal retains busy, running-service and unowned-refresh fences", async t => {
+  const f = fixture(t);
+  await f.manager.create({ name: "survivor" });
+  f.manager.run("default", () => f.config.save(f.config.load()));
+  const originalConfig = fs.readFileSync(path.join(f.root, "config.json"));
+  const item = f.manager.instance("default"), service = item.services;
+  const registryPath = path.join(f.root, "accounts.json");
+  const registry = fs.readFileSync(registryPath);
+  const configPath = path.join(f.root, "config.json");
+  try {
+    for (const state of ["busy", "mcp", "tunnel", "unowned-refresh"]) {
+      if (state === "busy") service.busy = true;
+      else if (state === "unowned-refresh") {
+        assert.equal(f.manager.refreshPromise, null);
+        item.refreshing = true;
+      } else service[state].state = "running";
+      await assert.rejects(f.manager.remove("default"), /先停止/, state + " must block removal");
+      assert.equal(f.manager.removingIds.has("default"), false, state + " must release reservation");
+      assert.equal(fs.readFileSync(registryPath).equals(registry), true, state + " must preserve registry");
+      assert.equal(fs.readFileSync(configPath).equals(originalConfig), true);
+      assert.equal(fs.existsSync(path.join(f.root, "account-recovery")), false);
+      service.busy = false; service.mcp.state = "stopped"; service.tunnel.state = "stopped"; item.refreshing = false;
+    }
+  } finally {
+    service.busy = false; service.mcp.state = "stopped"; service.tunnel.state = "stopped"; item.refreshing = false;
+  }
+});
+
+for (const interruption of ["busy", "shutdown"]) test("account removal releases its reservation when " + interruption + " occurs while waiting", async t => {
+  const f = fixture(t);
+  await f.manager.create({ name: "survivor" });
+  f.manager.run("default", () => f.config.save(f.config.load()));
+  const originalConfig = fs.readFileSync(path.join(f.root, "config.json"));
+  const item = f.manager.instance("default"), service = item.services, oldRefresh = service.refresh;
+  const registryPath = path.join(f.root, "accounts.json"), registry = fs.readFileSync(registryPath);
+  let release;
+  const hold = new Promise(resolve => { release = resolve; });
+  let outcome;
+  try {
+    service.refresh = async () => { await hold; return {}; };
+    const poll = f.manager.refreshAll();
+    assert.equal(item.refreshing, true);
+    outcome = f.manager.remove("default").then(value => ({ value }), error => ({ error }));
+    await delay(0);
+    assert.equal(f.manager.removingIds.has("default"), true, "target must be reserved while waiting");
+    if (interruption === "busy") service.busy = true;
+    else f.manager.shuttingDown = true;
+    release(); await poll;
+    const result = await outcome;
+    assert(result.error, "removal must fail rather than archive");
+    assert.match(result.error.message, interruption === "busy" ? /先停止/ : /退出/);
+    assert.equal(f.manager.removingIds.has("default"), false);
+    assert.equal(fs.readFileSync(registryPath).equals(registry), true);
+    assert.equal(fs.readFileSync(path.join(f.root, "config.json")).equals(originalConfig), true);
+    assert.equal(fs.existsSync(path.join(f.root, "account-recovery")), false);
+  } finally {
+    release();
+    if (outcome) await outcome;
+    if (f.manager.refreshPromise) await f.manager.refreshPromise;
+    service.refresh = oldRefresh;
+    service.busy = false;
+    f.manager.shuttingDown = false;
+  }
+});
+
+test("account removal times out a held status poll without archiving or cancelling it", async t => {
+  let fireDeadline, cleared = false;
+  const deadlineToken = {};
+  const f = fixture(t, {
+    setTimeout(fn, ms, ...args) {
+      if (ms !== 15000) return setTimeout(fn, ms, ...args);
+      assert.equal(fireDeadline, undefined, "one removal deadline");
+      fireDeadline = fn;
+      return deadlineToken;
+    },
+    clearTimeout(token) {
+      if (token === deadlineToken) { cleared = true; return; }
+      clearTimeout(token);
+    },
+  });
+  await f.manager.create({ name: "survivor" });
+  f.manager.run("default", () => f.config.save(f.config.load()));
+  const originalConfig = fs.readFileSync(path.join(f.root, "config.json"));
+  const item = f.manager.instance("default"), service = item.services, oldRefresh = service.refresh;
+  const registryPath = path.join(f.root, "accounts.json"), registry = fs.readFileSync(registryPath);
+  let release;
+  const hold = new Promise(resolve => { release = resolve; });
+  let outcome;
+  try {
+    service.refresh = async () => { await hold; return {}; };
+    const poll = f.manager.refreshAll();
+    assert.equal(item.refreshing, true);
+    outcome = f.manager.remove("default").then(value => ({ value }), error => ({ error }));
+    await delay(0);
+    assert.equal(f.manager.removingIds.has("default"), true);
+    assert.equal(typeof fireDeadline, "function", "production 15-second deadline is installed");
+    assert.throws(() => f.manager.run("default", () => f.manager.services.startMcp()), /正在移除/);
+    fireDeadline();
+    const result = await outcome;
+    assert(result.error);
+    assert.match(result.error.message, /刷新.*未移除/);
+    assert.equal(cleared, true, "deadline timer was cleared");
+    assert.equal(item.refreshing, true, "timeout must not cancel the active poll");
+    assert.equal(f.manager.removingIds.has("default"), false, "timeout releases reservation");
+    assert.equal(fs.readFileSync(registryPath).equals(registry), true);
+    assert.equal(fs.readFileSync(path.join(f.root, "config.json")).equals(originalConfig), true);
+    assert.equal(fs.existsSync(path.join(f.root, "account-recovery")), false);
+    release(); await poll;
+  } finally {
+    release();
+    if (outcome) await outcome;
+    if (f.manager.refreshPromise) await f.manager.refreshPromise;
+    service.refresh = oldRefresh;
+  }
+});
+
+test("account removal reservation prevents a new target poll during port allocation", async t => {
+  const f = fixture(t), item = f.manager.instance("default"), service = item.services;
+  f.manager.run("default", () => f.config.save(f.config.load()));
+  const oldRefresh = service.refresh, oldPortFree = f.manager.portFree;
+  let release, refreshCalls = 0, portCalls = 0;
+  const hold = new Promise(resolve => { release = resolve; });
+  let outcome;
+  try {
+    service.refresh = async () => { refreshCalls++; return {}; };
+    f.manager.portFree = async () => { portCalls++; await hold; return true; };
+    outcome = f.manager.remove("default").then(value => ({ value }), error => ({ error }));
+    await delay(0);
+    assert(portCalls > 0, "last-account port allocation must be in flight");
+    assert.equal(f.manager.removingIds.has("default"), true);
+    await f.manager.refreshAll();
+    assert.equal(refreshCalls, 0, "reserved target must be skipped by a new refresh batch");
+    assert.throws(() => f.manager.run("default", () => f.manager.services.startMcp()), /正在移除/);
+    assert.equal(fs.existsSync(path.join(f.root, "config.json")), true);
+    assert.equal(fs.existsSync(path.join(f.root, "account-recovery")), false);
+    release();
+    const result = await outcome;
+    assert.ifError(result.error);
+    assert.equal(result.value.removedId, "default");
+    assert.equal(result.value.backup.created, true);
+    assert.equal(f.manager.removingIds.has("default"), false);
+  } finally {
+    release();
+    if (outcome) await outcome;
+    service.refresh = oldRefresh;
+    f.manager.portFree = oldPortFree;
+  }
 });

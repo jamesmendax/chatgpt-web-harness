@@ -1,5 +1,4 @@
-import fs from "node:fs";
-import fsp from "node:fs/promises";
+import fs, { physicalPromises as fsp } from "./physical-fs.js";
 import path from "node:path";
 import os from "node:os";
 

@@ -12,6 +12,7 @@ import { getUpstreamManager } from "./mcp-upstream-manager.js";
 import { refreshProxiedTools } from "./mcp-tool-proxy.js";
 import { runCodexSessionStartHooks } from "./codex-hooks.js";
 import { runWithMcpRequestIdentity } from "./mcp-request-identity.js";
+import { appendActivity } from "./activity-log.js";
 import { PersistentMcpEventStore } from "./mcp-event-store.js";
 import { disposeBrowserUseProvider } from "./browser-use-registry.js";
 
@@ -336,6 +337,10 @@ export function createSessionManager(config: SessionManagerConfig): SessionManag
       const sid = transport.sessionId;
       const message = error.message || String(error);
       if (sid) lastTransportErrors[sid] = message;
+      // A shared transport error is a session observation. Without a direct
+      // request receipt it cannot be assigned to whichever RPC finishes next.
+      appendActivity({ kind: "session", action: "transport_error", status: "error", session_id: sid,
+        summary: message, details: { correlation: "session_only", tool_result_status: "unobserved" } });
     };
 
     // Keep session alive across transient SSE disconnects; explicit DELETE cleans up.
@@ -458,7 +463,7 @@ export function createSessionManager(config: SessionManagerConfig): SessionManag
         if (sid) beginSessionRequest(sid);
         try {
           await runWithMcpRequestIdentity(req.headers, sid, () =>
-            session.transport.handleRequest(req, res, body)
+            session.transport.handleRequest(req, res, body), body
           );
           const activeSid = session.transport.sessionId;
           if (activeSid) touch(activeSid);
@@ -511,7 +516,7 @@ export function createSessionManager(config: SessionManagerConfig): SessionManag
         if (sid) beginSessionRequest(sid);
         try {
           await runWithMcpRequestIdentity(req.headers, sid, () =>
-            session.transport.handleRequest(req, res, body)
+            session.transport.handleRequest(req, res, body), body
           );
         } finally {
           if (sid) endSessionRequest(sid);
@@ -585,7 +590,7 @@ export function createSessionManager(config: SessionManagerConfig): SessionManag
       beginSessionRequest(staleSessionId);
       try {
         await runWithMcpRequestIdentity(patchedReq.headers, staleSessionId, () =>
-          recovered.transport.handleRequest(patchedReq, res, body)
+          recovered.transport.handleRequest(patchedReq, res, body), body
         );
       } finally {
         endSessionRequest(staleSessionId);

@@ -8,7 +8,7 @@ import { validatePath } from "../lib/path-security.js";
 import { requireCommandAllowed } from "../lib/permissions.js";
 import { audit } from "../lib/audit.js";
 import { toolAnnotations } from "../lib/tool-annotations.js";
-import { toolResult } from "../lib/tool-result.js";
+import { toolError, toolResult } from "../lib/tool-result.js";
 import { compactOutput, observeCommand } from "../lib/command-observation.js";
 import { childProcessEnv } from "../lib/child-env.js";
 import { toSpillRef } from "../lib/spill.js";
@@ -52,6 +52,7 @@ import {
   bootstrapShellSession,
   createCommandLogPath,
   execInShellSession,
+  execArgvInShellSession,
   getShellStatus,
   resetShellSession,
   getWinShell,
@@ -312,6 +313,9 @@ async function recoveredProcessView(record: ProcessJournalRecord, scope: Capture
     running: effectiveFinished ? false : identity === "same" ? true : identity === "different_or_gone" ? false : null,
     exit_code: hostState?.exit_code ?? record.exit_code,
     signal: hostState?.signal ?? record.signal,
+    execution_mode: hostState?.execution_mode ?? null,
+    output_encoding: hostState?.output_encoding ?? "utf-8",
+    log_error: hostState?.log_error ?? null,
     stdout_chars: hostState?.stdout_bytes ?? null,
     stderr_chars: hostState?.stderr_bytes ?? null,
     full_output_path: record.full_output_path,
@@ -347,11 +351,11 @@ async function processLogOffset(filePath: string, view: ProcessOutputView, offse
   return offset ?? 0;
 }
 
-async function readSeparatedProcessOutput(stdoutPath: string | null | undefined, stderrPath: string | null | undefined, tailChars: number) {
+async function readSeparatedProcessOutput(stdoutPath: string | null | undefined, stderrPath: string | null | undefined, tailChars: number, encoding = "utf-8") {
   const maxBytes = Math.min(800_000, Math.max(4096, tailChars * 4));
   const [stdoutTail, stderrTail] = await Promise.all([
-    readTextTail(stdoutPath, maxBytes),
-    readTextTail(stderrPath, maxBytes),
+    readTextTail(stdoutPath, maxBytes, encoding),
+    readTextTail(stderrPath, maxBytes, encoding),
   ]);
   return {
     rawStdout: stdoutTail.text.slice(-tailChars),
@@ -370,9 +374,12 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
     {
       title: "Run Command",
       description:
-        "Run short shell checks, bounded to at most 90 seconds including queue time. For longer work use start_process once, retain its id/log path, and poll process_status/process_output. Never rerun a side effect just because result delivery failed. Cwd persists; use shell_status to inspect it.",
+        "Run a PowerShell script directly on Windows (bash on other platforms), or provide executable and args for exact argv without shell expansion. Run short checks bounded to at most 90 seconds including queue time. For longer work use start_process once, retain its id/log path, and poll process_status/process_output. Never rerun a side effect just because result delivery failed. Cwd persists; use shell_status to inspect it.",
       inputSchema: {
-        command: z.string(),
+        command: z.string().optional(),
+        executable: z.string().min(1).optional(),
+        args: z.array(z.string()).optional(),
+        output_encoding: z.string().optional().default("utf-8").describe("External program output encoding, e.g. utf-8, gbk, cp936, utf-16le"),
         working_directory: z.string().optional().describe("One-off override; does not reset persistent cwd unless you use shell_reset"),
         output_mode: z.enum(["compact", "full", "none"]).optional().default("compact"),
         output_chars: z.number().int().min(1000).max(50000).optional().default(12000).describe("Output preview characters: 1000–50000; default 12000"),
@@ -380,8 +387,24 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
 
       annotations: toolAnnotations("command"),
     },
-    async ({ command, working_directory, output_mode, output_chars }) => {
+    async ({ command: shellCommand, executable, args, output_encoding, working_directory, output_mode, output_chars }) => {
       pruneFinishedProcesses();
+      if ((shellCommand !== undefined) === (executable !== undefined) || (args !== undefined && !executable)) {
+        return toolError("run_command", "Provide command OR executable with args, exclusively", {
+          error_code: "COMMAND_INPUT_INVALID", outcome_kind: "needs_input", failure_phase: "validation",
+          failure_step: "command_arguments", operation_started: false, may_have_partially_completed: false,
+          retry_policy: "retry_with_changed_args",
+        });
+      }
+      try { new TextDecoder(output_encoding.toLowerCase() === "cp936" ? "gbk" : output_encoding); }
+      catch {
+        return toolError("run_command", `Unsupported output encoding: ${output_encoding}`, {
+          error_code: "COMMAND_INPUT_INVALID", outcome_kind: "needs_input", failure_phase: "validation",
+          failure_step: "output_encoding", operation_started: false, may_have_partially_completed: false,
+          retry_policy: "retry_with_changed_args",
+        });
+      }
+      const command = shellCommand ?? JSON.stringify([executable, ...(args ?? [])]);
       requireCommandAllowed(command);
       const cwdOverride = working_directory ? await validatePath(working_directory) : undefined;
       const cwd = cwdOverride ?? (getShellStatus().cwd || defaultCwd);
@@ -399,7 +422,9 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
           remote_deadline_known: scope?.deadlineAt !== undefined }, { ok: false });
       }
       const result = await withSynchronousCommandSlot(
-        (remainingMs) => execInShellSession(command, defaultCwd, remainingMs, cwdOverride),
+        (remainingMs) => executable !== undefined
+          ? execArgvInShellSession(executable, args ?? [], defaultCwd, remainingMs, cwdOverride, output_encoding)
+          : execInShellSession(command, defaultCwd, remainingMs, cwdOverride, output_encoding),
         localBudget, scope?.signal,
       );
       await audit({
@@ -419,8 +444,10 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
       return toolResult("run_command", { ...compact, ...verificationCompletionSnapshots, ...(spill ? { spill } : {}),
         execution_budget_ms: localBudget, remote_deadline_known: scope?.deadlineAt !== undefined,
         ...(result.exit_code !== 0 ? {
-          error_code: result.timed_out ? "COMMAND_TIMED_OUT" : result.exit_code === null ? "COMMAND_INTERRUPTED" : "COMMAND_EXIT_NONZERO",
-          outcome_kind: "execution_error", failure_phase: "execution", operation_started: true,
+          error_code: !result.operation_started ? "COMMAND_SPAWN_FAILED" : result.timed_out ? "COMMAND_TIMED_OUT" : result.exit_code === null ? "COMMAND_INTERRUPTED" : "COMMAND_EXIT_NONZERO",
+          outcome_kind: "execution_error", failure_phase: "execution", failure_step: result.operation_started ? "command" : "spawn",
+          operation_started: result.operation_started ?? false,
+          may_have_partially_completed: result.operation_started ?? false,
           retryable: false, retry_policy: "inspect_original_result",
         } : {}),
         ...(result.timed_out ? { timeout_layer: "local_command_budget", recovery: "Inspect the log and artifacts before deciding whether a new managed job is needed. Do not assume a UI timeout or repeat completed side effects." } : {}),
@@ -465,12 +492,29 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
   server.registerTool(
     "start_process",
     {
-      description: "Start a durable background command; observe or control it with process tools.",
-      inputSchema: { command: z.string(), working_directory: z.string().optional() },
+      description: "Start a durable background PowerShell script (bash on other platforms), or executable with exact args; observe or control it with process tools.",
+      inputSchema: { command: z.string().optional(), executable: z.string().min(1).optional(), args: z.array(z.string()).optional(), output_encoding: z.string().optional().default("utf-8"), working_directory: z.string().optional() },
 
       annotations: toolAnnotations("command"),
     },
-    async ({ command, working_directory }) => {
+    async ({ command: shellCommand, executable, args: argv, output_encoding, working_directory }) => {
+      if ((shellCommand !== undefined) === (executable !== undefined) || (argv !== undefined && !executable)) {
+        return toolError("start_process", "Provide command OR executable with args, exclusively", {
+          error_code: "COMMAND_INPUT_INVALID", outcome_kind: "needs_input", failure_phase: "validation",
+          failure_step: "command_arguments", operation_started: false, may_have_partially_completed: false,
+          retry_policy: "retry_with_changed_args",
+        });
+      }
+      const encoding = output_encoding.toLowerCase() === "cp936" ? "gbk" : output_encoding;
+      try { new TextDecoder(encoding); }
+      catch {
+        return toolError("start_process", `Unsupported output encoding: ${output_encoding}`, {
+          error_code: "COMMAND_INPUT_INVALID", outcome_kind: "needs_input", failure_phase: "validation",
+          failure_step: "output_encoding", operation_started: false, may_have_partially_completed: false,
+          retry_policy: "retry_with_changed_args",
+        });
+      }
+      const command = shellCommand ?? JSON.stringify([executable, ...(argv ?? [])]);
       const processScope = captureProcessScope(defaultCwd);
       requireProcessScope(processScope);
       requireCommandAllowed(command);
@@ -484,25 +528,22 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
       let effectiveCommand = command;
       let args = ["-lc", effectiveCommand];
 
-      if (process.platform === "win32") {
+      if (process.platform === "win32" && executable === undefined) {
         const winShellInfo = getWinShell();
         shell = winShellInfo.shell;
         if (!winShellInfo.isPwsh) {
           effectiveCommand = transpileCompoundOperators(command);
         }
+        effectiveCommand = "$OutputEncoding = [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new(); " + effectiveCommand;
         args = ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", effectiveCommand];
       }
+      if (executable !== undefined) { shell = executable; args = argv ?? []; }
 
       const id = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
       const fullOutputPath = createCommandLogPath(defaultCwd);
       if (!fullOutputPath) throw new Error("PROCESS_LOG_UNAVAILABLE: unable to reserve persistent command log");
       const control = processControlPaths(defaultCwd, id);
       const hostScript = fileURLToPath(new URL("../process-host.js", import.meta.url));
-      const runtimeScope = getRuntimeScope();
-      await runtimeScope?.beforeDispatch?.();
-      const effectLease = runtimeScope?.goalEffectLease;
-      if (processScope.goal_id && !effectLease) throw new Error("GOAL_PROCESS_EFFECT_CONTEXT_REQUIRED");
-      const effectLaunch = effectLease ? await effectLease.prepareManagedProcess(id, processCommandHash(command)) : undefined;
       await writeProcessHostSpec(control.spec, {
         version: 1,
         id,
@@ -514,7 +555,8 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
         stderr_path: control.stderr,
         state_path: control.state,
         control_dir: control.controlDir,
-        ...(effectLaunch ? { goal_effect: effectLaunch } : {}),
+        output_encoding: encoding,
+        execution_mode: executable === undefined ? "shell" : "argv",
       });
       const host = spawn(process.execPath, [hostScript, control.spec], {
         cwd,
@@ -529,18 +571,38 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
           NO_COLOR: "1",
         },
       });
-      if (!host.pid) throw new Error("PROCESS_HOST_START_FAILED: detached host has no pid");
+      // Spawn failures emit asynchronously even when no PID was assigned.
+      host.once("error", () => undefined);
+      if (!host.pid) {
+        await fs.rm(control.spec, { force: true }).catch(() => undefined);
+        return toolResult("start_process", {
+          id, ...processOwnershipMetadata(processScope), error: "Process host did not start",
+          error_code: "PROCESS_HOST_START_FAILED", outcome_kind: "execution_error",
+          failure_phase: "execution", failure_step: "host_spawn", operation_started: false,
+          may_have_partially_completed: false, retryable: false, retry_policy: "inspect_original_result",
+          full_output_path: fullOutputPath,
+        }, { ok: false });
+      }
       host.unref();
       let hostState: ProcessHostState;
       try {
         // The host captures two bounded process-start identities before ACK.
         hostState = await waitForProcessHostState(control.state, 10_000);
       } catch (error) {
-        try { host.kill("SIGKILL"); } catch {}
-        throw error;
+        // The host may already have started its child. Do not kill or launch a
+        // replacement: retain enough paths and identity for later inspection.
+        return toolResult("start_process", {
+          id, ...processOwnershipMetadata(processScope), host_pid: host.pid, command, cwd,
+          execution_mode: executable === undefined ? "shell" : "argv", output_encoding: encoding,
+          full_output_path: fullOutputPath, stdout_path: control.stdout, stderr_path: control.stderr,
+          state_path: control.state, control_dir: control.controlDir,
+          error: String(error), error_code: "PROCESS_HOST_START_UNKNOWN", outcome_kind: "unknown",
+          failure_phase: "execution", failure_step: "host_acknowledgement", operation_started: null,
+          may_have_partially_completed: true, retryable: false, retry_policy: "inspect_original_result",
+          recovery: "Inspect the original host state and logs; do not repeat the operation without determining its outcome.",
+        }, { ok: false });
       }
       if (!hostState.child_pid) throw new Error("PROCESS_HOST_START_FAILED: child pid missing");
-      if (effectLaunch) await effectLease!.confirmManagedProcess(effectLaunch, host.pid);
       const [processStartIdentity, hostStartIdentity] = await Promise.all([
         hostState.child_start_identity === undefined ? readProcessStartIdentity(hostState.child_pid) : hostState.child_start_identity,
         hostState.host_start_identity === undefined ? readProcessStartIdentity(host.pid) : hostState.host_start_identity,
@@ -583,6 +645,10 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
         pid: item.pid,
         host_pid: item.hostPid,
         command,
+        execution_mode: executable === undefined ? "shell" : "argv",
+        output_encoding: encoding,
+        stdout_path: control.stdout,
+        stderr_path: control.stderr,
         cwd,
         started_at: item.startedAt,
         full_output_path: item.fullOutputPath,
@@ -625,6 +691,9 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
             running: state.running,
             exit_code: state.exit_code,
             signal: state.signal,
+            execution_mode: state.execution_mode ?? null,
+            output_encoding: state.output_encoding ?? "utf-8",
+            log_error: state.log_error ?? null,
             stdout_chars: state.stdout_bytes,
             stderr_chars: state.stderr_bytes,
             stdin_open: state.stdin_open,
@@ -753,7 +822,8 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
         }, { summary: `paged output for ${id}` });
       }
 
-      const separated = await readSeparatedProcessOutput(stdoutPath, stderrPath, tail_chars);
+      const outputState = item ? item.lastState : await readProcessHostState(recovered!.state_path);
+      const separated = await readSeparatedProcessOutput(stdoutPath, stderrPath, tail_chars, outputState?.output_encoding);
       let rawStdout = separated.rawStdout;
       let rawStderr = separated.rawStderr;
       if (!stdoutPath && !stderrPath) {
@@ -783,6 +853,12 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
         signal,
         stdout,
         stderr,
+        output_encoding: outputState?.output_encoding ?? "utf-8",
+        execution_mode: outputState?.execution_mode ?? null,
+        log_error: outputState?.log_error ?? null,
+        decode_anomaly: outputState?.decode_anomaly ?? false,
+        raw_stdout_path: stdoutPath,
+        raw_stderr_path: stderrPath,
         stdout_chars: stdoutChars ?? separated.stdoutBytes,
         stderr_chars: stderrChars ?? separated.stderrBytes,
         full_output_path: fullOutputPath,

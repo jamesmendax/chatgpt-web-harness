@@ -45,6 +45,7 @@ async function signature(paths: string[]): Promise<string> {
 }
 async function watchPaths(roots: string[], skills: ResolvedSkill[]): Promise<string[]> {
   const paths = new Set<string>();
+  for (const root of roots) paths.add(path.join(root, "anthropic-official-skills", "children.json"));
   const addSkill = (file: string) => {
     paths.add(file);
     paths.add(path.dirname(file));

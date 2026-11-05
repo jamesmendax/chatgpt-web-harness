@@ -68,22 +68,14 @@ try {
   const restored = await getDurableTask(workspace, created.id);
   if (restored.goal !== created.goal) throw new Error("task did not persist");
 
-  let blocked = false;
-  try {
-    await completeDurableTask(workspace, created.id);
-  } catch (error) {
-    blocked = String(error).includes("blocking check");
-  }
-  if (!blocked) throw new Error("completion was not blocked by failed blocking check");
-
   const updated = await updateDurableTask(workspace, created.id, {
     current_step: "Ready to deliver",
-    blocking_checks: [{ name: "tests pass", passed: true, detail: "ok" }],
   });
-  if (!updated.blocking_checks[0]?.passed) throw new Error("blocking check update failed");
+  if (updated.blocking_checks[0]?.passed) throw new Error("failed check changed without evidence");
 
   const completed = await completeDurableTask(workspace, created.id, "Delivered");
   if (completed.status !== "completed" || !completed.completed_at) throw new Error("task did not complete");
+  if (completed.completion_basis?.verification !== "model_declared" || completed.completion_basis.unmet_checks[0]?.passed !== false || completed.blocking_checks[0]?.passed !== false) throw new Error("declaration must preserve the unmet check");
   if (completed.advisory_checks[0]?.passed) throw new Error("advisory check unexpectedly changed");
 
   const listed = await listDurableTasks(workspace, { status: "completed" });
@@ -189,22 +181,13 @@ try {
       blocking_checks: [{ name: "concurrent blocker", passed: false, detail: "must prevent completion" }],
     }).then(() => ({ rejected: false }), (error) => ({ rejected: true, error: String(error) }));
     releaseRead();
-    let completionRejected = false;
-    try {
-      await completing;
-    } catch (error) {
-      completionRejected = String(error).includes("blocking check");
-    }
+    await completing;
     const checkpointResult = await checkpointing;
     const raced = await getDurableTask(workspace, raceTask.id);
     const hasConcurrentBlocker = raced.blocking_checks.some((check) => check.name === "concurrent blocker" && !check.passed);
-    if (raced.status === "completed") {
-      if (!checkpointResult.rejected || hasConcurrentBlocker) {
-        throw new Error("completed task retained a concurrent failed blocker or accepted a terminal checkpoint");
-      }
-    } else if (!completionRejected || !hasConcurrentBlocker) {
-      throw new Error("completion did not reject after the concurrent failed blocking check");
-    }
+    if (raced.status !== "completed") throw new Error("completion declaration was lost");
+    if (checkpointResult.rejected && hasConcurrentBlocker) throw new Error("rejected checkpoint changed the task");
+    if (!checkpointResult.rejected && (!hasConcurrentBlocker || !raced.completion_basis.unmet_checks.some(check => check.name === "concurrent blocker"))) throw new Error("accepted concurrent checkpoint was omitted from completion basis");
     console.log("OK durable task completion/checkpoint race is linearizable");
   } finally {
     releaseRead();

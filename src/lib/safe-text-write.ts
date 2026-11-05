@@ -1,4 +1,4 @@
-import fs from "node:fs/promises";
+import { physicalPromises as fs } from "./physical-fs.js";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 

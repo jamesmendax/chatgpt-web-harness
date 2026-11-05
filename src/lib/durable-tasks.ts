@@ -7,6 +7,7 @@ import { getVisualReviewFreshness } from "./visual-review-state.js";
 import { assertGoalAllowsTaskCompletion, assertGoalCreationIdle, getGoal, goalDefinitionFingerprint, goalVisibleToSession, withGoalTaskDefinitionFence, withGoalTaskDefinitionFences } from "./goal-state-store.js";
 import { appendHarnessEventSafe, type HarnessEvidenceKind } from "./harness-events.js";
 import { getRuntimeScope } from "./runtime-scope.js";
+import { accountProjectDir } from "./account-project-scope.js";
 import { inferProjectRootsFromPaths, inferProjectScope, isPathWithinRoots } from "./project-scope.js";
 import { notifyStateInvalidated } from "./state-invalidate.js";
 
@@ -86,6 +87,7 @@ export interface DurableTask {
   created_at: string;
   updated_at: string;
   completed_at?: string;
+  completion_basis?: { declaration: string; declared_at: string; verification: "model_declared"; unmet_checks: TaskCheck[] };
 }
 
 export interface TaskHandoff {
@@ -102,6 +104,7 @@ export interface TaskHandoff {
   next_actions: string[];
   changed_files: string[];
   artifacts: string[];
+  completion_basis?: DurableTask["completion_basis"];
   blocking_remaining: number;
   advisory_remaining: number;
   observed_checks: TaskCheck[];
@@ -371,6 +374,7 @@ function normalizeTask(
     created_at: raw.created_at,
     updated_at: raw.updated_at,
     ...(raw.completed_at ? { completed_at: raw.completed_at } : {}),
+    ...(raw.completion_basis ? { completion_basis: raw.completion_basis } : {}),
     ...(raw.last_failure ? { last_failure: raw.last_failure } : {}),
     ...(raw.last_mutation_at ? { last_mutation_at: raw.last_mutation_at } : {}),
     ...(raw.visual_review ? { visual_review: raw.visual_review } : {}),
@@ -383,7 +387,7 @@ function projectSlug(workspaceRoot: string): string {
 
 export function durableTaskDir(workspaceRoot: string): string {
   const base = process.env.CODEX_HOME || path.join(os.homedir(), ".codex");
-  return path.join(base, "projects", projectSlug(workspaceRoot), "tasks");
+  return path.join(accountProjectDir(path.join(base, "projects", projectSlug(workspaceRoot))), "tasks");
 }
 
 function activeTaskPath(workspaceRoot: string): string {
@@ -772,8 +776,7 @@ export async function createDurableTask(
     updated_at: now,
   };
   await withGoalTaskDefinitionFence(workspaceRoot, () => withWorkspaceLock(workspaceRoot, async () => {
-    await assertGoalCreationIdle(workspaceRoot);
-    const currentGoal = await getGoal(workspaceRoot);
+    const currentGoal = await getGoal(workspaceRoot).catch(() => null);
     if (currentGoal) {
       task.goal_id = currentGoal.id;
       task.goal_definition_sha256 = goalDefinitionFingerprint(currentGoal);
@@ -801,7 +804,6 @@ export async function updateDurableTask(
     if (patch.status === "completed") {
       throw new Error("TASK_COMPLETION_GATE_REQUIRED: use completeDurableTask to enforce current Goal definition and blocking checks.");
     }
-    await assertGoalCreationIdle(workspaceRoot);
     const task = await getDurableTask(workspaceRoot, taskId);
     const next: DurableTask = {
       ...task,
@@ -841,7 +843,6 @@ export async function revalidateDurableTaskGoalDefinition(
     throw new Error("GOAL_STALE_REVISION: revalidation requires a positive expected_goal_revision.");
   }
   return withGoalTaskDefinitionFence(workspaceRoot, () => withWorkspaceLock(workspaceRoot, async () => {
-    await assertGoalCreationIdle(workspaceRoot);
     const task = await getDurableTask(workspaceRoot, taskId);
     if (task.status !== "active" && task.status !== "blocked") {
       throw new Error("TASK_REVALIDATION_TERMINAL: a completed or cancelled Task cannot be rebound.");
@@ -946,7 +947,6 @@ export async function checkpointDurableTask(
 ): Promise<DurableTask> {
   const task = await resolveDurableTask(workspaceRoot, taskId);
   return withWorkspaceLock(workspaceRoot, async () => {
-    await assertGoalCreationIdle(workspaceRoot);
     const current = await getDurableTask(workspaceRoot, task.id);
     if (current.status === "completed" || current.status === "cancelled") {
       throw new Error(`Cannot checkpoint task: task is already ${current.status}.`);
@@ -1010,6 +1010,7 @@ export function taskHandoff(task: DurableTask): TaskHandoff {
     changed_files: task.changed_files.slice(-16),
     artifacts: task.artifacts.slice(-16),
     blocking_remaining: task.blocking_checks.filter((check) => !check.passed).length,
+    ...(task.completion_basis ? { completion_basis: task.completion_basis } : {}),
     advisory_remaining: task.advisory_checks.filter((check) => !check.passed).length,
     ...(task.blocked ? { blocked: task.blocked } : {}),
     observed_checks: task.observed_checks.slice(-12),
@@ -1333,55 +1334,15 @@ export async function recordToolObservation(
 
 export async function completeDurableTask(workspaceRoot: string, taskId: string, note?: string): Promise<DurableTask> {
   return withGoalTaskDefinitionFence(workspaceRoot, () => withWorkspaceLock(workspaceRoot, async () => {
-  await assertGoalCreationIdle(workspaceRoot);
   const task = await getDurableTask(workspaceRoot, taskId);
   if (task.status === "completed" || task.status === "cancelled") throw new Error(`Cannot complete task: task is already ${task.status}.`);
-  const failedBlocking = task.blocking_checks.filter((check) => !check.passed);
-  if (failedBlocking.length > 0) {
-    throw new Error(
-      `Cannot complete task: ${failedBlocking.length} blocking check(s) are not passed: ${failedBlocking.map((c) => c.name).join(", ")}. ` +
-      `Keep executing toward the remaining checks — a progress update is not a stop condition.`
-    );
-  }
-  // Match the persisted Task -> Goal binding, not ambient text or an old Task
-  // from a superseded Goal. Local Task checks may pass while Goal stays active.
-  await assertGoalAllowsTaskCompletion(workspaceRoot, task.goal_id, task.goal_definition_sha256);
-  if (task.visual_required) {
-    if (!task.visual_review) {
-      throw new Error("Cannot complete task: visual review is required but no current visual_review result is recorded.");
-    }
-    const freshness = await getVisualReviewFreshness(workspaceRoot, task.visual_review.review_id);
-    if (!freshness.machine_ready) {
-      throw new Error(`Cannot complete task: visual review has machine blocking issue(s): ${freshness.record.machine_blocking_issues.join("; ")}`);
-    }
-    if (!freshness.model_visual_ready) {
-      const assessment = freshness.record.model_visual_assessment;
-      if (assessment?.verdict === "fail") {
-        throw new Error(`Cannot complete task: model visual assessment failed: ${assessment.issues.join("; ") || assessment.summary || "visual defects remain"}. Revise the artifact, rerun visual_review, inspect the new rendered pixels, and assess again.`);
-      }
-      if (assessment?.verdict === "pass" && !freshness.model_visual_coverage.complete) {
-        const missing = freshness.model_visual_coverage.missing_pages.slice(0, 12);
-        throw new Error(`Cannot complete task: model visual assessment passed for the delivered pages, but full visual coverage is incomplete. Missing page(s): ${missing.join(", ")}${freshness.model_visual_coverage.missing_pages.length > missing.length ? ", ..." : ""}. Run visual_review for the next missing pages, inspect every returned page image, and assess that review_id.`);
-      }
-      throw new Error("Cannot complete task: the latest rendered pixels have not been semantically inspected and passed by the model. Inspect the full render/page images returned by visual_review, then call visual_review action=assess with verdict=pass and inspected_full_render=true.");
-    }
-    if (freshness.verifiable && !freshness.fresh) {
-      throw new Error(`Cannot complete task: ${freshness.reason} Run visual_review again after the latest source change.`);
-    }
-    if (!freshness.verifiable && task.last_mutation_at && task.last_mutation_at > task.visual_review.reviewed_at) {
-      throw new Error("Cannot complete task: the project changed after the latest live/remote visual review. Run visual_review again.");
-    }
-    if (!freshness.model_visual_iteration_ready) {
-      const opportunities = freshness.model_visual_iteration.improvement_opportunities.slice(0, 5);
-      const iteration = freshness.model_visual_iteration;
-      throw new Error(`Cannot complete task: the model passed the current visual version but identified worthwhile further improvement. Continue visual iteration ${Math.min(iteration.current_iteration + 1, iteration.max_iterations)} of ${iteration.max_iterations} before delivery: ${opportunities.join("; ") || "see model visual iteration notes"}.`);
-    }
-  }
+  const unmetChecks = [...task.blocking_checks, ...task.advisory_checks].filter((check) => !check.passed);
   const now = new Date().toISOString();
   const next: DurableTask = {
     ...task,
     status: "completed",
-    current_step: "Deliverable ready",
+    completion_basis: { declaration: note?.trim() || "Model declared task complete", declared_at: now, verification: "model_declared", unmet_checks: unmetChecks },
+    current_step: "Model declared complete",
     notes: note?.trim() ? [...task.notes, note.trim()] : task.notes,
     updated_at: now,
     completed_at: now,

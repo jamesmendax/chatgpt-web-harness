@@ -406,11 +406,23 @@ class AccountManager extends EventEmitter {
   remove(id) {
     return this.enqueue(async () => {
       this.record(id);
-      this.assertStopped(id);
+      this.assertStopped(id, { allowStatusRefresh: true });
       const root = this.root(), scope = this.scope(id);
       this.removingIds.add(id);
       let backup = null, replacement = null, replacementConfig = null, committed = false;
       try {
+        // Reserve before awaiting: refreshAll and service starts skip this account.
+        // Drain the current status batch before moving any profile-owned files.
+        if (this.instances.get(id)?.refreshing && this.refreshPromise) {
+          let timer;
+          try {
+            await Promise.race([this.refreshPromise, new Promise((_, reject) => {
+              timer = setTimeout(() => reject(new Error("账号状态刷新尚未结束，未移除账号；请稍后重试。")), 15000);
+            })]);
+          } finally { clearTimeout(timer); }
+        }
+        if (this.shuttingDown) throw new Error("程序正在退出，已取消账号移除。");
+        this.assertStopped(id);
         const recoveryRoot = containedTree(root, path.join(root, "account-recovery"));
         if (fs.existsSync(recoveryRoot) && !fs.statSync(recoveryRoot).isDirectory()) throw new Error("账号恢复备份位置不是目录。");
         let accounts = this.registry.accounts.filter(row => row.id !== id);

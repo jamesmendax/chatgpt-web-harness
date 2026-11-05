@@ -13,7 +13,8 @@ import {
   type BrowserTurnFenceState,
   type BrowserTurnSnapshot,
 } from "../lib/browser-turn-fence.js";
-import { findBrowserExecutable } from "../lib/browser-runtime.js";
+import { launchBrowser } from "../lib/browser-runtime.js";
+import { resolveBrowserTarget } from "../lib/browser-target.js";
 import { saveBrowserTurnCheckpoint } from "../lib/browser-turn-checkpoint.js";
 import { browserPageTargetId, rebindBrowserPageToTarget } from "../lib/browser-session-rebind.js";
 import { registerRuntimeStatusProvider } from "../lib/runtime-status-registry.js";
@@ -55,6 +56,7 @@ interface BrowserTurnSelectors {
 
 const sessions = new Map<string, BrowserSession>();
 let sharedBrowser: Browser | null = null;
+let sharedBrowserPath: string | null = null;
 let cleanupTimer: NodeJS.Timeout | null = null;
 
 function idleTtlMs(): number {
@@ -78,6 +80,7 @@ async function closeSharedBrowserIfUnused(): Promise<void> {
   if (sessions.size === 0 && sharedBrowser) {
     const browser = sharedBrowser;
     sharedBrowser = null;
+    sharedBrowserPath = null;
     await browser.close().catch(() => {});
   }
 }
@@ -108,27 +111,15 @@ function ensureCleanupTimer(): void {
 async function ensureBrowser(): Promise<Browser> {
   await cleanupIdleSessions();
   if (sharedBrowser?.isConnected()) return sharedBrowser;
-  const executablePath = findBrowserExecutable();
-  if (!executablePath) {
-    throw new Error("No supported Chromium browser found. Set CHATGPT_BROWSER_PATH to Edge/Chrome/Chromium executable.");
-  }
-  sharedBrowser = await chromium.launch({
-    executablePath,
-    headless: true,
-    args: ["--disable-gpu", "--no-first-run", "--disable-extensions"],
-  });
+  const launched = await launchBrowser();
+  sharedBrowser = launched.browser;
+  sharedBrowserPath = launched.executablePath;
   ensureCleanupTimer();
   return sharedBrowser;
 }
 
 async function resolveTarget(raw: string): Promise<string> {
-  const trimmed = raw.trim();
-  if (/^https?:\/\//i.test(trimmed)) return new URL(trimmed).toString();
-  if (/^file:\/\//i.test(trimmed)) return trimmed;
-  const localPath = await validatePath(trimmed);
-  const stat = await fs.stat(localPath);
-  if (!stat.isFile()) throw new Error("Local browser target must be a file");
-  return pathToFileURL(localPath).toString();
+  return (await resolveBrowserTarget(raw)).target;
 }
 
 function attachDiagnostics(session: BrowserSession): void {
@@ -305,7 +296,7 @@ export function registerBrowserTools(server: McpServer): void {
         target: z.string().min(1),
         width: z.number().int().min(320).max(3840).optional().default(1440),
         height: z.number().int().min(240).max(2160).optional().default(1000),
-        wait_until: z.enum(["load", "domcontentloaded", "networkidle", "commit"]).optional().default("load"),
+        wait_until: z.enum(["load", "domcontentloaded", "networkidle", "commit"]).optional().default("domcontentloaded"),
         timeout_ms: z.number().int().min(1000).max(120000).optional().default(30000),
       },
       annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true, idempotentHint: false },
@@ -334,7 +325,7 @@ export function registerBrowserTools(server: McpServer): void {
           const resolvedTarget = await resolveTarget(target);
           await page.goto(resolvedTarget, { waitUntil: wait_until, timeout: timeout_ms });
           const [data, image] = await Promise.all([pageMetadata(session), snapshot(session)]);
-          return browserImageResult("browser_open", data, image, `browser_open: ${page.url()}`);
+          return browserImageResult("browser_open", { ...data, browser: sharedBrowserPath, browser_version: browser.version(), width, height }, image, `browser_open: ${page.url()}`);
         } catch (error) {
           await closeSession(session.id);
           throw error;
@@ -388,7 +379,7 @@ export function registerBrowserTools(server: McpServer): void {
 
         if (action === "navigate") {
           if (!url) throw new Error("navigate requires url");
-          await page.goto(await resolveTarget(url), { waitUntil: "load", timeout: timeout_ms });
+          await page.goto(await resolveTarget(url), { waitUntil: "domcontentloaded", timeout: timeout_ms });
         } else if (action === "click") {
           if (!selector) throw new Error("click requires selector");
           await page.locator(selector).click({ timeout: timeout_ms });

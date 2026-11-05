@@ -1,5 +1,7 @@
-import fs from "node:fs/promises";
-import { createReadStream } from "node:fs";
+import type { FileHandle } from "node:fs/promises";
+import { physicalPromises as fs } from "./physical-fs.js";
+import physicalFs from "./physical-fs.js";
+const { createReadStream } = physicalFs;
 import { createHash, randomUUID } from "node:crypto";
 import { withCanonicalFileLock } from "./safe-text-write.js";
 
@@ -21,7 +23,7 @@ async function targetHash(file: string): Promise<string | null> {
     return hash;
   } catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") return null; throw e; }
 }
-export async function writeAll(handle: Pick<fs.FileHandle, "write">, buffer: Buffer, offset: number): Promise<void> {
+export async function writeAll(handle: Pick<FileHandle, "write">, buffer: Buffer, offset: number): Promise<void> {
   let done = 0;
   while (done < buffer.length) {
     const { bytesWritten } = await handle.write(buffer, done, buffer.length - done, offset + done);

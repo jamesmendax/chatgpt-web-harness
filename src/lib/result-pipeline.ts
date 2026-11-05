@@ -53,10 +53,8 @@ export class WebHarnessResultPipeline {
     }
     await suppressErrors(() => this.operations.recordToolObservation(context, result));
     await suppressErrors(() => this.operations.recordGoalStallTelemetry());
-    const withGoalRunEvidence = await this.operations.appendGoalRunEvidenceToResult(
-      context,
-      result
-    );
+    const withGoalRunEvidence = await optionalAppend("goal_evidence", result,
+      value => this.operations.appendGoalRunEvidenceToResult(context, value));
     const withHarnessContext = await optionalAppend("runtime_context", withGoalRunEvidence,
       value => this.operations.appendHarnessRuntimeContextToResult(context, value));
     return optionalAppend("repeat_reminder", withHarnessContext,
@@ -73,8 +71,7 @@ export class WebHarnessResultPipeline {
   }
 }
 
-/** Optional guidance must not turn a completed handler into an apparent failure.
- * Goal evidence above is intentionally required and still propagates errors. */
+/** Work-record failures cannot turn a completed operation into an apparent failure. */
 async function optionalAppend(stage: string, result: CallToolResult,
   append: (value: CallToolResult) => MaybePromise<CallToolResult>): Promise<CallToolResult> {
   try { return await append(result); }

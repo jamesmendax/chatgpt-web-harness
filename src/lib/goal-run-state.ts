@@ -115,6 +115,12 @@ export interface GoalRun {
   readonly lease: GoalRunLease | null;
   readonly stopReason: GoalRunStopReason | null;
   readonly timestamps: GoalRunTimestamps;
+  readonly completionBasis?: {
+    readonly verification: "model_declared" | "legacy_record";
+    readonly declaration: string;
+    readonly declaredAt: string;
+    readonly unverifiedCriterionIds: readonly string[];
+  };
 }
 
 export interface CreateGoalRunInput {
@@ -260,6 +266,7 @@ export type GoalRunEvent =
     }
   | { readonly type: "request_finalize" }
   | { readonly type: "complete" }
+  | { readonly type: "declare_complete"; readonly declaration: string; readonly unverifiedCriterionIds: readonly string[] }
   | {
       readonly type: "pause";
       readonly pauseKind?: "manual" | "no_progress";
@@ -475,6 +482,7 @@ function cloneWait(wait: GoalRunWaitCondition | null): GoalRunWaitCondition | nu
 function cloneRun(run: GoalRun): GoalRun {
   return {
     ...run,
+    ...(run.completionBasis ? { completionBasis: { ...run.completionBasis, unverifiedCriterionIds: [...run.completionBasis.unverifiedCriterionIds] } } : {}),
     criteria: run.criteria.map(cloneCriterion),
     typedEvidence: run.typedEvidence.map(cloneEvidence),
     waitCondition: cloneWait(run.waitCondition),
@@ -504,6 +512,10 @@ function freezeRun(run: GoalRun): GoalRun {
   freezeWait(run.waitCondition);
   if (run.lease) Object.freeze(run.lease);
   if (run.stopReason) Object.freeze(run.stopReason);
+  if (run.completionBasis) {
+    Object.freeze(run.completionBasis.unverifiedCriterionIds);
+    Object.freeze(run.completionBasis);
+  }
   Object.freeze(run.timestamps);
   return Object.freeze(run);
 }
@@ -694,7 +706,17 @@ function validateRun(run: GoalRun): void {
   } else if (run.stopReason) {
     fail("INVALID_INPUT", `${run.state} must not carry stopReason`);
   }
-  if ((run.state === "READY_TO_FINALIZE" || run.state === "COMPLETED") && !allCriteriaConfirmed(run)) {
+  if (run.completionBasis) {
+    if (run.state !== "COMPLETED" || !["model_declared", "legacy_record"].includes(run.completionBasis.verification)) fail("INVALID_INPUT", "completionBasis requires a completed run and known provenance");
+    text(run.completionBasis.declaration, "completionBasis.declaration", 2000);
+    canonicalTime(run.completionBasis.declaredAt, "completionBasis.declaredAt");
+    if (!Array.isArray(run.completionBasis.unverifiedCriterionIds) || new Set(run.completionBasis.unverifiedCriterionIds).size !== run.completionBasis.unverifiedCriterionIds.length ||
+        run.completionBasis.unverifiedCriterionIds.some(id => !criterionIds.has(id)) ||
+        run.criteria.some(criterion => !criterion.confirmed && !run.completionBasis!.unverifiedCriterionIds.includes(criterion.id))) {
+      fail("INVALID_INPUT", "completionBasis must include every unconfirmed criterion and only known criterion IDs");
+    }
+  }
+  if ((run.state === "READY_TO_FINALIZE" || (run.state === "COMPLETED" && !run.completionBasis)) && !allCriteriaConfirmed(run)) {
     fail("CRITERIA_UNMET", `${run.state} requires every criterion to be confirmed`);
   }
   normalizeLease(run.lease);
@@ -1268,6 +1290,21 @@ export function advanceGoalRun(
       };
       effects.push({ type: "FINALIZATION_READY" });
       summary = "All criteria confirmed; ready to finalize";
+      break;
+    }
+
+    case "declare_complete": {
+      assertState(base, event.type, ["RUNNING", "WAITING_TOOL", "WAITING_EXTERNAL_PROCESS", "WAITING_USER", "READY_TO_FINALIZE", "WAITING_CONTROL_PLANE", "NO_PROGRESS_PAUSED", "INTERRUPTED"]);
+      const ids = [...new Set(event.unverifiedCriterionIds)];
+      const declaration = text(event.declaration, "event.declaration", 2000);
+      releaseLeaseEffect(base, effects);
+      next = {
+        ...next, state: "COMPLETED", waitCondition: null, lease: null, stopReason: null, nextAction: null,
+        completionBasis: { verification: "model_declared", declaration, declaredAt: now, unverifiedCriterionIds: ids },
+        timestamps: { ...next.timestamps, completedAt: now },
+      };
+      effects.push({ type: "RUN_COMPLETED", runId: base.runId });
+      summary = `Model declared run ${base.runId} complete`;
       break;
     }
 

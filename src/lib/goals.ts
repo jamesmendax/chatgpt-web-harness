@@ -57,11 +57,19 @@ export {
   resumeGoal,
   cancelGoal,
   completeGoal,
-  confirmGoalCriterion,
   goalSummary,
   formatActiveGoalForInstructions,
   assertGoalAllowsTaskCompletion,
 } from "./goal-state-store.js";
+
+/** Compatibility facade: confirmation requires actual recorded evidence. */
+export async function confirmGoalCriterion(
+  workspaceRoot: string,
+  input: { criterion: string; detail?: string; expectedRevision?: number; evidenceIds?: readonly string[] }
+): Promise<DurableGoal> {
+  const { confirmGoalRunCriterion } = await import("./goal-run-web.js");
+  return (await confirmGoalRunCriterion(workspaceRoot, input)).goal;
+}
 
 const {
   assertExpectedRevision, atomicWriteJson, cleanString, currentSessionId,
@@ -161,13 +169,8 @@ async function withCreationRelayGoal<T>(workspaceRoot: string, goalId: string, o
   return withRelayGoalTransition(workspaceRoot, currentRelayGoal(workspaceRoot), goalId, operation);
 }
 
-async function assertCreationDriverIdle(workspaceRoot: string, goalId: string): Promise<void> {
-  await withCreationRelayGoal(workspaceRoot, goalId, async () => {
-    const lease = await readDriverLease(workspaceRoot, goalId);
-    if (lease && activeDriverMutationCount(workspaceRoot, lease.lease_id) > 0) {
-      throw new Error("GOAL_CREATION_DRIVER_BUSY: the previous Goal still has an executing mutation; retry after it settles.");
-    }
-  });
+async function assertCreationDriverIdle(_workspaceRoot: string, _goalId: string): Promise<void> {
+  // Prior Driver admission state does not block a new Goal.
 }
 
 /** Explicit, authorized recovery; status/getGoal never calls this. */
@@ -230,7 +233,7 @@ export async function createGoal(
     if (!owner && previous && ["active", "paused"].includes(previous.status) && !input.supersede) {
       throw new Error("An active goal already exists. For a DIFFERENT task in a session-less client use supersede=true.");
     }
-    if (previous) await assertCreationDriverIdle(workspaceRoot, previous.id);
+    // Legacy Driver admission does not gate Goal replacement.
     const now = new Date().toISOString();
     const next: DurableGoal = {
       version: 1, id: randomUUID(), revision: 1, ...definition, status: "active",

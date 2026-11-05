@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { runWithMcpRequestIdentity, getMcpRequestIdentity } from '../dist/lib/mcp-request-identity.js';
 import {
   consumeMcpOutcome,
   getMcpOutcomeStoreStats,
@@ -16,6 +17,7 @@ const failureResult = {
   isError: true,
 };
 
+runWithMcpRequestIdentity({}, 'transport-fixture', () => {
 observeMcpToolResult({ requestId: 7, tool: 'fixture_tool', invocationId: 'inv-success', result: successResult });
 observeMcpToolResult({ requestId: 7, tool: 'fixture_tool', invocationId: 'inv-failure-result', result: failureResult });
 observeMcpInvocationFailure({ requestId: 7, tool: 'fixture_tool', invocationId: 'inv-throw' });
@@ -32,6 +34,8 @@ assert.deepEqual(first, {
   client_delivery: 'unknown',
   invocation_id: 'inv-success',
   observed_at: first.observed_at,
+  request_instance_id: getMcpRequestIdentity().requestInstanceId,
+  runtime_instance_id: getMcpRequestIdentity().runtimeInstanceId,
 });
 assert.match(first.observed_at, /^\d{4}-\d{2}-\d{2}T/);
 assert.equal(JSON.stringify(first).includes('secret_payload'), false);
@@ -51,4 +55,13 @@ assert.equal(third.invocation_id, 'inv-throw');
 assert.equal(consumeMcpOutcome(7, 'fixture_tool'), undefined);
 assert.equal(getMcpOutcomeStoreStats().observations, 0);
 
-console.log('mcp-outcome-correlation: FIFO request/tool correlation, success/error layering, consume-once semantics, bounded metadata-only storage, and unknown client delivery OK');
+});
+observeMcpToolResult({ requestId: 7, tool: 'fixture_tool', invocationId: 'unattributed', result: successResult });
+assert.equal(consumeMcpOutcome(7, 'fixture_tool'), undefined, 'unattributed observations cannot be matched globally');
+await Promise.all(['left', 'right'].map(name => runWithMcpRequestIdentity({}, 'shared-transport', async () => {
+  observeMcpToolResult({ requestId: 7, tool: 'fixture_tool', invocationId: name, result: successResult });
+  await new Promise(resolve => setTimeout(resolve, name === 'left' ? 12 : 1));
+  assert.equal(consumeMcpOutcome(7, 'fixture_tool').invocation_id, name, 'same RPC id and tool cannot consume another request');
+})));
+assert.equal(getMcpOutcomeStoreStats().observations, 0);
+console.log('mcp-outcome-correlation: request-instance isolation, typed RPC IDs, consume-once and metadata-only storage OK');

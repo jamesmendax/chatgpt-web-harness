@@ -125,13 +125,20 @@ button { border: 0; background: none; cursor: pointer; padding: 0; }
 [hidden] { display: none !important; }
 #scene { position: fixed; inset: 0; width: 100%; height: 100%; display: block; z-index: 0; }
 .no-webgl body, .no-webgl #scene { background: radial-gradient(1200px 700px at 18% 20%, var(--surface-solid), var(--paper)); }
-.no-webgl [data-orb] { background: radial-gradient(circle at 34% 30%, #fff, #b9c6ff 30%, #a07cff 58%, #ff8fbd 86%); border-radius: 50%; }
+.no-webgl { --static-orb-material:
+  radial-gradient(ellipse at 31% 25%, rgba(255,255,255,.98) 0%, rgba(232,250,255,.72) 6%, rgba(255,255,255,0) 23%),
+  radial-gradient(circle at 39% 32%, transparent 43%, rgba(28,18,95,.52) 100%),
+  radial-gradient(ellipse at 72% 22%, #f5b2ee 0%, rgba(213,107,244,.85) 21%, rgba(183,99,255,0) 53%),
+  radial-gradient(ellipse at 24% 65%, #82e8f6 0%, rgba(72,191,255,.88) 24%, rgba(73,161,255,0) 57%),
+  radial-gradient(ellipse at 72% 78%, #4259d9 0%, rgba(82,72,212,.7) 30%, rgba(99,68,214,0) 61%),
+  radial-gradient(circle at 43% 36%, #d8c5ff 0%, #a17df2 37%, #6768e6 70%, #42318b 100%);
+}
+.no-webgl [data-orb] { background: var(--static-orb-material); border-radius: 50%; }
 /* Without WebGL the presence orb cannot travel: the workspace shows it large in its slot, other pages keep it small. */
-.no-webgl .orb-slot { border-radius: 50%; background: radial-gradient(circle at 34% 30%, #fff, #b9c6ff 30%, #a07cff 58%, #ff8fbd 86%);
-  box-shadow: 0 26px 70px rgba(160, 124, 255, .3), inset -16px -20px 44px rgba(15, 17, 21, .12); }
+.no-webgl .orb-slot { border-radius: 50%; background: var(--static-orb-material);
+  box-shadow: inset 0 0 2px 1px rgba(235,227,255,.55), inset -10px -16px 28px rgba(31,27,102,.2), 0 22px 52px rgba(103,74,196,.16); }
 .no-webgl body[data-view="workspace"] #brand-orb { visibility: hidden; }
-html.no-webgl[data-theme="dark"] [data-orb], html.no-webgl[data-theme="dark"] .orb-slot { background: radial-gradient(circle at 34% 30%, #f4f5fc, #c9cbe0 20%, #8a8ea8 48%, #3a3d4f 78%, #1d1f29); }
-html.no-webgl[data-theme="dark"] .orb-slot { box-shadow: 0 0 90px rgba(185, 165, 255, .2), inset -16px -20px 44px rgba(0, 0, 0, .4); }
+html.no-webgl[data-theme="dark"] .orb-slot { box-shadow: inset 0 0 2px 1px rgba(226,216,255,.5), inset -10px -16px 28px rgba(26,19,88,.3), 0 20px 56px rgba(94,65,192,.18); }
 kbd { font: 11px var(--f-mono); color: var(--ink-3); border: 1px solid var(--line-2); border-radius: 6px; padding: 1px 6px; background: var(--kbd-bg); }
 code { font: 12.5px var(--f-mono); }
 .scroll { overflow: auto; scrollbar-width: thin; scrollbar-color: var(--scrollbar) transparent; }
@@ -680,8 +687,10 @@ main, .bar { transition: opacity 700ms var(--ease); }
 .quiet-details > summary::before { content: ""; width: 5px; height: 5px; border-right: 1px solid currentColor; border-bottom: 1px solid currentColor; transform: rotate(-45deg); transition: transform 180ms var(--ease); }
 .quiet-details[open] > summary::before { transform: rotate(45deg); }
 .quiet-details > summary:hover { color: var(--ink); }
-.quiet-details .data-location, .quiet-details .import-source { margin: 10px 0; padding: 12px 14px; background: var(--wash); border-radius: 12px; }
-.data-location { overflow-wrap: anywhere; user-select: text; font: 12px/1.7 var(--f-mono); }
+.quiet-details .import-source { margin: 10px 0; padding: 12px 14px; background: var(--wash); border-radius: 12px; }
+.data-location-section { margin-top: 20px; }
+.data-path-line .inline { max-width: min(100%, 46ch); }
+.data-path-line input[readonly] { cursor: text; text-overflow: ellipsis; }
 .detail-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 .choice { display: inline-flex; max-width: 100%; vertical-align: baseline; }
 .choice-trigger { display: inline-flex; align-items: center; gap: .6em; min-width: 0; max-width: 100%; padding: 0 2px 1px; border-bottom: 1px solid var(--line-2); border-radius: 0; background: transparent; color: var(--ink); font: inherit; line-height: 1.35; text-align: left; cursor: pointer; transition: border-color 180ms; }
@@ -715,3 +724,8 @@ main, .bar { transition: opacity 700ms var(--ease); }
   .conversation-item { grid-template-columns: minmax(0, 1fr) 48px 76px; }
   .conversation-item > span { grid-column: 1 / -1; }
 }
+
+/* Quality uses the existing Aura segmented control; no captions or help text. */
+.quality-line { display: flex; align-items: center; flex-wrap: wrap; gap: 12px 18px; }
+.quality-line .chips { margin: 0; }
+html[data-quality="static"] *, html[data-quality="static"] *::before, html[data-quality="static"] *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; }

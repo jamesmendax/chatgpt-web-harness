@@ -108,16 +108,15 @@ try {
     name: "goal",
     arguments: {
       action: "create",
-      objective: "Verify Goal Mode keeps the agent focused until evidence is complete",
+      objective: "Verify Goal and Task records preserve evidence",
       success_criteria: [{ name: "tests pass", passed: false, verification: { kind: "command", target: workspace, command: "node --test", files: ["sample.test.mjs"] } }],
       current_phase: "Run harness checks",
     },
   }));
-  if (createdGoal.continue_execution !== true || !String(createdGoal.execution_contract || "").includes("GOAL RUN POLICY") || !String(createdGoal.execution_contract || "").includes("RUNNING")) {
-    throw new Error("goal create result missing the continuation-contract signal");
+  if (createdGoal.goal?.status !== "active" || createdGoal.goal.success_criteria[0]?.passed !== false) {
+    throw new Error("goal creation did not preserve its active state and unverified criterion");
   }
-  // Bind a new Task to the already-active Goal. A Task created before this
-  // Goal is an unrelated stale Task and must fail completion with TASK_GOAL_MISMATCH.
+  // Create a Task while the Goal is active and verify each record separately.
   const created = data(await client.callTool({
     name: "task_state",
     arguments: {
@@ -193,8 +192,8 @@ try {
       next_actions: [],
     },
   }));
-  if (checkpointed.continue_execution !== true || !/remaining Goal criteria|Goal completion requires/.test(String(checkpointed.execution_hint || ""))) {
-    throw new Error("checkpoint result missing the continuation-contract signal");
+  if (checkpointed.handoff?.current_step !== "Ready to deliver") {
+    throw new Error("checkpoint did not preserve the current step");
   }
 
   data(await client.callTool({
@@ -218,9 +217,9 @@ try {
     name: "task_state",
     arguments: { action: "complete", task_id: taskId, note: "Harness integration passed" },
   }));
-  if (!completed.deliverable_ready || completed.handoff.status !== "completed" ||
-      completed.goal_still_active !== true || completed.continue_execution !== true) {
-    throw new Error("Task must finish while explicitly preserving the separate active Goal: " + JSON.stringify(completed));
+  if (completed.deliverable_ready !== false || completed.completion_status !== "model_declared" ||
+      completed.handoff.status !== "completed" || completed.goal_still_active !== true) {
+    throw new Error("Task completion must be recorded as model-declared while preserving the separate active Goal: " + JSON.stringify(completed));
   }
   data(await client.callTool({ name: "goal", arguments: { action: "complete" } }));
 

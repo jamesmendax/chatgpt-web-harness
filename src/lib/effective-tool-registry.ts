@@ -5,11 +5,6 @@ import { getChatGptToolProfile, shouldExposeTool, type ToolProfileName } from ".
 import { TOOL_RESULT_OUTPUT_SCHEMA } from "./tool-result.js";
 import type { RuntimeScope } from "./runtime-scope.js";
 import { SLIM_TOOL_DESCRIPTIONS } from "./slim-tool-descriptions.js";
-import {
-  INTENT_ASSURANCE_FIELD,
-  intentAssuranceInputSchema,
-  toolRequiresExecutionContract,
-} from "./requirement-readiness.js";
 
 export type ToolSource = "native" | "upstream";
 
@@ -89,25 +84,8 @@ export class EffectiveToolRegistry {
         ? { ...config, outputSchema: TOOL_RESULT_OUTPUT_SCHEMA }
         : config;
 
-    // Requirement assurance is a cross-cutting execution concern rather than a
-    // separate MCP tool. Add one compact reserved argument only to tools that
-    // can produce external/user-visible side effects. Keeping it out of read
-    // and harness-control tools lets discovery/Goal setup proceed before the
-    // execution contract is ready and avoids expanding every tools/list item.
-    if (toolRequiresExecutionContract(name, effectiveConfig.annotations)) {
-      const input = effectiveConfig.inputSchema;
-      if (!input || typeof input !== "object" || Array.isArray(input)) {
-        throw new Error(`Tool ${name} cannot receive ${INTENT_ASSURANCE_FIELD}: unsupported input schema shape`);
-      }
-      const shape = input as Record<string, unknown>;
-      if (Object.prototype.hasOwnProperty.call(shape, INTENT_ASSURANCE_FIELD)) {
-        throw new Error(`Tool ${name} uses reserved input field ${INTENT_ASSURANCE_FIELD}`);
-      }
-      effectiveConfig = {
-        ...effectiveConfig,
-        inputSchema: { ...shape, [INTENT_ASSURANCE_FIELD]: intentAssuranceInputSchema },
-      };
-    }
+    // Tool schemas describe execution parameters. Legacy _intent fields are
+    // accepted/ignored by the callback boundary, never advertised or required.
 
     if (source === "native" && this.profile === "slim" && SLIM_TOOL_DESCRIPTIONS[name]) {
       // Human-readable titles duplicate stable tool names. Only display metadata

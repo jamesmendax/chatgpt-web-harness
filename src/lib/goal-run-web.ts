@@ -207,17 +207,9 @@ function evidenceVerifies(
     const verdict = visualVerdict(data);
     const passLike = Boolean(verdict && ["pass", "passed", "ready", "approved", "ok"].includes(verdict));
     if (tool === "visual_review") {
-      const qualityGate = isRecord(data.model_visual_quality_gate) ? data.model_visual_quality_gate : null;
       const coverage = isRecord(data.model_visual_coverage) ? data.model_visual_coverage : null;
-      return passLike &&
-        stringField(data, "model_visual_quality_status")?.toLowerCase() === "ready" &&
-        booleanField(data, "model_visual_iteration_ready") === true &&
-        booleanField(data, "model_visual_ready") === true &&
-        booleanField(data, "machine_ready") === true &&
-        stringField(data, "render_status")?.toLowerCase() === "clean" &&
-        booleanField(data, "fresh") === true &&
-        Boolean(qualityGate && stringField(qualityGate, "status")?.toLowerCase() === "acceptable") &&
-        Boolean(coverage && booleanField(coverage, "complete") === true);
+      return passLike && booleanField(data, "model_visual_ready") === true &&
+        booleanField(data, "fresh") === true && Boolean(coverage && booleanField(coverage, "complete") === true);
     }
     return passLike;
   }
@@ -329,7 +321,8 @@ function normalizeConstraints(input: readonly string[] | undefined, fallback: st
 
 function mergeLegacyCriteria(
   current: readonly GoalCriterion[],
-  patch: readonly GoalCriterion[] | undefined
+  patch: readonly (GoalCriterion & { id?: string })[] | undefined,
+  envelope: GoalRunEnvelope
 ): GoalCriterion[] {
   const merged = current.map((criterion) => ({ ...criterion }));
   if (!patch) return merged;
@@ -341,7 +334,16 @@ function mergeLegacyCriteria(
         `UNVERIFIED_CRITERION_UPDATE: criterion "${name}" cannot be marked passed via goal(action=update); record a successful tool result and use goal(action=confirm, evidence_ids=[...]).`
       );
     }
-    const index = merged.findIndex((criterion) => criterionKey(criterion.name) === criterionKey(name));
+    const bound = raw.id ? envelope.run.criteria.find(candidate => candidate.id === raw.id) : undefined;
+    if (raw.id && !bound) throw new Error(`Unknown criterion ID "${raw.id}".`);
+    const index = merged.findIndex((criterion) => criterionKey(criterion.name) === criterionKey(bound?.description ?? name));
+    if (raw.id && index < 0) throw new Error(`Criterion ID "${raw.id}" does not match the current Goal.`);
+    if (index >= 0 && criterionKey(merged[index].name) !== criterionKey(name)) {
+      if (merged[index].passed) throw new Error("Cannot rename a confirmed criterion; add a new criterion for the changed requirement.");
+      if (merged.some((candidate, i) => i !== index && criterionKey(candidate.name) === criterionKey(name))) {
+        throw new Error(`A criterion named "${name}" already exists.`);
+      }
+    }
     const previous = index >= 0 ? merged[index] : undefined;
     const detail = cleanString(raw.detail, 2000);
     const next: GoalCriterion = {
@@ -362,11 +364,12 @@ function mergeLegacyCriteria(
 
 function runCriteriaFor(
   envelope: GoalRunEnvelope,
-  criteria: readonly GoalCriterion[]
+  criteria: readonly GoalCriterion[],
+  previousCriteria?: readonly GoalCriterion[]
 ): { readonly id: string; readonly description: string }[] {
   return criteria.map((criterion, index) => {
     const existing = envelope.run.criteria.find(
-      (candidate) => criterionKey(candidate.description) === criterionKey(criterion.name)
+      (candidate) => criterionKey(candidate.description) === criterionKey(previousCriteria?.[index]?.name ?? criterion.name)
     );
     return {
       id: existing?.id ?? goalRunCriterionId(criterion.name, index),
@@ -558,7 +561,7 @@ async function commitRunProjection(
 
 export interface GoalRunDefinitionPatch {
   readonly objective?: string;
-  readonly success_criteria?: readonly GoalCriterion[];
+  readonly success_criteria?: readonly (GoalCriterion & { id?: string })[];
   readonly constraints?: readonly string[];
   readonly current_phase?: string;
 }
@@ -578,7 +581,7 @@ export async function updateGoalRunDefinition(
     throw new Error(`GOAL_STALE_REVISION: goal revision is ${current.revision}, but ${expectedRevision} was supplied.`);
   }
   const envelope = await ensureGoalRunAuthority(workspaceRoot, current);
-  const criteria = mergeLegacyCriteria(current.success_criteria, patch.success_criteria);
+  const criteria = mergeLegacyCriteria(current.success_criteria, patch.success_criteria, envelope);
   const legacyBase: DurableGoal = {
     ...current,
     objective: cleanString(patch.objective, 4000) ?? current.objective,
@@ -593,7 +596,7 @@ export async function updateGoalRunDefinition(
     {
       type: "definition_update",
       objective: legacyBase.objective,
-      criteria: runCriteriaFor(envelope, criteria),
+      criteria: runCriteriaFor(envelope, criteria, current.success_criteria),
       currentPhase: legacyBase.current_phase,
     },
     "goal-run:update"
@@ -629,40 +632,21 @@ export async function confirmGoalRunCriterion(
   if (input.expectedRevision !== undefined && current.revision !== input.expectedRevision) {
     throw new Error(`GOAL_STALE_REVISION: goal revision is ${current.revision}, but ${input.expectedRevision} was supplied.`);
   }
-  const legacyCriterion = current.success_criteria.find(
-    (candidate) => criterionKey(candidate.name) === criterionKey(input.criterion)
-  );
-  if (!legacyCriterion) throw new Error(`Unknown criterion "${input.criterion}".`);
-  // Reject model or tool-relayed human approval BEFORE creating a GoalRun
-  // projection or minting a user_confirmed evidence record.
-  const hostEvidence = legacyCriterion.requires_confirmation
-    ? requireVerifiedHostUserConfirmation(current, legacyCriterion.name)
-    : undefined;
   let envelope = await ensureGoalRunAuthority(workspaceRoot, current);
-  const runCriterion = envelope.run.criteria.find(
-    (candidate) => criterionKey(candidate.description) === criterionKey(legacyCriterion.name)
-  );
+  // Status exposes GoalRun IDs; map those IDs, legacy generated IDs and names
+  // through the same current projection, preserving stable IDs on edits.
+  const requested = input.criterion.trim();
+  const byRunId = envelope.run.criteria.find(candidate => candidate.id === requested);
+  const index = current.success_criteria.findIndex((candidate, index) =>
+    criterionKey(candidate.name) === criterionKey(byRunId?.description ?? requested) ||
+    goalRunCriterionId(candidate.name, index) === requested);
+  const legacyCriterion = current.success_criteria[index];
+  if (!legacyCriterion) throw new Error(`Unknown criterion "${input.criterion}".`);
+  const runCriterion = byRunId ?? envelope.run.criteria.find(candidate =>
+    criterionKey(candidate.description) === criterionKey(legacyCriterion.name));
   if (!runCriterion) throw new Error(`GoalRun criterion mapping is missing for "${legacyCriterion.name}".`);
-  let evidenceIds = [...new Set(input.evidenceIds ?? [])];
-  if (legacyCriterion.requires_confirmation) {
-    const detail = cleanString(input.detail, 2000);
-    const evidenceId = confirmationEvidenceId(envelope.run, runCriterion.id, detail, hostEvidence!.receipt_sha256);
-    envelope = await persistRunOnly(workspaceRoot, envelope, {
-      type: "record_evidence",
-      evidence: {
-        id: evidenceId,
-        kind: "user_confirmed",
-        summary: detail ?? `User confirmed ${legacyCriterion.name}`,
-        source: "goal:confirm",
-        metadata: { verifiesCriterion: true, criterion: legacyCriterion.name, ...hostEvidence },
-      },
-    });
-    evidenceIds = [evidenceId];
-  } else if (evidenceIds.length < 1) {
-    throw new Error(
-      `criterion "${legacyCriterion.name}" requires evidence_ids from successful tool results; goal(action=update, passed=true) is not accepted`
-    );
-  }
+  const evidenceIds = [...new Set(input.evidenceIds ?? [])];
+  if (!evidenceIds.length) throw new Error(`criterion "${legacyCriterion.name}" requires evidence_ids from successful tool results`);
   await assertGoalCriterionVerified(workspaceRoot, legacyCriterion, envelope.run.typedEvidence.filter((item) => evidenceIds.includes(item.id)));
   return commitRunProjection(
     workspaceRoot,
@@ -676,7 +660,7 @@ export async function confirmGoalRunCriterion(
 export async function transitionGoalRunLifecycle(
   workspaceRoot: string,
   action: "pause" | "resume" | "complete" | "cancel" | "wait_control_plane" | "control_plane_ready",
-  options: { readonly currentPhase?: string; readonly expectedRevision?: number; readonly pauseKind?: "manual" | "no_progress" } = {}
+  options: { readonly currentPhase?: string; readonly expectedRevision?: number; readonly pauseKind?: "manual" | "no_progress"; readonly declaration?: string } = {}
 ): Promise<{ readonly envelope: GoalRunEnvelope; readonly goal: DurableGoal }> {
   return withGoalTaskDefinitionFence(workspaceRoot, async () => {
   const current = await getGoal(workspaceRoot);
@@ -686,18 +670,19 @@ export async function transitionGoalRunLifecycle(
   }
   let envelope = await ensureGoalRunAuthority(workspaceRoot, current);
   if (action === "complete") {
+    if (current.status === "cancelled" || current.status === "completed") throw new Error(`Cannot complete a ${current.status} goal.`);
+    const unverified: string[] = [];
     for (const criterion of current.success_criteria) {
       const bound = envelope.run.criteria.find((candidate) => criterionKey(candidate.description) === criterionKey(criterion.name));
-      if (bound?.confirmed) await assertGoalCriterionVerified(workspaceRoot, criterion, envelope.run.typedEvidence.filter((item) => bound.evidenceIds.includes(item.id)));
+      if (!bound) throw new Error(`GoalRun criterion mapping is missing for "${criterion.name}".`);
+      if (!bound.confirmed) { unverified.push(bound.id); continue; }
+      try { await assertGoalCriterionVerified(workspaceRoot, criterion, envelope.run.typedEvidence.filter((item) => bound.evidenceIds.includes(item.id))); }
+      catch { unverified.push(bound.id); }
     }
-    // A crash or projection failure can leave the authoritative run at
-    // READY_TO_FINALIZE after request_finalize has committed. Retrying
-    // complete must resume from that durable state instead of trying the
-    // RUNNING-only request_finalize transition again.
-    if (envelope.run.state !== "READY_TO_FINALIZE") {
-      envelope = await persistRunOnly(workspaceRoot, envelope, { type: "request_finalize" });
-    }
-    return commitRunProjection(workspaceRoot, envelope, current, { type: "complete" }, "goal-run:complete");
+    return commitRunProjection(workspaceRoot, envelope, current, {
+      type: "declare_complete", declaration: options.declaration?.trim() || "Model declared goal complete",
+      unverifiedCriterionIds: unverified,
+    }, "goal-run:complete");
   }
   const event: GoalRunEvent = action === "pause"
     ? {

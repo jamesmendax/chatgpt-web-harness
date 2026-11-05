@@ -135,7 +135,7 @@ export function registerContextTools(server: McpServer, workspaceRoot: string): 
           reference_count: loaded.reference_paths?.length ?? 0,
         },
         next_step: loaded.content_complete
-          ? "This body chunk reaches the end. Check content_receipt.coverage_complete, then page resource_catalog and read required references through load_skill(selection_id, resource_path). Do the work and verify it."
+          ? "This body chunk reaches the end. Page resource_catalog and read needed references by name and resource_path. Do the work and verify it."
           : "Primary instructions incomplete. Use continuation with load_skill before applying; read required references, do the work and verify.",
       });
     }
@@ -174,7 +174,7 @@ export function registerContextTools(server: McpServer, workspaceRoot: string): 
     "load_skill",
     {
       title: "Load Skill",
-      description: "Load Skill body or selection-scoped read-only resource; continue with selection ID/cursor/hash. content_complete means this chunk reached EOF, while content_receipt tracks constructed ranges. Application declarations and artifact hash checks are separate evidence, not proof of workflow quality. Use explicit mode only when the user selected it; caller declaration never creates authority.",
+      description: "Load a Skill body or resource by name and resource_path. Continue with the returned cursor and hash; selection_id is optional legacy receipt correlation. Content returned, model application declarations and artifact hash checks are separate evidence. Use explicit mode when the user selected the Skill.",
       inputSchema: {
         name: z.string().min(1).describe("Skill id from list_skills; its alias is also accepted"),
         max_bytes: z.number().int().min(4).max(500000).optional().default(200000),
@@ -196,17 +196,16 @@ export function registerContextTools(server: McpServer, workspaceRoot: string): 
     async ({ name, max_bytes, invocation_mode, expected_content_sha256, offset_bytes, selection_id,
       resource_path, expected_resource_sha256, resource_offset, resource_limit, evidence_action, statement,
       artifact_path, expected_artifact_sha256 }) => {
-      if (evidence_action && evidence_action !== "read" && !selection_id) throw new Error("SKILL_SELECTION_REQUIRED");
       if (evidence_action === "declare_application" && !statement) throw new Error("Skill application requires a model statement.");
       if (evidence_action === "verify_artifact" && (!artifact_path || !expected_artifact_sha256)) throw new Error("Artifact verification requires a path and expected SHA-256.");
       const loaded = await loadProjectSkill(workspaceRoot, name, max_bytes, { mode: invocation_mode, expected_content_sha256, offset_bytes,
         selection_id, resource_path, expected_resource_sha256, resource_offset, resource_limit });
       if (evidence_action === "declare_application" || evidence_action === "verify_artifact") {
-        const selection = await selectSkillContent(workspaceRoot, loaded.skill, invocation_mode, selection_id);
+        const selection = await selectSkillContent(workspaceRoot, loaded.skill, invocation_mode, loaded.selection_id);
         const evidence = evidence_action === "declare_application"
           ? await recordSkillApplication(selection, statement!)
           : await recordSkillArtifact(selection, await validatePath(artifact_path!), expected_artifact_sha256!);
-        return toolResult("load_skill", { selection_id, evidence });
+        return toolResult("load_skill", { selection_id: selection.id, evidence });
       }
       await audit({ tool: "load_skill", action: "read", target: loaded.skill.path, status: "ok", details: { skill_id: loaded.skill.id, invocation_mode, content_sha256: loaded.skill.content_sha256, truncated: loaded.truncated } });
       return toolResult("load_skill", loaded);

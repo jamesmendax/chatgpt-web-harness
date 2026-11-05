@@ -22,6 +22,14 @@
   const icon = cp => h("i", { class: "ic" }, cp);
   const RM = matchMedia("(prefers-reduced-motion: reduce)");
   const params = new URLSearchParams(location.search);
+  let qualityStorage; try { qualityStorage = localStorage; } catch (_) {}
+  let qualityChoice = AuraQuality.read(qualityStorage);
+  let curtainChoice = AuraQuality.readCurtain(qualityStorage);
+  const curtainEnabled = () => AuraQuality.curtainEnabled(curtainChoice, qualityChoice);
+  let graphicsBlocked = params.has("safeGraphics"), closingGraphics = false;
+  const currentTier = () => AuraQuality.tiers[qualityChoice];
+  const motionStopped = () => RM.matches || qualityChoice === "static" || graphicsBlocked;
+  document.documentElement.dataset.quality = qualityChoice;
 
   let core;
   try { core = await HarnessCore.start(); }
@@ -131,7 +139,7 @@
     let v = 0, t = x;
     return {
       set(n) { t = n; }, jump(n) { x = t = n; v = 0; },
-      step(dt) { if (RM.matches) { x = t; v = 0; return x; } const a = -k * (x - t) - c * v; v += a * dt; x += v * dt; if (Math.abs(x - t) < .002 && Math.abs(v) < .002) { x = t; v = 0; } return x; },
+      step(dt) { if (motionStopped()) { x = t; v = 0; return x; } const a = -k * (x - t) - c * v; v += a * dt; x += v * dt; if (Math.abs(x - t) < .002 && Math.abs(v) < .002) { x = t; v = 0; } return x; },
       get value() { return x; }, get target() { return t; }, get idle() { return x === t && v === 0; }
     };
   }
@@ -141,7 +149,7 @@
       el,
       to(start, size) {
         const end = start + size;
-        if (!a || RM.matches) { a = spring(start, 520, 44); b = spring(end, 520, 44); a.jump(start); b.jump(end); return; }
+        if (!a || motionStopped()) { a = spring(start, 520, 44); b = spring(end, 520, 44); a.jump(start); b.jump(end); return; }
         const dir = start >= a.target ? 1 : -1;
         const na = spring(a.value, ...(dir < 0 ? [560, 42] : [200, 25])), nb = spring(b.value, ...(dir > 0 ? [560, 42] : [200, 25]));
         na.set(start); nb.set(end); a = na; b = nb;
@@ -158,7 +166,7 @@
   const bars = [];
   const mk = (el, axis) => { const s = slider(el, axis); bars.push(s); return s; };
   const navBar = mk($("#nav-indicator")), srcBar = mk($("#seg-source .tab-line")), lvlBar = mk($("#seg-level .seg-ind")), modeBar = mk($("#seg-mode .seg-ind"));
-  let toolBar = null, proxyBar = null, remindBar = null;
+  let toolBar = null, proxyBar = null, remindBar = null, qualityBar = null, curtainBar = null;
   function placeIndicators() {
     const x = (b, t, pad = 0) => { if (b && t && t.offsetParent) b.to(t.offsetLeft - pad, t.offsetWidth); };
     x(navBar, $(`#nav [data-view="${ui.view}"]`), 4);
@@ -168,14 +176,26 @@
     if (ui.draft) { x(toolBar, $(`#tool-chips [data-value="${ui.draft.toolProfile}"]`), 4); x(proxyBar, $(`#proxy-chips [data-value="${ui.draft.tunnelProxyMode}"]`), 4); }
     x(themeBar, $(`#theme-chips [data-value="${theme.choice}"]`), 4);
     x(remindBar, $('#remind-chips [aria-checked="true"]'), 4);
-    kick();
+    x(qualityBar, $('#quality-chips [aria-checked="true"]'), 4);
+    x(curtainBar, $('#curtain-chips [aria-checked="true"]'), 4);
+    if (!scene || motionStopped()) bars.forEach(b => b.step(0));
+    else kick();
   }
 
   /* ===================== scene: presence orb, small orbs, edge glow ===================== */
-  const scene = AuraScene.create($("#scene"));
+  // On a renderer-memory emergency the main process reloads the management
+  // UI without WebGL; all controls remain available via the CSS fallback.
+  const sceneOwner = AuraQuality.createOwner({
+    canvas: $("#scene"), create: canvas => AuraScene.create(canvas),
+    replace: old => { const fresh = old.cloneNode(false); fresh.width = fresh.height = 0; old.replaceWith(fresh); return fresh; },
+  });
+  let scene = sceneOwner.enable(!graphicsBlocked && qualityChoice !== "static");
+  document.documentElement.classList.toggle("no-webgl", !scene);
+  let cancelSceneReady = null;
   const P = { x: spring(0, 120, 20), y: spring(0, 120, 20), r: spring(100, 120, 20), vis: spring(1, 90, 19) };
   const on = spring(0, 40, 13), active = spring(0, 60, 15), warm = spring(0, 40, 13), alarm = spring(0, 40, 13), busy = spring(0, 40, 13), dim = spring(0, 90, 19);
   let pulseStart = -1, activeUntil = 0;
+  const choreography = AuraMotion.create();
 
   /* ===================== appearance: day and night ===================== */
   // theme-boot.js already applied the saved choice before first paint; this keeps it in sync afterwards.
@@ -282,9 +302,9 @@
     const accountId=core.snapshot().selectedId,rows=await A.listConversationNames();
     if(core.snapshot().selectedId!==accountId)return;
     const box=$("#conversation-label-list");if(!box)return;
-    text($("#conversation-count"), rows.length ? rows.length + " 个会话" : "");
+    text($("#conversation-count"), "已记录对话 " + rows.length + " 个");
     $("#btn-clear-conversations").disabled = !rows.some(row => !row.pinned);
-    if(!rows.length) {fill(box,h("p",{class:"conversation-empty"},"暂无会话"));return;}
+    if(!rows.length) {fill(box,h("p",{class:"conversation-empty"},"暂无已记录对话"));return;}
     fill(box,rows.map(row=>{
       const input=h("input",{type:"text",maxlength:"40",placeholder:"可选备注",value:row.title||"","aria-label":row.display+" 备注"});
       return h("div",{class:"conversation-item"},
@@ -310,7 +330,8 @@
     const r = el.getBoundingClientRect();
     return { x: r.left + r.width / 2, y: r.top + r.height / 2, r: r.width / 2 };
   }
-  function placePresence(jump) { const T = presenceTarget(), op = jump ? "jump" : "set"; P.x[op](T.x); P.y[op](T.y); P.r[op](T.r); kick(); }
+  // Called during a frame as well as by layout handlers; callers own scheduling.
+  function placePresence(jump) { const T = presenceTarget(), op = jump ? "jump" : "set"; P.x[op](T.x); P.y[op](T.y); P.r[op](T.r); }
   // small orbs: each [data-orb] element carries its own light
   function orbLook(el, o) {
     const g = el._o || (el._o = { light: 0, lightT: 0, shift: 0, frost: 0, flash: 0 });
@@ -342,42 +363,193 @@
     }
     return { minis: out, moving };
   }
-  // adaptive resolution: if frames run long (slow GPU), render fewer pixels; recover when there is headroom
-  const governor = { q: 1, samples: [], step(dt) {
-    this.samples.push(dt); if (this.samples.length < 50) return;
-    const s = this.samples.sort((a, b) => a - b), med = s[s.length >> 1]; this.samples = [];
-    if (med > .024 && this.q > .55) this.q = Math.max(.55, this.q - .15);
-    else if (med < .0175 && this.q < 1) this.q = Math.min(1, this.q + .05);
-  } };
-  let raf = 0, last = 0, settle = 0, inFrame = false;
-  // kick() from inside a frame only extends the settle window; the frame schedules itself once
-  function kick() { settle = 40; if (!raf && !inFrame) raf = requestAnimationFrame(frame); }
+  // Quantized resolution with hysteresis. Returning by .05 each time used to
+  // reallocate the full-size WebGL canvas over and over.
+  const QUALITY_LEVELS = [1, .85, .7, .55];
+  const governor = { q: 1, samples: [], lastChangeAt: -Infinity, memoryPressure: false,
+    step(dt) {
+      this.samples.push(dt);
+      if (this.samples.length < 75) return;
+      const samples = this.samples.sort((a, b) => a - b);
+      const median = samples[samples.length >> 1];
+      this.samples = [];
+      const now = performance.now();
+      if (now - this.lastChangeAt < 4000) return;
+      const index = QUALITY_LEVELS.indexOf(this.q);
+      let next = index;
+      if (median > .028 && index < QUALITY_LEVELS.length - 1) next++;
+      else if (median < .016 && index > 0 && !this.memoryPressure) next--;
+      if (next !== index) { this.q = QUALITY_LEVELS[next]; this.lastChangeAt = now; }
+    },
+    reduceLoad() {
+      this.memoryPressure = true;
+      this.q = Math.min(this.q, .7);
+      this.samples = [];
+      this.lastChangeAt = performance.now();
+    },
+  };
+  let raf = 0, idleTimer = 0, last = 0, settle = 0, inFrame = false;
+  const animationSprings = [P.x, P.y, P.r, P.vis, on, active, warm, alarm, busy, dim, night];
+  const frameValues = new Array(animationSprings.length).fill(0);
+  const frameState = { orb: new Float32Array(4), mood: new Float32Array(4), minis: [], quality: 1 };
+  let renderCount = 0, frameDueAt = 0, lifecycle = 0;
+  const canAnimate = () => Boolean(scene) && !motionStopped() && !closingGraphics && !document.hidden && !params.has("still");
+  function stopFrames() {
+    if (raf) cancelAnimationFrame(raf);
+    if (idleTimer) clearTimeout(idleTimer);
+    raf = idleTimer = last = frameDueAt = 0;
+  }
+  // Called by the trusted Electron main-process memory guard or context loss.
+  // The scene is decorative; never touch IPC, account data or managed services.
+  function disableGraphics() {
+    graphicsBlocked = true;
+    stopFrames(); settle = 0;
+    cancelSceneReady?.(); cancelSceneReady = null;
+    scene = sceneOwner.enable(false);
+    document.documentElement.classList.add("no-webgl");
+    placeIndicators();
+    return true;
+  }
+  function setQuality(value, { persist = true } = {}) {
+    if (!Object.prototype.hasOwnProperty.call(AuraQuality.tiers, value) || closingGraphics) return false;
+    qualityChoice = value;
+    if (persist) AuraQuality.save(qualityStorage, value);
+    document.documentElement.dataset.quality = value;
+    stopFrames(); settle = 0; lifecycle++;
+    cancelSceneReady?.(); cancelSceneReady = null;
+    scene = sceneOwner.enable(!graphicsBlocked && value !== "static");
+    document.documentElement.classList.toggle("no-webgl", !scene);
+    // Deliberate tier changes never reset an existing memory-pressure latch.
+    governor.samples.length = 0;
+    governor.q = governor.memoryPressure ? Math.min(governor.q, .7) : 1;
+    $$("#quality-chips [data-value]").forEach(b => {
+      const checked = b.dataset.value === value;
+      b.setAttribute("aria-checked", String(checked)); b.tabIndex = checked ? 0 : -1;
+    });
+    syncCurtainControls();
+    placePresence(true); placeIndicators();
+    if (scene) {
+      const owned = scene, generation = lifecycle;
+      scene.freeze(RM.matches ? 9 : params.has("t") ? Number(params.get("t")) : null);
+      cancelSceneReady = scene.whenReady(() => {
+        if (scene === owned && generation === lifecycle && !closingGraphics) kick();
+      });
+    }
+    return true;
+  }
+  // A curtain choice is independent of quality and reuses the same scene.
+  function syncCurtainControls() {
+    const selected = curtainEnabled() ? "on" : "off";
+    $$("#curtain-chips [data-value]").forEach(b => {
+      const active = b.dataset.value === selected;
+      b.setAttribute("aria-checked", String(active)); b.tabIndex = active ? 0 : -1;
+    });
+  }
+  function setCurtain(enabled, { persist = true } = {}) {
+    if (typeof enabled !== "boolean" || closingGraphics) return false;
+    curtainChoice = enabled;
+    if (persist) AuraQuality.saveCurtain(qualityStorage, enabled);
+    syncCurtainControls();
+    placeIndicators();
+    if (scene && !document.hidden) kick();
+    return true;
+  }
+  // At the warning threshold, preserve the real shader and animation,
+  // reducing only its pixel workload. Static UI remains emergency-only.
+  function reduceGraphicsLoad() {
+    if (!scene) return false;
+    governor.reduceLoad();
+    // One redraw changes resolution; avoid a synthetic 40-frame animation
+    // burst while the renderer is already under memory pressure.
+    if (idleTimer) { clearTimeout(idleTimer); idleTimer = 0; }
+    if (!document.hidden && !raf && !inFrame) raf = requestAnimationFrame(frame);
+    return true;
+  }
+  globalThis.AuraMemoryGuard = Object.freeze({
+    disable: disableGraphics,
+    reduceLoad: reduceGraphicsLoad,
+    status: () => ({ animated: !!scene && !motionStopped(), selected: qualityChoice, quality: governor.q,
+      memoryPressure: governor.memoryPressure, resources: sceneOwner.status(), frames: renderCount,
+      scheduled: Number(!!raf) + Number(!!idleTimer), tier: currentTier(), blocked: graphicsBlocked, scene: scene?.stats?.() || null,
+      curtain: { selected: curtainEnabled(), effective: curtainEnabled() && !!scene && !motionStopped(), preference: curtainChoice },
+      choreography: choreography.status() }),
+  });
+  function scheduleIdleFrame() {
+    if (!canAnimate() || idleTimer || raf || inFrame) return;
+    // Intentional idle gaps are not slow GPU frames and must not resize the canvas.
+    last = 0;
+    idleTimer = setTimeout(() => {
+      idleTimer = 0;
+      if (canAnimate()) raf = requestAnimationFrame(frame);
+    }, 1000 / currentTier().idleFps);
+  }
+  function kick() {
+    if (!scene || closingGraphics) return;
+    settle = Math.max(1, Math.ceil(currentTier().activeFps * .65));
+    if (idleTimer) { clearTimeout(idleTimer); idleTimer = 0; }
+    if (!document.hidden && !raf && !inFrame) raf = requestAnimationFrame(frame);
+  }
   function frame(now) {
-    raf = 0; inFrame = true;
-    const rawDt = last ? (now - last) / 1000 : 1 / 60, dt = Math.min(.05, rawDt); last = now;
-    if (rawDt < .2) governor.step(rawDt);
-    let moving = false;
+    raf = 0;
+    if (document.hidden || !scene || closingGraphics) { last = 0; return; }
+    const interval = 1000 / currentTier().activeFps;
+    if (frameDueAt && now + .5 < frameDueAt) { raf = requestAnimationFrame(frame); return; }
+    frameDueAt = now + interval;
+    inFrame = true;
+    const rawDt = last ? (now - last) / 1000 : 1 / 60, dt = Math.min(.05, rawDt);
+    if (last && rawDt < .2) governor.step(rawDt * currentTier().activeFps / 60);
+    last = now;
+    if (activeUntil && Date.now() > activeUntil) { activeUntil = 0; active.set(core.snapshot().activity.some(r => r.phase === "running") ? 1 : 0); }
+    // Completion feedback has a finite deadline, even when reduced motion stops idle ticks.
+    let moving = !!activeUntil;
     for (const b of bars) if (!b.step(dt)) moving = true;
     if (ui.view === "workspace" || P.vis.target) placePresence(false);
-    const springs = [P.x, P.y, P.r, P.vis, on, active, warm, alarm, busy, dim, night];
-    const v = springs.map(s => s.step(dt));
-    if (springs.some(s => !s.idle)) moving = true;
-    if (activeUntil && Date.now() > activeUntil) { activeUntil = 0; active.set(core.snapshot().activity.some(r => r.phase === "running") ? 1 : 0); }
+    const v = frameValues;
+    for (let i = 0; i < animationSprings.length; i++) {
+      v[i] = animationSprings[i].step(dt); if (!animationSprings[i].idle) moving = true;
+    }
     const pulse = pulseStart < 0 ? 0 : (now - pulseStart) / 1600;
     if (pulse > 0 && pulse < 1) moving = true;
     const { minis, moving: m2 } = collectOrbs(dt);
-    if (scene) scene.draw({ orb: [v[0], v[1], v[2], Math.max(0, Math.min(1, v[3]))], on: Math.max(0, Math.min(1, v[4])), active: Math.max(0, Math.min(1, v[5])), pulse: pulse > 0 && pulse < 1 ? pulse : 0, mood: [Math.max(0, v[6]), Math.max(0, v[7]), Math.max(0, v[8]), 0], dim: v[9], night: Math.max(0, Math.min(1, v[10])), minis, quality: governor.q });
-    if (moving || m2) settle = 40;
+    frameState.orb[0] = v[0]; frameState.orb[1] = v[1]; frameState.orb[2] = v[2]; frameState.orb[3] = Math.max(0, Math.min(1, v[3]));
+    frameState.mood[0] = Math.max(0, v[6]); frameState.mood[1] = Math.max(0, v[7]); frameState.mood[2] = Math.max(0, v[8]);
+    frameState.on = Math.max(0, Math.min(1, v[4])); frameState.active = Math.max(0, Math.min(1, v[5]));
+    frameState.pulse = pulse > 0 && pulse < 1 ? pulse : 0; frameState.dim = v[9]; frameState.night = Math.max(0, Math.min(1, v[10]));
+    frameState.minis = minis; frameState.quality = governor.q; frameState.dprCap = currentTier().dpr; frameState.pixelBudget = currentTier().pixels;
+    frameState.visual = currentTier();
+    frameState.curtain = curtainEnabled() && !motionStopped();
+    const ultra = qualityChoice === "ultra" && !motionStopped();
+    frameState.motion = choreography.sample(now, ultra);
+    if (ultra) {
+      const mv = frameState.motion.values, orbit = frameState.motion.orbit;
+      const gather = Math.sin(Math.PI * mv[1]) * (1 - mv[1]);
+      const release = Math.sin(Math.PI * mv[2]) * (1 - mv[2]);
+      const breath = .0055 * Math.sin(orbit[2] * .95);
+      frameState.orb[2] *= 1 + breath + .019 * gather + .009 * release;
+      frameState.orb[1] += Math.sin(orbit[2] * .48) * 1.3 * frameState.on;
+      if (frameState.motion.moving && canAnimate()) moving = true;
+    }
+    if (scene.draw(frameState)) renderCount++;
+    if (moving || m2) settle = Math.max(1, Math.ceil(currentTier().activeFps * .65));
     inFrame = false;
-    if ((!RM.matches && !document.hidden && !params.has("still")) || settle-- > 0) raf = requestAnimationFrame(frame);
+    if (settle > 0) { settle--; raf = requestAnimationFrame(frame); }
+    else if (canAnimate()) scheduleIdleFrame();
   }
   if (scene && params.has("t")) scene.freeze(Number(params.get("t")));
   if (scene && RM.matches) scene.freeze(9);
-  document.addEventListener("visibilitychange", () => { if (!document.hidden) kick(); });
+  document.addEventListener("visibilitychange", () => { if (document.hidden) stopFrames(); else kick(); });
+  RM.addEventListener("change", () => {
+    if (scene) scene.freeze(RM.matches ? 9 : params.has("t") ? Number(params.get("t")) : null);
+    kick();
+  });
+  addEventListener("pagehide", () => {
+    closingGraphics = true; lifecycle++; cancelSceneReady?.(); cancelSceneReady = null;
+    stopFrames(); choreography.destroy(); scene = null; sceneOwner.destroy();
+  }, { once: true });
   addEventListener("resize", () => { placePresence(true); placeIndicators(); });
   document.addEventListener("scroll", kick, { passive: true, capture: true });
-  document.addEventListener("transitionrun", kick, { passive: true });
-  document.addEventListener("animationstart", kick, { passive: true });
+  document.addEventListener("transitionrun", event => { if (!event.target.closest?.("#log-view")) kick(); }, { passive: true });
+  document.addEventListener("animationstart", event => { if (!event.target.closest?.("#log-view")) kick(); }, { passive: true });
 
   /* ===================== view switching ===================== */
   function setView(name, opts = {}) {
@@ -397,7 +569,10 @@
     if (name === "logs") { renderLogs(); renderSpectrum(core.snapshot()); }
     if (name === "skills") autoRefreshSkills();
     if (name === "settings" && opts.pane) setTimeout(() => goChapter(opts.pane), 80);
-    history.replaceState(null, "", "?" + new URLSearchParams({ ...Object.fromEntries(params), sheet: name }));
+    // Resolve against the actual document, not a review page's asset <base>.
+    const routeUrl = new URL(location.href);
+    routeUrl.search = new URLSearchParams({ ...Object.fromEntries(params), sheet: name }).toString();
+    history.replaceState(null, "", routeUrl.href);
     kick();
   }
   $$("#nav [role=tab]").forEach(t => t.addEventListener("click", () => setView(t.dataset.view)));
@@ -555,17 +730,20 @@
   }
   function setBtn(el, disabled, isBusy) { el.disabled = !!(disabled || isBusy); el.setAttribute("aria-busy", String(!!isBusy)); }
   function renderWorkspace(s) {
+    choreography.sync(s.activity, s.selectedId || s.account?.id || "current");
     const d = s.derived, a = s.account, m = a.mcp, t = a.tunnel, c = a.config || {}, p = s.pending;
     const [who, what, tone] = liveSentence(s);
     const key = who + "|" + what;
-    if (ui.liveKey !== key) {
+    const liveChanged = ui.liveKey !== key;
+    if (liveChanged) {
       ui.liveKey = key;
       const live = $("#live"); text($("#live-who"), who); text($("#live-what"), what); live.dataset.tone = tone;
       live.classList.remove("fresh"); void live.offsetWidth; if (!RM.matches) live.classList.add("fresh");
     }
     // the orb and the window edge carry the state
-    on.set(d.cloudOnline ? 1 : (m.healthy && t.ready) ? .55 : m.healthy ? .3 : 0);
-    warm.set(tone === "warn" ? 1 : 0); alarm.set(tone === "err" ? 1 : 0); busy.set(tone === "busy" ? 1 : 0);
+    const targets = [[on, d.cloudOnline ? 1 : (m.healthy && t.ready) ? .55 : m.healthy ? .3 : 0], [warm, tone === "warn" ? 1 : 0], [alarm, tone === "err" ? 1 : 0], [busy, tone === "busy" ? 1 : 0]];
+    const glowChanged = targets.some(([s, value]) => s.target !== value);
+    for (const [s, value] of targets) s.set(value);
     document.body.dataset.link = d.cloudOnline ? "on" : "off";
     const row = (id, v, tn) => { const el = $(id); text(el, v); if (tn) el.dataset.tone = tn; else delete el.dataset.tone; el.title = v; };
     row("#s-local", m.portOccupiedByUnknown ? `端口 ${c.mcpPort} 被占用` : m.healthy ? `${m.toolCount} 个工具，端口 ${c.mcpPort}` : m.state === "error" ? "异常退出" : m.state === "starting" ? "启动中" : `未运行，端口 ${c.mcpPort}`, m.state === "error" ? "err" : m.portOccupiedByUnknown ? "warn" : null);
@@ -590,8 +768,10 @@
     setBtn($("#btn-mcp-restart"), d.busy || !(m.healthy || m.state === "error") || !c.setupDone, p.has("restartMcp"));
     setBtn($("#btn-tunnel-start"), d.busy || t.state === "running" || !c.setupDone, p.has("startTunnel"));
     setBtn($("#btn-tunnel-stop"), d.busy || !(t.state === "running" || t.state === "error"), p.has("stopTunnel"));
+    const previousHistory = ui.lastSig.history;
     renderHistory(s);
-    kick();
+    // The one-second clock/status refresh must not restart an unchanged scene.
+    if (liveChanged || glowChanged || previousHistory !== ui.lastSig.history) kick();
   }
   function badge(sel, b) { const el = $(sel); el.dataset.tone = b.tone; text(el, b.text); }
   function kv(sel, rows) {
@@ -600,9 +780,9 @@
     rows.forEach(([k, v, cls], i) => { text(dl.children[i * 2], k); const dd = dl.children[i * 2 + 1]; dd.className = cls || ""; text(dd, v); dd.title = String(v); });
   }
   // Preserve the original narrative labels; retain canonical tool/call identities as row metadata.
-  const outcomeLabel = r => ({ needs_input: "参数待修正", review_rejected: "评审未通过", blocked: r.operationStarted === false ? "未执行" : "调用受阻", execution_error: "失败" }[r.outcomeKind] || "失败");
+  const outcomeLabel = r => ({ needs_input: "参数待修正", review_rejected: "评审未通过", blocked: r.operationStarted === false ? "未执行" : "调用受阻", execution_error: r.timedOut === true ? "执行超时" : "执行失败", unknown: "结果未知", running: "仍在运行" }[r.outcomeKind] || "失败");
   const extraOf = r => r.phase !== "running" && r.summary && r.summary !== r.target ? r.summary : "";
-  const sentenceOf = r => `${core.describe(r).verb} ${r.target || ""}`.trim() + (r.phase === "failed" ? `，${outcomeLabel(r)}` : "") + (extraOf(r) ? `，${extraOf(r)}` : "");
+  const sentenceOf = r => `${core.describe(r).verb} ${r.target || ""}`.trim() + (["failed", "unknown"].includes(r.phase) ? `，${outcomeLabel(r)}` : "") + (extraOf(r) ? `，${extraOf(r)}` : "");
   function renderHistory(s) {
     const list = [...s.activity].sort((x, y) => y.startedAt - x.startedAt).slice(0, 4);
     const sig = JSON.stringify(list.map(r => [r.id, r.phase, r.ms, r.startedAt, r.tool, r.target, r.summary, r.outcomeKind])) + (s.derived.cloudOnline ? 1 : 0);
@@ -612,10 +792,13 @@
     ui.historyIds = list.map(r => r.id);
     ui.lastSig.history = sig;
     $("#history").replaceChildren(...(list.length ? list.map((r, i) => h("li", { class: `${r.phase === "failed" ? "fail" : r.phase === "running" ? "running" : ""}${i === 0 && ui.lastSig.historyReady && !prev.has(r.id) ? " new" : ""}`, dataset: { ts: r.startedAt, tool: r.tool, call: r.callId || r.id } },
-      h("time", null, stamp(r)), h("span", { class: "w", title: sentenceOf(r) }, `${core.describe(r).verb} ${r.target || ""}`.trim(), r.phase === "failed" ? h("span", { class: "result" }, `，${outcomeLabel(r)}`) : null, extraOf(r) ? `，${extraOf(r)}` : ""), h("span", { class: "d" }, r.phase === "running" ? "…" : duration(r.ms)))) : [h("li", { class: "empty" }, s.derived.cloudOnline ? "ChatGPT 还没有调用工具。" : "连接后，ChatGPT 的每一次操作都会写在这里。")]));
+      h("time", null, stamp(r)), h("span", { class: "w", title: sentenceOf(r) }, `${core.describe(r).verb} ${r.target || ""}`.trim(), ["failed", "unknown"].includes(r.phase) ? h("span", { class: "result" }, `，${outcomeLabel(r)}`) : null, extraOf(r) ? `，${extraOf(r)}` : ""), h("span", { class: "d" }, r.phase === "running" ? "…" : duration(r.ms)))) : [h("li", { class: "empty" }, s.derived.cloudOnline ? "ChatGPT 还没有调用工具。" : "连接后，ChatGPT 的每一次操作都会写在这里。")]));
     ui.lastSig.historyReady = true;
   }
   core.on("activity", ({ kind, record }) => {
+    const current = core.snapshot();
+    choreography.sync(current.activity, current.selectedId || current.account?.id || "current");
+    choreography.event(kind, record, performance.now());
     if (kind === "start") { if (!RM.matches) pulseStart = performance.now(); active.set(1); activeUntil = 0; }
     else if (kind === "end") {
       // Fast calls can finish in the same IPC batch. Keep their real feedback
@@ -866,9 +1049,15 @@
       el.style.setProperty("--c", c ? rgb(irisAt(i / (NB - 1))) : "");
       el.classList.toggle("zero", !c); el.classList.toggle("fail", fails[i] > 0); el.classList.toggle("hot", v > .66); el.classList.toggle("now", running && i === NB - 1);
     });
-    const recent = s.activity.filter(r => r.startedAt > now - SPAN), f = recent.filter(r => r.phase === "failed").length;
+    const recent = s.activity.filter(r => r.startedAt > now - SPAN);
+    const outcomeCounts = [
+      ["参数待修正", recent.filter(r => r.outcomeKind === "needs_input").length],
+      ["执行失败", recent.filter(r => r.phase === "failed" && r.outcomeKind !== "needs_input").length],
+      ["结果未知", recent.filter(r => r.phase === "unknown").length],
+      ["仍在运行", recent.filter(r => r.phase === "running").length],
+    ].filter(([, count]) => count > 0).map(([label, count]) => `${count} 次${label}`);
     const real = core.mode !== "preview";
-    fill($("#logs-live"), recent.length ? [real ? "近 30 分钟，发生了 " : "近 30 分钟，ChatGPT 调用了 ", h("em", null, recent.length), real ? " 次工具调用" : " 次工具", f ? ["，其中 ", h("em", null, f), " 次未完成"] : recent.some(r => r.phase === "running") ? "，仍有调用进行中" : "，全部成功", "。"] : s.derived.cloudOnline ? (real ? "已连接，尚无工具调用记录。" : "已连接。ChatGPT 还没有调用工具。") : "服务未连接，这里还很安静。");
+    fill($("#logs-live"), recent.length ? [real ? "近 30 分钟，发生了 " : "近 30 分钟，ChatGPT 调用了 ", h("em", null, recent.length), real ? " 次工具调用" : " 次工具", outcomeCounts.length ? "，" + outcomeCounts.join("，") : "，全部成功", "。"] : s.derived.cloudOnline ? (real ? "已连接，尚无工具调用记录。" : "已连接。ChatGPT 还没有调用工具。") : "服务未连接，这里还很安静。");
   }
   const spec = $("#spectrum");
   spec.addEventListener("pointermove", e => {
@@ -915,7 +1104,7 @@
         if (invocation.phase === "running" && item.result) continue;
         item.tool = invocation.tool; item.target = invocation.target || item.target;
         item.elapsed = invocation.ms;
-        if (invocation.phase !== "running") item.result = { ...invocation, ok: invocation.phase === "done", summary: invocation.summary === invocation.target ? "" : invocation.summary };
+        if (invocation.phase !== "running") item.result = { ...invocation, ok: invocation.phase === "unknown" ? null : invocation.phase === "done", summary: invocation.summary === invocation.target ? "" : invocation.summary };
         continue;
       }
       const completed = HarnessCore.activityFromLogs([e]).find(record => record.phase !== "running");
@@ -935,7 +1124,7 @@
     }
     return items;
   }
-  const itemLevel = it => it.kind === "call" ? (it.result && !it.result.ok ? "error" : "info") : it.e.level;
+  const itemLevel = it => it.kind === "call" ? (it.result?.phase === "unknown" ? "warn" : it.result?.ok === false ? "error" : "info") : it.e.level;
   function itemPasses(it) {
     const q = ui.query.trim().toLowerCase();
     if (ui.level !== "all" && itemLevel(it) !== ui.level) return false;
@@ -945,7 +1134,7 @@
   function evEl(it) {
     const q = ui.query.trim();
     if (it.kind === "call") {
-      const res = it.result, phase = !res ? "running" : res.ok ? "done" : "failed";
+      const res = it.result, phase = !res ? "running" : res.phase === "unknown" ? "unknown" : res.ok ? "done" : "failed";
       const pct = res && res.ms != null ? Math.max(4, Math.min(100, Math.log10(Math.max(1, res.ms)) / 4 * 100)) : 0;
       const target = h("code"); markText(target, it.target || it.tool, q);
       const r = h("span", { class: "res" }); markText(r, !res ? "，进行中…" : res.ok ? (res.summary ? `，${res.summary}` : "，完成") : `，${outcomeLabel(res)}${res.summary ? `：${res.summary}` : ""}`, q);
@@ -958,6 +1147,9 @@
     return h("div", { class: "ev sys", dataset: { entry: it.e.seq, ts: it.e.ts, level: it.e.level } }, h("span", { class: "t" }, it.e.time), h("span", { class: "dot" }), h("p", { class: "say" }, it.tag ? h("span", { class: "tag" }, it.tag) : null, msg));
   }
   function lineEl(e) { const row = h("div", { class: "line", dataset: { level: e.level, entry: e.seq, ts: e.ts } }, h("span", { class: "t" }, e.time), h("span", { class: "l" }), h("span", { class: "x" })); markText(row.lastChild, e.text, ui.query.trim()); return row; }
+  // Bound rendered log DOM even when the underlying in-memory/disk log grows.
+  // The log viewer is not a second copy of the whole historical log file.
+  const LOG_STORY_CAP = 600, LOG_RAW_CAP = 800;
   let logTimer = 0, lastLogRender = 0;
   function scheduleLogs() { if (logTimer) return; logTimer = setTimeout(() => { logTimer = 0; renderLogs(true); }, Math.max(0, 220 - (performance.now() - lastLogRender))); }
   function renderLogs(live) {
@@ -967,10 +1159,10 @@
     const prevIds = live ? new Set($$("[data-entry]", view).map(el => el.dataset.entry)) : null;
     view.classList.toggle("raw", ui.logMode === "raw");
     let nodes = [];
-    if (ui.logMode === "raw") nodes = core.filterLogs(all, ui).slice(-3000).map(lineEl);
+    if (ui.logMode === "raw") nodes = core.filterLogs(all, ui).slice(-LOG_RAW_CAP).map(lineEl);
     else {
-      const items = storyItems(all).filter(itemPasses), shown = items.slice(-ui.storyLimit);
-      if (items.length > shown.length) nodes.push(h("div", { class: "more-row" }, h("button", { class: "ghost", type: "button", onclick: () => { ui.storyLimit += 1200; renderLogs(); } }, `显示更早的 ${items.length - shown.length} 条`)));
+      const items = storyItems(all).filter(itemPasses), shown = items.slice(-LOG_STORY_CAP);
+      if (items.length > shown.length) nodes.push(h("div", { class: "more-row" }, "仅显示最近 " + LOG_STORY_CAP + " 条，另有 " + (items.length - shown.length) + " 条请在日志文件查看。"));
       let minute = "";
       for (const it of shown) { const mm = it.e.time.slice(0, 5); if (mm !== minute) { minute = mm; nodes.push(h("div", { class: "minute", "aria-hidden": "true" }, mm)); } nodes.push(evEl(it)); }
     }
@@ -985,9 +1177,9 @@
     $("#btn-open-log").setAttribute("aria-label", openLabel);
     for (const k of ["mcp", "tunnel", "launcher"]) text($("#count-" + k), (s.logs[k] || []).length);
     const all = s.logs[ui.source] || [], matches = ui.logMode === "raw" ? core.filterLogs(all, ui).length : storyItems(all).filter(itemPasses).length;
-    const shown = Math.min(matches, ui.logMode === "raw" ? 3000 : ui.storyLimit);
+    const shown = Math.min(matches, ui.logMode === "raw" ? LOG_RAW_CAP : LOG_STORY_CAP);
     text($("#log-summary"), `显示 ${shown} 条${matches > shown ? ` · 共 ${matches} 条匹配` : ""}`);
-    $("#log-summary").title = `当前来源 ${all.length} 行，界面最多保留 3000 行。`;
+    $("#log-summary").title = "当前来源 " + all.length + " 行；完整历史请打开日志文件查看。";
   }
   core.on("log", e => {
     if (ui.view !== "logs") return;
@@ -997,7 +1189,7 @@
       if (!core.filterLogs([e], ui).length) return;
       const view = $("#log-view"); view.querySelector(".empty-state")?.remove();
       const row = lineEl(e); if (!RM.matches) row.classList.add("fresh"); view.append(row);
-      while (view.children.length > 3000) view.firstChild.remove();
+      while (view.children.length > LOG_RAW_CAP) view.firstChild.remove();
       if (ui.autoscroll) view.scrollTop = view.scrollHeight;
     } else scheduleLogs();
   });
@@ -1046,6 +1238,31 @@
     const themeInd = h("span", { class: "seg-ind", "aria-hidden": "true" });
     const themeChips = h("span", { class: "chips", id: "theme-chips", role: "radiogroup", "aria-label": "界面外观" }, themeInd,
       ...[["system", "跟随系统"], ["light", "浅色"], ["dark", "夜间"]].map(([v, label]) => h("button", { type: "button", role: "radio", "aria-checked": String(theme.choice === v), dataset: { value: v }, onclick: () => applyTheme(v) }, label)));
+    const qualityInd = h("span", { class: "seg-ind", "aria-hidden": "true" });
+    const qualityChips = h("span", { class: "chips", id: "quality-chips", role: "radiogroup", "aria-label": "画质与动效" }, qualityInd,
+      ...Object.entries(AuraQuality.tiers).map(([v, preset]) => h("button", { type: "button", role: "radio", "aria-checked": String(qualityChoice === v), tabindex: qualityChoice === v ? "0" : "-1", dataset: { value: v }, onclick: () => setQuality(v) }, preset.label)));
+    qualityChips.addEventListener("keydown", event => {
+      const keys = Object.keys(AuraQuality.tiers), index = keys.indexOf(qualityChoice);
+      let next = index;
+      if (event.key === "ArrowRight" || event.key === "ArrowDown") next = (index + 1) % keys.length;
+      else if (event.key === "ArrowLeft" || event.key === "ArrowUp") next = (index + keys.length - 1) % keys.length;
+      else if (event.key === "Home") next = 0; else if (event.key === "End") next = keys.length - 1; else return;
+      event.preventDefault(); setQuality(keys[next]); qualityChips.querySelector('[data-value="' + keys[next] + '"]').focus();
+    });
+    const curtainInd = h("span", { class: "seg-ind", "aria-hidden": "true" });
+    const curtainChips = h("span", { class: "chips", id: "curtain-chips", role: "radiogroup", "aria-label": "动态光幕" }, curtainInd,
+      ...[["on", "开启"], ["off", "关闭"]].map(([value, label]) => h("button", {
+        type: "button", role: "radio", "aria-checked": String(curtainEnabled() === (value === "on")),
+        tabindex: curtainEnabled() === (value === "on") ? "0" : "-1", dataset: { value },
+        onclick: () => setCurtain(value === "on"),
+      }, label)));
+    curtainChips.addEventListener("keydown", event => {
+      if (!["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Home", "End"].includes(event.key)) return;
+      event.preventDefault();
+      const enabled = event.key === "Home" ? true : event.key === "End" ? false : !curtainEnabled();
+      setCurtain(enabled);
+      curtainChips.querySelector('[data-value="' + (enabled ? "on" : "off") + '"]').focus();
+    });
     const remindInd = h("span", { class: "seg-ind", "aria-hidden": "true" });
     const remindChips = h("span", { class: "chips", id: "remind-chips", role: "radiogroup", "aria-label": "空档提醒" }, remindInd,
       ...[[5, "5 分钟后提醒"], [10, "10 分钟后提醒"], [15, "15 分钟后提醒"], [0, "不提醒"]].map(([v, label]) => h("button", { type: "button", role: "radio", "aria-checked": "false", dataset: { value: String(v) }, onclick: () => setReminder(v) }, label)));
@@ -1099,19 +1316,23 @@
           try { await refreshConversationControls(); } catch(error) { if(core.snapshot().selectedId===accountId)fill($("#conversation-label-list"),h("p",{class:"conversation-empty"},"暂时无法读取会话"));if(error.code!=="STALE")throw error; }
         }},"管理会话",icon(I.open))) ]),
       // Appearance is a property of this window, not of the account: it applies at once and never enters the save draft.
-      chapter("appearance", "外观", [h("p", { class: "say-line" }, "界面使用", themeChips, "。")]),
+      chapter("appearance", "外观", [
+        h("p", { class: "say-line" }, "界面使用", themeChips, "。"),
+        h("p", { class: "say-line quality-line", id: "quality-row" }, h("span", { class: "quality-label" }, "画质与动效"), qualityChips),
+        h("p", { class: "say-line quality-line", id: "curtain-row" }, h("span", { class: "quality-label" }, "动态光幕"), curtainChips),
+      ]),
       chapter("maintenance", "维护", [
         h("p", { class: "say-line" }, "需要时，可以", h("button", { class: "ghost strong", type: "button", id: "btn-reset-profiles" }, "重置 Skill / 插件配置"), "，或", h("button", { class: "ghost warn", type: "button", id: "btn-uninstall" }, "卸载并清理数据"), "。"),
-        h("details",{class:"quiet-details",id:"data-details"},
-          h("summary",null,"数据位置"),
-          h("p",{id:"data-location",class:"data-location"}),
-          h("div",{class:"detail-actions"},h("button",{class:"ghost",type:"button",id:"btn-copy-data-location",onclick:()=>{
+        h("div",{id:"data-details",class:"data-location-section"},
+          h("p",{class:"say-line data-path-line"},"数据保存在 ",
+            h("label",{class:"inline mono"},h("input",{id:"data-location",type:"text",readonly:true,spellcheck:"false","aria-label":"数据位置",dataset:{min:16,max:46}})),"。"),
+          h("p",{class:"say-help"},h("button",{class:"ghost strong",type:"button",id:"btn-copy-data-location",onclick:()=>{
             const location=core.snapshot().info?.accountDataDir;if(location)return A.copyText(location,"数据位置");
-          }},icon(I.copy),"复制路径"),h("button",{class:"ghost",type:"button",onclick:()=>A.openRuntime()},icon(I.folder),"打开运行目录")))]),
+          }},icon(I.copy),"复制路径"),h("button",{class:"ghost strong",type:"button",onclick:()=>A.openRuntime()},icon(I.folder),"打开运行目录")))]),
       chapter("guide", "接入指引", [h("p", { class: "say-line" }, "每个账户使用独立的 Connector 和 Tunnel ID。", h("button", { class: "ghost strong", type: "button", "data-guide": "1" }, "打开接入指引", icon(I.open)))])
     );
     $("#st-index").append(...CHAPTERS.map(([id, title]) => h("button", { type: "button", dataset: { ch: id }, onclick: () => goChapter(id) }, title)));
-    toolBar = mk(tools.ind); proxyBar = mk(proxy.ind); themeBar = mk(themeInd); remindBar = mk(remindInd);
+    toolBar = mk(tools.ind); proxyBar = mk(proxy.ind); themeBar = mk(themeInd); remindBar = mk(remindInd); qualityBar = mk(qualityInd); curtainBar = mk(curtainInd);
     $("#btn-reset-profiles").addEventListener("click", run(async () => { if (await confirmBox("重置 Skill / 插件配置？", "只重置两个 profile 文件，不删除已安装 Skill 或 Tunnel 配置。", "重置")) await A.resetProfiles(); }));
     $("#btn-uninstall").addEventListener("click", run(async () => { if (await confirmBox("卸载桌面端并清理数据？", "会删除配置、日志和已安装 Skill。portable / zip 的 EXE 需之后手动删除。", "卸载并清理")) { try { await A.uninstallApp(); } catch (err) { toast(err.message, "error"); } } }));
     $("#btn-refresh-conversations").addEventListener("click",run(refreshConversationControls));
@@ -1169,8 +1390,8 @@
     const form = $("#setup-form");
     const top = form.scrollTop + target.getBoundingClientRect().top - form.getBoundingClientRect().top - 4;
     const destination = Math.max(0, Math.min(top, form.scrollHeight - form.clientHeight));
-    chapterNavigation = !RM.matches && Math.abs(destination - form.scrollTop) > 1 ? destination : null;
-    form.scrollTo({ top: destination, behavior: RM.matches ? "instant" : "smooth" });
+    chapterNavigation = !motionStopped() && Math.abs(destination - form.scrollTop) > 1 ? destination : null;
+    form.scrollTo({ top: destination, behavior: motionStopped() ? "instant" : "smooth" });
     syncChapter();
   }
   function setDraft(key, value, fromInput) { ui.draft[key] = value; ui.dirty = true; syncForm(!fromInput); pillState("dirty"); }
@@ -1311,7 +1532,17 @@
     const list = h("div", { class: "proto-menu-list", role: "menu" });
     const menu = h("details", { class: "proto-menu" }, h("summary", { title: "预览工具：切换模拟场景，不影响真实服务" }, "预览", h("span", { class: "proto-menu-label" }, "切换场景")), list);
     for (const [name, title] of core.scenarios) list.append(h("button", { type: "button", role: "menuitemradio", dataset: { scenario: name }, onclick: () => { A.setScenario(name); menu.open = false; } }, title));
-    list.append(h("button", { type: "button", onclick: () => { A.simulateCall(); menu.open = false; } }, "模拟一次调用"));
+    const reviewingMotion = params.get("review") === "motion4" || globalThis.AURA_REVIEW_MOTION === true;
+    if (reviewingMotion) {
+      A.setTraffic?.(false);
+      menu.querySelector("summary").replaceChildren(document.createTextNode("预览"));
+      const demo = (label, fn) => list.append(h("button", { type: "button", onclick: () => { fn(); menu.open = false; } }, label));
+      demo("已连接待机", () => { A.setScenario("online"); A.setTraffic?.(false); });
+      demo("执行与完成", () => { A.simulateCall("run_command", { durationMs: 5200, ok: true }); });
+      demo("并行调用", () => { A.simulateCall("run_command", { durationMs: 4800, ok: true }); A.simulateCall("search_files", { durationMs: 6500, ok: true }); A.simulateCall("read_text_file", { durationMs: 7800, ok: true }); });
+      demo("失败反馈", () => { A.simulateCall("run_command", { durationMs: 2200, ok: false }); });
+      document.title = globalThis.AURA_REVIEW_TITLE || "Web Harness · 原版动效 R4";
+    } else list.append(h("button", { type: "button", onclick: () => { A.simulateCall(); menu.open = false; } }, "模拟一次调用"));
     $("#proto").append(menu);
     document.addEventListener("click", e => { if (menu.open && !menu.contains(e.target)) menu.open = false; });
     core.on("change", () => { const s = core.snapshot(); $$("[data-scenario]", list).forEach(b => b.setAttribute("aria-checked", String(b.dataset.scenario === s.scenario))); });
@@ -1322,7 +1553,8 @@
   function render() {
     const s = core.snapshot();
     renderAccounts(s); renderWorkspace(s); renderSkills(s);
-    text($("#data-location"), s.info?.accountDataDir || "仅桌面版显示实际路径");
+    const dataLocation = $("#data-location"), dataPath = s.info?.accountDataDir || "";
+    if (dataLocation.value !== dataPath) { dataLocation.value = dataPath; fit(dataLocation); }
     if ($("#btn-copy-data-location")) $("#btn-copy-data-location").disabled = !s.info?.accountDataDir;
     if (ui.view === "logs") { logMeta(s); renderSpectrum(s); }
     if ($("#dlg-guide").open) renderGuide();
@@ -1360,5 +1592,8 @@
     placePresence(true); placeIndicators(); document.body.classList.remove("booting"); kick();
   };
   if (scene) { scene.whenReady(() => { kick(); requestAnimationFrame(reveal); }); setTimeout(reveal, 4000); } else reveal();
-  window.__harness = { core, setView, openGuide, applyTheme, refreshSkills, setReminder };
+  window.__harness = { core, setView, openGuide, applyTheme, refreshSkills, setReminder, setQuality, setCurtain };
+  if (core.mode === "preview" && (params.get("review") === "motion4" || globalThis.AURA_REVIEW_MOTION === true)) {
+    setQuality("ultra", { persist: false });
+  }
 })();

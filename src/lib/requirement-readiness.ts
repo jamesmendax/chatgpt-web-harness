@@ -122,7 +122,7 @@ export const requirementModelSchema = z.object({
 // still enforces MAX_INTENT_JSON_CHARS, so omitting maxLength here does not
 // weaken admission; it only avoids duplicating catalog metadata on every
 // side-effecting tool.
-export const intentAssuranceInputSchema = z.string().optional().describe("Required for side effects. JSON with intent_revision (positive integer), objective (string), scope and success_criteria (nonempty string arrays), plus actual constraints/uncertainties. Or use the exact accepted reference. A confidence percentage is not a requirement model; see server instructions.");
+export const intentAssuranceInputSchema = z.string().optional().describe("Legacy compatibility field; accepted and ignored.");
 
 /** Explain the schema without supplying facts, granting authority or altering admission. */
 export function requirementInputGuidance(): Record<string, unknown> {

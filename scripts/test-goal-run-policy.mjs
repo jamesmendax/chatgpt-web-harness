@@ -54,10 +54,8 @@ function assertBase(result, stateText) {
 {
   const running = renderGoalRunPolicy(newRun());
   assertBase(running, "state: RUNNING");
-  assert.ok(running.text.includes("continue with tools while RUNNING"));
-  assert.ok(running.text.includes("user-visible assistant text"));
-  assert.ok(running.text.includes("before 300s"));
-  assert.ok(running.text.includes("tool cards"));
+  assert.ok(running.text.includes("Recorded state: RUNNING"));
+  assert.ok(!running.text.includes("continue with tools"));
   assert.equal(renderGoalRunPolicyText(newRun()), running.text);
   assert.equal(running.truncated, false);
 }
@@ -73,8 +71,8 @@ function assertBase(result, stateText) {
   }, T1);
   const tool = renderGoalRunPolicy(run);
   assertBase(tool, "state: WAITING_TOOL");
-  assert.ok(tool.text.includes("resume only when tool run_command returns"));
-  assert.ok(tool.text.includes("user-visible assistant text"));
+  assert.ok(tool.text.includes("tool=run_command"));
+  assert.ok(tool.text.includes("wait=tool-1"));
 
   run = advance(run, { type: "tool_result", waitId: "tool-1", outcome: "succeeded" }, T2);
   run = advance(run, {
@@ -87,8 +85,8 @@ function assertBase(result, stateText) {
   }, T3);
   const external = renderGoalRunPolicy(run);
   assertBase(external, "state: WAITING_EXTERNAL_PROCESS");
-  assert.ok(external.text.includes("resume only when external process build-42 is satisfied"));
-  assert.ok(external.text.includes("user-visible assistant text"));
+  assert.ok(external.text.includes("process=build-42"));
+  assert.ok(external.text.includes("poll_ms=250"));
 
   run = advance(run, { type: "external_satisfied", waitId: "process-1" }, T4);
   run = advance(run, {
@@ -100,7 +98,7 @@ function assertBase(result, stateText) {
   }, T4);
   const user = renderGoalRunPolicy(run);
   assertBase(user, "state: WAITING_USER");
-  assert.ok(user.text.includes("resume only after a user response for request approval"));
+  assert.ok(user.text.includes("request=approval"));
   assert.ok(!user.text.includes("user-visible assistant text"));
 }
 
@@ -113,7 +111,7 @@ function assertBase(result, stateText) {
   }, T1);
   const interrupted = renderGoalRunPolicy(run);
   assertBase(interrupted, "state: INTERRUPTED");
-  assert.ok(interrupted.text.includes("resume from cursor cursor-policy-7"));
+  assert.ok(interrupted.text.includes("cursor=cursor-policy-7"));
 
   run = newRun();
   run = advance(run, {
@@ -124,7 +122,7 @@ function assertBase(result, stateText) {
   }, T1);
   const noProgress = renderGoalRunPolicy(run);
   assertBase(noProgress, "state: NO_PROGRESS_PAUSED");
-  assert.ok(noProgress.text.includes("changed recovery condition"));
+  assert.ok(noProgress.text.includes("stop=goal_no_progress"));
 
   run = newRun();
   run = advance(run, {
@@ -140,12 +138,12 @@ function assertBase(result, stateText) {
   run = advance(run, { type: "request_finalize" }, T4);
   const ready = renderGoalRunPolicy(run);
   assertBase(ready, "state: READY_TO_FINALIZE");
-  assert.ok(ready.text.includes("requires verified criteria"));
+  assert.ok(ready.text.includes("Recorded state: READY_TO_FINALIZE"));
 
   run = advance(run, { type: "complete" }, T4);
   const completed = renderGoalRunPolicy(run);
   assertBase(completed, "state: COMPLETED");
-  assert.ok(completed.text.includes("COMPLETED: no continuation"));
+  assert.ok(completed.text.includes("Recorded state: COMPLETED"));
 }
 
 {

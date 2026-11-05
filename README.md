@@ -6,7 +6,7 @@
 
 将 ChatGPT 网页端连接到本地开发环境，使用文件、终端、Git、浏览器和桌面操作能力。
 
-[下载 Web Harness 3.1.2](https://github.com/jamesmendax/chatgpt-web-harness/releases/tag/v3.1.2) · [快速开始](#快速开始) · [系统架构](#系统架构)
+[下载 Web Harness 3.2.0](https://github.com/jamesmendax/chatgpt-web-harness/releases/tag/v3.2.0) · [快速开始](#快速开始) · [系统架构](#系统架构)
 
 ![Windows](https://img.shields.io/badge/Windows-10%20%2F%2011%20x64-0078D4?style=flat-square)
 ![MCP](https://img.shields.io/badge/MCP-Enabled-10A37F?style=flat-square)
@@ -22,18 +22,25 @@
 - **Skills** — 根据任务发现并加载对应技能。
 - **长任务管理** — Goal、Task、执行日志与任务恢复。
 - **多账户隔离** — 独立账户配置、连接和运行数据。
-- **Aura 桌面界面** — 服务管理、实时状态、主题和通知。
+- **Aura 桌面界面** — 服务管理、实时状态、主题和通知；3.2.0 新增「极致／高／普通／节能」四档画质、独立动态光幕开关。
+
+## 3.2.0 新增
+
+- 基于 3.2.0 后端和 R5 Aura 界面，保留原版光球、光幕与状态反馈，新增四档渲染质量以及独立的「动态光幕」开启／关闭选项，外观沿用原有主题，不增加说明小字。
+- 改进真实会话关联、工具调用结果诊断、Windows 文件／命令处理、浏览器截图和 14 个 Anthropic Skills 的路由与资源读取。
+- 优化动画调度与 WebGL 资源管理；同时监测 Renderer 与 GPU 内存，异常时先减负、必要时只恢复界面，不主动终止后台 MCP／Tunnel。
+- 已验证源码回归、真正的单文件 Portable 启动与私有账户 IPC；**Setup 实际安装／旧版升级、真实 ChatGPT 网页接入及小时级 GPU 长测尚未作为已完成验收**。见 [3.2.0 发布说明](docs/RELEASE_NOTES.md)。
 
 ## 快速开始
 
 ### 1. 下载并启动
 
-从 [Releases](https://github.com/jamesmendax/chatgpt-web-harness/releases/tag/v3.1.2) 下载 Windows x64 版本：
+从 [Releases](https://github.com/jamesmendax/chatgpt-web-harness/releases/tag/v3.2.0) 下载 Windows x64 版本：
 
 | 类型 | 下载 |
 | --- | --- |
-| 安装版 | [Web-Harness-3.1.2-Setup.exe](https://github.com/jamesmendax/chatgpt-web-harness/releases/download/v3.1.2/Web-Harness-3.1.2-Setup.exe) |
-| 便携版 | [Web-Harness-3.1.2-Portable.exe](https://github.com/jamesmendax/chatgpt-web-harness/releases/download/v3.1.2/Web-Harness-3.1.2-Portable.exe) |
+| 安装版 | [ChatGPT Web Harness Isolated-3.2.0-setup.exe](https://github.com/jamesmendax/chatgpt-web-harness/releases/download/v3.2.0/ChatGPT%20Web%20Harness%20Isolated-3.2.0-setup.exe) |
+| 便携版 | [ChatGPT Web Harness Isolated-3.2.0-portable.exe](https://github.com/jamesmendax/chatgpt-web-harness/releases/download/v3.2.0/ChatGPT%20Web%20Harness%20Isolated-3.2.0-portable.exe) |
 
 安装版按向导安装；便携版直接运行，无需安装。
 

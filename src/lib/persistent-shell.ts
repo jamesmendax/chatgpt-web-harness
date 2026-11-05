@@ -3,7 +3,6 @@ import fs from "fs";
 import { createHash } from "crypto";
 import os from "os";
 import path from "path";
-import { StringDecoder } from "node:string_decoder";
 
 export interface ShellExecResult {
   command: string;
@@ -12,6 +11,7 @@ export interface ShellExecResult {
   stderr: string;
   exit_code: number | null;
   timed_out: boolean;
+  operation_started?: boolean;
   duration_ms: number;
   full_output_path?: string;
   log_incomplete?: boolean;
@@ -20,6 +20,11 @@ export interface ShellExecResult {
   stderr_chars: number;
   stdout_truncated: boolean;
   stderr_truncated: boolean;
+  execution_mode?: "shell" | "argv";
+  output_encoding?: string;
+  decode_anomaly?: boolean;
+  raw_stdout_path?: string;
+  raw_stderr_path?: string;
 }
 
 import { loadGlobalShellState, saveGlobalShellState } from "./global-shell-state.js";
@@ -54,7 +59,12 @@ export function createCommandLogPath(root: string): string | undefined {
       .map((name) => ({ name, time: fs.statSync(path.join(dir, name)).mtimeMs }))
       .sort((left, right) => right.time - left.time);
     for (const stale of existing.slice(MAX_COMMAND_LOG_FILES - 1)) {
-      try { fs.rmSync(path.join(dir, stale.name), { force: true }); } catch {}
+      try {
+        const stalePath = path.join(dir, stale.name);
+        fs.rmSync(stalePath, { force: true });
+        fs.rmSync(`${stalePath}.stdout.raw`, { force: true });
+        fs.rmSync(`${stalePath}.stderr.raw`, { force: true });
+      } catch {}
     }
     const filePath = path.join(
       dir,
@@ -303,8 +313,11 @@ export function getWinShell(): { shell: string; isPwsh: boolean } {
   return { shell: "powershell.exe", isPwsh: false };
 }
 
-function runOnce(command: string, cwd: string, timeoutMs: number): Promise<ShellExecResult> {
+function runOnce(command: string, cwd: string, timeoutMs: number, direct?: { executable: string; args: string[] }, outputEncoding = "utf-8"): Promise<ShellExecResult> {
   return new Promise((resolve) => {
+    const encoding = outputEncoding.toLowerCase() === "cp936" ? "gbk" : outputEncoding;
+    const stdoutDecoder = new TextDecoder(encoding);
+    const stderrDecoder = new TextDecoder(encoding);
     const startedAt = Date.now();
     const log = createCommandLogFile(persistenceRoot || cwd);
     log.stream?.write(`# cwd: ${cwd}\n# started: ${new Date(startedAt).toISOString()}\n\n`);
@@ -318,10 +331,13 @@ function runOnce(command: string, cwd: string, timeoutMs: number): Promise<Shell
       if (!winShellInfo.isPwsh) {
         effectiveCommand = transpileCompoundOperators(command);
       }
+      effectiveCommand = "$OutputEncoding = [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new(); " + effectiveCommand;
       args = ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", effectiveCommand];
     }
 
+    if (direct) { shell = direct.executable; args = direct.args; }
     const child = spawn(shell, args, {
+      shell: false,
       cwd,
       windowsHide: true,
       env: {
@@ -346,12 +362,19 @@ function runOnce(command: string, cwd: string, timeoutMs: number): Promise<Shell
     let stderrChars = 0;
     let timedOut = false;
     let settled = false;
-    const stdoutDecoder = new StringDecoder("utf8");
-    const stderrDecoder = new StringDecoder("utf8");
+    const rawStdout = log.path ? fs.createWriteStream(`${log.path}.stdout.raw`) : undefined;
+    const rawStderr = log.path ? fs.createWriteStream(`${log.path}.stderr.raw`) : undefined;
+    let rawLogError: string | undefined;
+    const rawFinished = [rawStdout, rawStderr].map(stream => stream ? new Promise<void>(resolve => {
+      stream.once("finish", resolve);
+      stream.once("error", error => { rawLogError = error.message; resolve(); });
+    }) : Promise.resolve());
+    let decodeAnomaly = false;
     let decodersFlushed = false;
 
     const appendStdout = (chunk: string): void => {
       if (!chunk) return;
+      if (chunk.includes("\uFFFD")) decodeAnomaly = true;
       stdoutChars += chunk.length;
       log.stream?.write(`[stdout]\n${chunk}`);
       if (stdout.length + chunk.length > MAX_COMMAND_OUTPUT_CHARS) stdoutTruncated = true;
@@ -359,6 +382,7 @@ function runOnce(command: string, cwd: string, timeoutMs: number): Promise<Shell
     };
     const appendStderr = (chunk: string): void => {
       if (!chunk) return;
+      if (chunk.includes("\uFFFD")) decodeAnomaly = true;
       stderrChars += chunk.length;
       log.stream?.write(`[stderr]\n${chunk}`);
       if (stderr.length + chunk.length > MAX_COMMAND_OUTPUT_CHARS) stderrTruncated = true;
@@ -367,20 +391,31 @@ function runOnce(command: string, cwd: string, timeoutMs: number): Promise<Shell
     const flushDecoders = (): void => {
       if (decodersFlushed) return;
       decodersFlushed = true;
-      appendStdout(stdoutDecoder.end());
-      appendStderr(stderrDecoder.end());
+      appendStdout(stdoutDecoder.decode());
+      appendStderr(stderrDecoder.decode());
     };
 
     const finish = (result: ShellExecResult, trailer: string): void => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      rawStdout?.end(); rawStderr?.end();
+      result.execution_mode = direct ? "argv" : "shell";
+      result.operation_started = Boolean(child.pid);
+      result.output_encoding = encoding;
+      result.decode_anomaly = decodeAnomaly;
+      if (decodeAnomaly && log.path) { result.raw_stdout_path = `${log.path}.stdout.raw`; result.raw_stderr_path = `${log.path}.stderr.raw`; }
       let resolved = false;
       const done = (error?: Error | null): void => {
         if (resolved) return;
         resolved = true;
-        const failure = log.error || (error && ((error as NodeJS.ErrnoException).code || error.message));
-        resolve(failure ? { ...result, log_incomplete: true, log_error: failure } : result);
+        void Promise.all(rawFinished).then(() => {
+          const failure = log.error || rawLogError || (error && ((error as NodeJS.ErrnoException).code || error.message));
+          if (!decodeAnomaly && log.path) {
+            try { fs.rmSync(`${log.path}.stdout.raw`, { force: true }); fs.rmSync(`${log.path}.stderr.raw`, { force: true }); } catch {}
+          }
+          resolve(failure ? { ...result, log_incomplete: true, log_error: failure } : result);
+        });
       };
       const stream = log.stream;
       if (!stream) { done(); return; }
@@ -394,10 +429,12 @@ function runOnce(command: string, cwd: string, timeoutMs: number): Promise<Shell
     }, timeoutMs);
 
     child.stdout?.on("data", (d: Buffer) => {
-      appendStdout(stdoutDecoder.write(d));
+      rawStdout?.write(d);
+      appendStdout(stdoutDecoder.decode(d, { stream: true }));
     });
     child.stderr?.on("data", (d: Buffer) => {
-      appendStderr(stderrDecoder.write(d));
+      rawStderr?.write(d);
+      appendStderr(stderrDecoder.decode(d, { stream: true }));
     });
     child.on("close", (code) => {
       flushDecoders();
@@ -446,11 +483,13 @@ export async function execInShellSession(
   command: string,
   defaultCwd: string,
   timeoutMs: number,
-  workingDirectory?: string
+  workingDirectory?: string,
+  outputEncoding = "utf-8"
 ): Promise<ShellExecResult> {
+  new TextDecoder(outputEncoding.toLowerCase() === "cp936" ? "gbk" : outputEncoding);
   // sessionCwd and the persisted global state are shared across concurrent
   // calls — serialize them so parallel run_command invocations cannot race.
-  const run = shellExecChain.catch(() => undefined).then(() => execInShellSessionInner(command, defaultCwd, timeoutMs, workingDirectory));
+  const run = shellExecChain.catch(() => undefined).then(() => execInShellSessionInner(command, defaultCwd, timeoutMs, workingDirectory, outputEncoding));
   shellExecChain = run.catch(() => undefined);
   return run;
 }
@@ -459,7 +498,8 @@ async function execInShellSessionInner(
   command: string,
   defaultCwd: string,
   timeoutMs: number,
-  workingDirectory?: string
+  workingDirectory?: string,
+  outputEncoding = "utf-8"
 ): Promise<ShellExecResult> {
   if (!sessionCwd) initShellSession(defaultCwd);
   const persistentCwd = sessionCwd!;
@@ -469,7 +509,7 @@ async function execInShellSessionInner(
   history.push(effective);
   if (history.length > MAX_HISTORY) history.shift();
 
-  const result = await runOnce(effective, cwd, timeoutMs);
+  const result = await runOnce(effective, cwd, timeoutMs, undefined, outputEncoding);
   // Commit the session cwd only after a successful run: a failed `cd` (or a
   // failing command after cd) must not poison every later call in the session.
   if (!workingDirectory && result.exit_code === 0) sessionCwd = cwd;
@@ -485,4 +525,16 @@ async function execInShellSessionInner(
   }
 
   return result;
+}
+
+export async function execArgvInShellSession(executable: string, args: string[], defaultCwd: string, timeoutMs: number, workingDirectory?: string, encoding = "utf-8"): Promise<ShellExecResult> {
+  // Validate before spawning, retaining the same serialized ownership and timeout path.
+  new TextDecoder(encoding.toLowerCase() === "cp936" ? "gbk" : encoding);
+  const run = shellExecChain.catch(() => undefined).then(async () => {
+    if (!sessionCwd) initShellSession(defaultCwd);
+    const cwd = workingDirectory ? path.resolve(workingDirectory) : sessionCwd!;
+    return runOnce(JSON.stringify([executable, ...args]), cwd, timeoutMs, { executable, args }, encoding);
+  });
+  shellExecChain = run.catch(() => undefined);
+  return run;
 }

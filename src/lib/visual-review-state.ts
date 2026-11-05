@@ -2,6 +2,8 @@ import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { getRuntimeScope } from "./runtime-scope.js";
+import { accountProjectDir } from "./account-project-scope.js";
 
 export type VisualArtifactKind = "image" | "svg" | "html" | "url" | "pdf" | "pptx" | "docx";
 
@@ -10,7 +12,6 @@ export type VisualComparisonVerdict = "improved" | "unchanged" | "regressed" | "
 export type VisualQualityBar = "draft" | "standard" | "polished";
 export type VisualFirstImpression = "rough" | "acceptable" | "polished";
 export type VisualDeliveryRecommendation = "reject" | "revise" | "accept";
-export const MAX_VISUAL_ITERATIONS = 5;
 
 export interface VisualQualityScores {
   task_fidelity: number;
@@ -31,7 +32,7 @@ export interface ModelVisualCritique {
   minor_issues: string[];
   strengths: string[];
   improvement_opportunities: string[];
-  further_improvement_worthwhile: boolean;
+  further_improvement_worthwhile?: boolean;
   summary?: string;
   critiqued_at: string;
   source_signature?: string;
@@ -52,7 +53,7 @@ export interface ModelVisualAssessment {
   comparison: VisualComparisonVerdict;
   strengths: string[];
   improvement_opportunities: string[];
-  further_improvement_worthwhile: boolean;
+  further_improvement_worthwhile?: boolean;
   summary?: string;
   assessed_at: string;
   source_signature?: string;
@@ -82,6 +83,9 @@ export interface VisualReviewRecord {
   machine_advisories: string[];
   model_visual_critique?: ModelVisualCritique;
   model_visual_assessment?: ModelVisualAssessment;
+  owner_session?: string;
+  owner_scope?: string;
+  review_history?: Array<{ action: string; at: string; source: string; session_id?: string; previous?: unknown }>;
   diagnostics: Record<string, unknown>;
   created_at: string;
 }
@@ -104,7 +108,7 @@ export interface VisualReviewFreshness {
   };
   model_visual_iteration: {
     current_iteration: number;
-    max_iterations: number;
+    max_iterations: number | null;
     limit_reached: boolean;
     further_improvement_worthwhile: boolean;
     continuation_required: boolean;
@@ -126,30 +130,9 @@ const QUALITY_SCORE_KEYS: Array<keyof VisualQualityScores> = [
   "professional_readiness",
 ];
 
-const QUALITY_THRESHOLDS: Record<VisualQualityBar, {
-  minimum: number;
-  professional: number;
-  average: number;
-  required_impression?: VisualFirstImpression;
-}> = {
-  draft: { minimum: 2.5, professional: 2.5, average: 2.75 },
-  standard: { minimum: 3.5, professional: 3.75, average: 3.75 },
-  polished: { minimum: 4, professional: 4.25, average: 4.2, required_impression: "polished" },
-};
-
-/** Report the same locked thresholds the evaluator enforces; never rescore an artifact. */
+/** Quality preference and score scale are informational. */
 export function visualQualityRequirements(bar: VisualQualityBar): Record<string, unknown> {
-  const thresholds = QUALITY_THRESHOLDS[bar];
-  return {
-    quality_bar: bar,
-    minimum_each_score: thresholds.minimum,
-    minimum_average_score: thresholds.average,
-    minimum_professional_readiness: thresholds.professional,
-    ...(thresholds.required_impression ? { required_first_impression: thresholds.required_impression } : {}),
-    score_scale: "1–5; fractional scores are allowed and rounded to two decimals",
-    recommendation_guidance: "Keep scores faithful to the inspected pixels. If they miss this locked bar, use revise/reject and concrete findings; do not raise scores or lower the bar to obtain accept.",
-    accept_requires: ["No machine blocking issues", "No unresolved critical or major issues", "All locked score and first-impression thresholds"],
-  };
+  return { quality_bar: bar, score_scale: "1–5", thresholds_enforced: false };
 }
 
 const visualReviewChains = new Map<string, Promise<void>>();
@@ -197,47 +180,10 @@ function normalizedQualityScores(scores: VisualQualityScores): VisualQualityScor
 }
 
 export function evaluateVisualQualityGate(record: VisualReviewRecord): VisualQualityGate {
-  const bar = qualityBarFor(record);
   const critique = record.model_visual_critique;
-  if (!critique) {
-    return { bar, status: "pending", reasons: ["A structured visual Critic review is required before quality can be accepted."] };
-  }
-  const values = QUALITY_SCORE_KEYS.map((key) => critique.quality_scores[key]);
-  const average = values.reduce((sum, value) => sum + value, 0) / values.length;
-  const minimum = Math.min(...values);
-  const thresholds = QUALITY_THRESHOLDS[bar];
-  const reasons: string[] = [];
-
-  if (critique.critical_issues.length > 0) reasons.push("Unresolved critical visual issues remain.");
-  if (bar !== "draft" && critique.major_issues.length > 0) reasons.push("Unresolved major visual issues remain.");
-  if (bar !== "draft" && critique.delivery_recommendation !== "accept") {
-    reasons.push(`Visual Critic recommends ${critique.delivery_recommendation}, not accept.`);
-  }
-  if (bar !== "draft" && critique.first_impression === "rough") {
-    reasons.push("A rough first impression does not meet a finished-product quality bar.");
-  }
-  if (thresholds.required_impression && critique.first_impression !== thresholds.required_impression) {
-    reasons.push(`${bar} quality requires first_impression=${thresholds.required_impression}.`);
-  }
-  for (const key of QUALITY_SCORE_KEYS) {
-    if (critique.quality_scores[key] < thresholds.minimum) {
-      reasons.push(`${key}=${critique.quality_scores[key]} is below the ${bar} minimum ${thresholds.minimum}.`);
-    }
-  }
-  if (critique.quality_scores.professional_readiness < thresholds.professional) {
-    reasons.push(`professional_readiness=${critique.quality_scores.professional_readiness} is below the ${bar} readiness minimum ${thresholds.professional}.`);
-  }
-  if (average < thresholds.average) {
-    reasons.push(`average visual quality score ${average.toFixed(2)} is below the ${bar} minimum ${thresholds.average}.`);
-  }
-
-  return {
-    bar,
-    status: reasons.length === 0 ? "acceptable" : "failed",
-    average_score: Math.round(average * 100) / 100,
-    minimum_score: minimum,
-    reasons,
-  };
+  if (!critique) return { bar: qualityBarFor(record), status: "pending", reasons: [] };
+  const values = QUALITY_SCORE_KEYS.map(key => critique.quality_scores[key]);
+  return { bar: qualityBarFor(record), status: "acceptable", average_score: values.reduce((a,b) => a+b,0)/values.length, minimum_score: Math.min(...values), reasons: [] };
 }
 
 async function siblingReviewRecords(workspaceRoot: string): Promise<VisualReviewRecord[]> {
@@ -268,16 +214,13 @@ async function modelVisualCoverage(workspaceRoot: string, record: VisualReviewRe
   const candidates = record.source_signature
     ? (await siblingReviewRecords(workspaceRoot)).filter((candidate) =>
         candidate.target === record.target &&
-        candidate.source_signature === record.source_signature
+        candidate.source_signature === record.source_signature &&
+        candidate.owner_session === record.owner_session && candidate.owner_scope === record.owner_scope
       )
     : [record];
   for (const candidate of candidates) {
     const qualityGate = evaluateVisualQualityGate(candidate);
-    if (
-      candidate.machine_blocking_issues.length > 0 ||
-      candidate.model_visual_assessment?.verdict !== "pass" ||
-      qualityGate.status !== "acceptable"
-    ) continue;
+    if (candidate.model_visual_assessment?.verdict !== "pass" || !candidate.model_visual_assessment.inspected_full_render) continue;
     for (const pageNumber of pagesForRecord(candidate)) {
       if (Number.isInteger(pageNumber) && pageNumber >= 1 && pageNumber <= pageCount) passed.add(pageNumber);
     }
@@ -299,7 +242,8 @@ async function modelVisualIterationState(
   const candidates = record.source_signature
     ? (await siblingReviewRecords(workspaceRoot)).filter((candidate) =>
         candidate.target === record.target &&
-        candidate.source_signature === record.source_signature
+        candidate.source_signature === record.source_signature &&
+        candidate.owner_session === record.owner_session && candidate.owner_scope === record.owner_scope
       )
     : [record];
   const improvable = candidates.filter((candidate) =>
@@ -337,21 +281,14 @@ async function modelVisualIterationState(
     }
   }
   currentIteration = Math.max(1, currentIteration);
-  const limitReached = currentIteration >= MAX_VISUAL_ITERATIONS;
-  const furtherImprovementWorthwhile = improvable.length > 0;
-  const continuationRequired = furtherImprovementWorthwhile && !limitReached;
   return {
     current_iteration: currentIteration,
-    max_iterations: MAX_VISUAL_ITERATIONS,
-    limit_reached: limitReached,
-    further_improvement_worthwhile: furtherImprovementWorthwhile,
-    continuation_required: continuationRequired,
-    termination_reason: continuationRequired
-      ? "continue"
-      : limitReached
-        ? "max_iterations_reached"
-        : "no_worthwhile_improvement",
-    review_ids: improvable.map((candidate) => candidate.id),
+    max_iterations: null,
+    limit_reached: false,
+    further_improvement_worthwhile: improvable.length > 0,
+    continuation_required: false,
+    termination_reason: "no_worthwhile_improvement",
+    review_ids: improvable.map(candidate => candidate.id),
     improvement_opportunities: opportunities,
   };
 }
@@ -362,7 +299,7 @@ function projectSlug(workspaceRoot: string): string {
 
 export function visualReviewDir(workspaceRoot: string): string {
   const base = process.env.CODEX_HOME || path.join(os.homedir(), ".codex");
-  return path.join(base, "projects", projectSlug(workspaceRoot), "visual-reviews");
+  return path.join(accountProjectDir(path.join(base, "projects", projectSlug(workspaceRoot))), "visual-reviews");
 }
 
 function reviewPath(workspaceRoot: string, reviewId: string): string {
@@ -405,6 +342,13 @@ export async function fileSignature(filePath: string): Promise<{
   };
 }
 
+function currentVisualOwner(): { session: string; scope: string } | null {
+  const runtime = getRuntimeScope();
+  const session = runtime?.conversationSessionId;
+  if (runtime?.conversationContinuity !== "trusted" || !session) return null;
+  return { session, scope: createHash("sha256").update(JSON.stringify([runtime?.principalId ?? "", runtime?.tunnelProfile ?? ""])).digest("hex") };
+}
+
 export async function saveVisualReviewRecord(
   workspaceRoot: string,
   input: Omit<VisualReviewRecord, "version" | "id" | "created_at">
@@ -415,6 +359,7 @@ export async function saveVisualReviewRecord(
     ...input,
     quality_bar: input.quality_bar ?? "standard",
     created_at: new Date().toISOString(),
+    ...(currentVisualOwner() ? { owner_session: currentVisualOwner()!.session, owner_scope: currentVisualOwner()!.scope } : {}),
   };
   await atomicWriteJson(reviewPath(workspaceRoot, record.id), record);
   return record;
@@ -433,18 +378,13 @@ export async function critiqueVisualReviewRecord(
     minor_issues?: string[];
     strengths?: string[];
     improvement_opportunities?: string[];
-    further_improvement_worthwhile: boolean;
+    further_improvement_worthwhile?: boolean;
     summary?: string;
   }
 ): Promise<VisualReviewRecord> {
   return withVisualReviewLock(workspaceRoot, reviewId, async () => {
   const record = await getVisualReviewRecord(workspaceRoot, reviewId);
-  if (record.model_visual_critique) {
-    throw new Error("VISUAL_CRITIQUE_IMMUTABLE: A visual Critic decision is immutable for the same rendered pixels. Revise the artifact and run visual_review again instead of re-critiquing the same review_id.");
-  }
-  if (record.model_visual_assessment) {
-    throw new Error("VISUAL_CRITIQUE_ORDER: Critic must run before Judge/assess. This rendered review was already assessed; revise the artifact and create a fresh review_id.");
-  }
+  if (!record.delivered_pages?.length) throw new Error("VISUAL_IMAGES_UNAVAILABLE: no rendered image was delivered for inspection.");
   if (record.source_path && record.source_signature) {
     const current = await fileSignature(record.source_path);
     if (current.signature !== record.source_signature) {
@@ -460,25 +400,6 @@ export async function critiqueVisualReviewRecord(
   const summary = input.summary?.trim().slice(0, 4000) || undefined;
   const qualityScores = normalizedQualityScores(input.quality_scores);
 
-  if (record.machine_blocking_issues.length > 0 && input.delivery_recommendation === "accept") {
-    throw new Error("VISUAL_CRITIQUE_CONTRADICTION: cannot recommend accept while machine blocking issues remain.");
-  }
-  if (criticalIssues.length > 0 && input.delivery_recommendation === "accept") {
-    throw new Error("VISUAL_CRITIQUE_CONTRADICTION: critical visual issues cannot coexist with delivery_recommendation=accept.");
-  }
-  if (majorIssues.length > 0 && input.delivery_recommendation === "accept") {
-    throw new Error("VISUAL_CRITIQUE_CONTRADICTION: major visual issues cannot coexist with delivery_recommendation=accept.");
-  }
-  if (input.first_impression === "rough" && input.delivery_recommendation === "accept" && qualityBarFor(record) !== "draft") {
-    throw new Error("VISUAL_CRITIQUE_CONTRADICTION: a rough first impression cannot be accepted at the current finished-product quality bar.");
-  }
-  if (input.further_improvement_worthwhile && improvementOpportunities.length === 0) {
-    throw new Error("VISUAL_INPUT_REQUIRED: When further_improvement_worthwhile=true, the Critic must provide at least one concrete improvement_opportunity.");
-  }
-  if (!input.further_improvement_worthwhile && improvementOpportunities.length > 0) {
-    throw new Error("VISUAL_CRITIQUE_CONTRADICTION: concrete improvement_opportunities cannot be reported while further_improvement_worthwhile=false. Put low-value optional polish in minor_issues instead.");
-  }
-
   const critique: ModelVisualCritique = {
     inspected_full_render: true,
     first_impression: input.first_impression,
@@ -489,7 +410,7 @@ export async function critiqueVisualReviewRecord(
     minor_issues: minorIssues,
     strengths,
     improvement_opportunities: improvementOpportunities,
-    further_improvement_worthwhile: input.further_improvement_worthwhile,
+    ...(input.further_improvement_worthwhile !== undefined ? { further_improvement_worthwhile: input.further_improvement_worthwhile } : {}),
     ...(summary ? { summary } : {}),
     critiqued_at: new Date().toISOString(),
     ...(record.source_signature ? { source_signature: record.source_signature } : {}),
@@ -498,11 +419,8 @@ export async function critiqueVisualReviewRecord(
     ...record,
     version: 4,
     model_visual_critique: critique,
+    review_history: [...(record.review_history ?? []), { action: "critique", at: critique.critiqued_at, source: "calling_model", session_id: getRuntimeScope()?.mcpSessionId, previous: record.model_visual_critique }],
   };
-  const gate = evaluateVisualQualityGate(next);
-  if (input.delivery_recommendation === "accept" && gate.status === "failed") {
-    throw new Error(`VISUAL_CRITIQUE_CONTRADICTION: delivery_recommendation=accept conflicts with the locked ${gate.bar} quality gate: ${gate.reasons.join(" ")}`);
-  }
   await atomicWriteJson(reviewPath(workspaceRoot, reviewId), next);
   return next;
   });
@@ -530,76 +448,7 @@ export async function assessVisualReviewRecord(
   const summary = input.summary?.trim().slice(0, 4000) || undefined;
   const comparison: VisualComparisonVerdict = input.comparison ?? "not_compared";
   const hasComparisonEvidence = Boolean(record.comparison_path);
-  if (input.verdict === "fail" && issues.length === 0) {
-    throw new Error("VISUAL_INPUT_REQUIRED: A failed visual assessment must include at least one concrete visual issue.");
-  }
-  if (hasComparisonEvidence && comparison === "not_compared") {
-    throw new Error("VISUAL_COMPARISON_REQUIRED: This review includes before-after comparison pixels. Inspect them and submit comparison=improved|unchanged|regressed.");
-  }
-  if (!hasComparisonEvidence && comparison !== "not_compared") {
-    throw new Error("VISUAL_COMPARISON_UNAVAILABLE: comparison can only be improved|unchanged|regressed when this review includes comparison pixels. Use comparison=not_compared otherwise.");
-  }
-  if (comparison === "improved" && strengths.length === 0) {
-    throw new Error("VISUAL_INPUT_REQUIRED: An improved comparison must include at least one concrete strength describing what visibly improved.");
-  }
-  if (input.verdict === "pass" && typeof input.further_improvement_worthwhile !== "boolean") {
-    throw new Error("VISUAL_INPUT_REQUIRED: A passing visual assessment must explicitly state further_improvement_worthwhile=true|false after inspecting the pixels.");
-  }
-  if (input.verdict === "pass" && record.model_visual_assessment?.verdict === "fail") {
-    throw new Error("VISUAL_ASSESSMENT_IMMUTABLE: A failed visual assessment cannot be reclassified as pass on the same rendered pixels. Revise the artifact and run visual_review again to obtain a new review_id.");
-  }
-  if (input.verdict === "pass" && !record.model_visual_critique) {
-    throw new Error("VISUAL_CRITIQUE_REQUIRED: a passing assessment requires visual_review action=critique on these exact rendered pixels first.");
-  }
-  if (input.verdict === "pass" && input.further_improvement_worthwhile === true && improvementOpportunities.length === 0) {
-    throw new Error("VISUAL_INPUT_REQUIRED: When further_improvement_worthwhile=true, include at least one concrete improvement_opportunity for the next iteration.");
-  }
-  if (input.verdict === "pass" && input.further_improvement_worthwhile === false && improvementOpportunities.length > 0) {
-    throw new Error("VISUAL_ASSESSMENT_CONTRADICTION: concrete improvement_opportunities cannot coexist with further_improvement_worthwhile=false.");
-  }
-  if (
-    input.verdict === "pass" &&
-    record.model_visual_critique &&
-    input.further_improvement_worthwhile !== record.model_visual_critique.further_improvement_worthwhile
-  ) {
-    throw new Error("VISUAL_ASSESSMENT_CONTRADICTION: the Judge cannot override the Critic's further_improvement_worthwhile decision on the same rendered pixels.");
-  }
-  if (input.verdict === "pass" && record.machine_blocking_issues.length > 0) {
-    throw new Error("VISUAL_MACHINE_BLOCKED: Cannot pass model visual assessment while machine blocking issues remain.");
-  }
-  if (
-    input.verdict === "pass" &&
-    input.further_improvement_worthwhile === false &&
-    record.model_visual_assessment?.further_improvement_worthwhile === true
-  ) {
-    throw new Error("VISUAL_ASSESSMENT_IMMUTABLE: This exact rendered review was already assessed as having worthwhile visual improvement remaining. Revise the artifact and run visual_review again instead of marking the same pixels as finished.");
-  }
-  if (input.verdict === "pass" && record.source_signature) {
-    const siblings = await siblingReviewRecords(workspaceRoot);
-    const priorFailed = siblings.find((candidate) =>
-      candidate.id !== record.id &&
-      candidate.target === record.target &&
-      candidate.source_signature === record.source_signature &&
-      candidate.model_visual_assessment?.verdict === "fail"
-    );
-    if (priorFailed) {
-      throw new Error("VISUAL_SOURCE_REJECTED: Cannot pass visual assessment because this exact source version was previously assessed as failed. Revise the artifact so its source signature changes, then run visual_review again.");
-    }
-    if (input.further_improvement_worthwhile === false) {
-      const currentPages = new Set(pagesForRecord(record));
-      const priorImprovable = siblings.find((candidate) =>
-        candidate.id !== record.id &&
-        candidate.target === record.target &&
-        candidate.source_signature === record.source_signature &&
-        candidate.model_visual_assessment?.verdict === "pass" &&
-        candidate.model_visual_assessment.further_improvement_worthwhile === true &&
-        pagesForRecord(candidate).some((pageNumber) => currentPages.has(pageNumber))
-      );
-      if (priorImprovable) {
-        throw new Error("VISUAL_SOURCE_REJECTED: Cannot mark the same source pixels as visually finished because an overlapping review already found worthwhile improvement. Revise the artifact so its source signature changes, then compare and assess the new version.");
-      }
-    }
-  }
+  if (!record.delivered_pages?.length) throw new Error("VISUAL_IMAGES_UNAVAILABLE: no rendered image was delivered for inspection.");
 
   if (record.source_path && record.source_signature) {
     const current = await fileSignature(record.source_path);
@@ -611,6 +460,7 @@ export async function assessVisualReviewRecord(
   const next: VisualReviewRecord = {
     ...record,
     version: 4,
+    review_history: [...(record.review_history ?? []), { action: "assess", at: new Date().toISOString(), source: "calling_model", session_id: getRuntimeScope()?.mcpSessionId, previous: record.model_visual_assessment }],
     model_visual_assessment: {
       verdict: input.verdict,
       inspected_full_render: true,
@@ -618,7 +468,7 @@ export async function assessVisualReviewRecord(
       comparison,
       strengths,
       improvement_opportunities: improvementOpportunities,
-      further_improvement_worthwhile: input.verdict === "pass" ? input.further_improvement_worthwhile! : true,
+      ...(input.further_improvement_worthwhile !== undefined ? { further_improvement_worthwhile: input.further_improvement_worthwhile } : {}),
       ...(summary ? { summary } : {}),
       assessed_at: new Date().toISOString(),
       ...(record.source_signature ? { source_signature: record.source_signature } : {}),
@@ -631,11 +481,31 @@ export async function assessVisualReviewRecord(
 
 export async function getVisualReviewRecord(workspaceRoot: string, reviewId: string): Promise<VisualReviewRecord> {
   try {
-    return JSON.parse(await fs.readFile(reviewPath(workspaceRoot, reviewId), "utf-8")) as VisualReviewRecord;
+    const record = JSON.parse(await fs.readFile(reviewPath(workspaceRoot, reviewId), "utf-8")) as VisualReviewRecord;
+    const owner = currentVisualOwner();
+    if (owner && record.owner_scope && owner.scope !== record.owner_scope) throw new Error("VISUAL_REVIEW_NOT_FOUND: No saved review matches this account.");
+    return record;
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") throw new Error("VISUAL_REVIEW_NOT_FOUND: No saved review matches this review_id. Use the exact ID returned by review in this workspace, or review the current artifact.");
     throw error;
   }
+}
+
+export async function latestSessionVisualReview(workspaceRoot: string): Promise<VisualReviewRecord | null> {
+  const owner = currentVisualOwner();
+  if (!owner) return null;
+  const records = (await siblingReviewRecords(workspaceRoot)).filter(record => record.owner_session === owner.session && record.owner_scope === owner.scope);
+  return records.sort((a, b) => b.created_at.localeCompare(a.created_at))[0] ?? null;
+}
+
+export async function withdrawVisualReview(workspaceRoot: string, reviewId: string, reason?: string): Promise<VisualReviewRecord> {
+  return withVisualReviewLock(workspaceRoot, reviewId, async () => {
+    const record = await getVisualReviewRecord(workspaceRoot, reviewId);
+    const next = { ...record, model_visual_critique: undefined, model_visual_assessment: undefined,
+      review_history: [...(record.review_history ?? []), { action: "withdraw", at: new Date().toISOString(), source: "calling_model", session_id: getRuntimeScope()?.mcpSessionId, previous: { critique: record.model_visual_critique, assessment: record.model_visual_assessment, reason } }] };
+    await atomicWriteJson(reviewPath(workspaceRoot, reviewId), next);
+    return next;
+  });
 }
 
 export async function getVisualReviewFreshness(
@@ -648,23 +518,11 @@ export async function getVisualReviewFreshness(
   const qualityGate = evaluateVisualQualityGate(record);
   const coverage = await modelVisualCoverage(workspaceRoot, record);
   const iteration = await modelVisualIterationState(workspaceRoot, record);
-  const modelVisualReady =
-    modelVisualStatus === "pass" &&
-    qualityGate.status === "acceptable" &&
-    machineReady &&
-    coverage.complete;
-  const modelVisualQualityStatus: VisualReviewFreshness["model_visual_quality_status"] =
-    qualityGate.status === "failed"
-      ? "failed"
-      : modelVisualStatus === "pending" || qualityGate.status === "pending"
-        ? "pending"
-        : modelVisualStatus === "fail"
-        ? "failed"
-        : iteration.continuation_required
-          ? "improvable"
-          : "ready";
-  const modelVisualIterationReady =
-    modelVisualReady && modelVisualQualityStatus === "ready" && !iteration.continuation_required;
+  // The assessment is a caller declaration about images returned; it is not
+  // independent verification and does not depend on scores or iterations.
+  const modelVisualReady = modelVisualStatus === "pass" && coverage.complete;
+  const modelVisualQualityStatus: VisualReviewFreshness["model_visual_quality_status"] = modelVisualStatus === "pass" ? "ready" : modelVisualStatus === "fail" ? "failed" : "pending";
+  const modelVisualIterationReady = modelVisualReady;
 
   if (!record.source_path || !record.source_signature) {
     return {

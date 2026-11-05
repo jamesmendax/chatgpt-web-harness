@@ -345,8 +345,10 @@ function deriveStatus(account) {
       clearTimeout(ambient); ambient = null;
       callTimers.forEach(clearTimeout); callTimers = [];
     }
+    let manualTraffic = false;
     function startTraffic() {
       clearTimeout(ambient);
+      if (manualTraffic) return;
       const a = current();
       const tick = () => {
         if (!(a === current() && a.tunnel.cloudState === "online" && a.mcp.healthy)) return;
@@ -358,22 +360,28 @@ function deriveStatus(account) {
       };
       ambient = setTimeout(tick, rint(1200, 2600));
     }
-    function call(a, forced) {
+    function call(a, forced, options = {}) {
+      if (callTimers.length >= 64) return null;
       const pool = CALLS.filter(c => !c.needs || a.catalog[c.needs]?.enabled);
       let spec = forced ? pool.find(c => c.tool === forced) : null;
       if (!spec) { const total = pool.reduce((s, c) => s + c.w, 0); let r = Math.random() * total; spec = pool.find(c => (r -= c.w) < 0) || pool[0]; }
-      const target = pick(spec.targets), ms = rint(spec.ms[0], spec.ms[1]);
+      const target = pick(spec.targets), ms = Number.isFinite(options.durationMs)
+        ? Math.max(450, Math.min(12000, options.durationMs)) : rint(spec.ms[0], spec.ms[1]);
       const rec = { id: "c" + (++seq), tool: spec.tool, target, startedAt: Date.now(), endedAt: null, ms: null, ok: null, summary: "", phase: "running" };
       a.activity.push(rec);
       if (a.activity.length > 400) a.activity.splice(0, a.activity.length - 400);
       log("mcp", `[tool] ${spec.tool} · ${target}`, a);
       emit("activity", { kind: "start", record: rec });
-      callTimers.push(setTimeout(() => finish(a, rec, spec, ms), ms));
+      const handle = setTimeout(() => {
+        const at = callTimers.indexOf(handle); if (at >= 0) callTimers.splice(at, 1);
+        finish(a, rec, spec, ms, options.ok);
+      }, ms);
+      callTimers.push(handle);
       return rec;
     }
-    function finish(a, rec, spec, ms) {
+    function finish(a, rec, spec, ms, forcedOk) {
       if (rec.phase !== "running") return;
-      const ok = !(spec.fail && Math.random() < spec.fail);
+      const ok = typeof forcedOk === "boolean" ? forcedOk : !(spec.fail && Math.random() < spec.fail);
       const out = spec.done(ok);
       Object.assign(rec, { endedAt: Date.now(), ms, ok, summary: out.summary, phase: ok ? "done" : "failed" });
       log("mcp", `[result] ${ok ? "Completed" : "Failed"} in ${ms}ms · ${out.log}`, a);
@@ -602,7 +610,8 @@ function deriveStatus(account) {
       copy: (count, what = "日志") => notice(`原型：已准备复制 ${count} 行${what}，未写入系统剪贴板。`),
       uninstallApp: async () => { await wait(200); throw new Error("原型不会卸载桌面端或删除数据。"); },
       setScenario: name => applyScenario(name),
-      simulateCall: tool => { const a = current(); if (a.tunnel.cloudState === "online" && a.mcp.healthy) return call(a, tool); }
+      setTraffic: enabled => { manualTraffic = !enabled; clearTimeout(ambient); ambient = null; clearTimeout(timer); timer = null; if (enabled) startTraffic(); },
+      simulateCall: (tool, options) => { const a = current(); if (a.tunnel.cloudState === "online" && a.mcp.healthy) return call(a, tool, options); }
     };
 
     function snapshot() {

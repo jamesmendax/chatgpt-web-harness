@@ -114,10 +114,49 @@ async function navigate(view) {
   await waitFor(`document.body.dataset.view === ${JSON.stringify(view)} && !document.getElementById('view-${view}').hidden`, `${view} selected`);
   await pause(400);
 }
+// Native resize and the view's entrance animation may outlive the click's fixed delay.
+async function waitLayout(size, view) {
+  const deadline = Date.now() + 8000;
+  let last = "", stable = 0, state;
+  while (Date.now() < deadline) {
+    const outer = win.getSize(), content = win.getContentSize();
+    state = await js(`(() => {
+      const el = document.getElementById('view-${view}'), r = el.getBoundingClientRect();
+      return { inner: [innerWidth, innerHeight], rect: [r.left, r.top, r.right, r.bottom],
+        animations: el.getAnimations().filter(a => a.playState === 'running').map(a => ({name: a.animationName, state: a.playState})) };
+    })()`);
+    state.outer = outer; state.content = content;
+    const key = JSON.stringify(state);
+    stable = key === last ? stable + 1 : 0; last = key;
+    if (outer[0] === size[0] && outer[1] === size[1] &&
+        state.inner[0] === content[0] && state.inner[1] === content[1] &&
+        state.animations.length === 0 && stable >= 3) return;
+    await pause(40);
+  }
+  console.error("Aura layout stability timeout:", JSON.stringify({size, view, state}));
+  await capture(`layout-timeout-${size.join("x")}-${view}`);
+  throw new Error(`Aura layout did not settle: ${size} ${view}`);
+}
 async function capture(name) {
   const file = path.join(fixture, `${name}.png`);
   fs.writeFileSync(file, (await win.capturePage()).toPNG());
   screenshots.push(file);
+}
+async function reportClipped(size, view, layout, theme) {
+  const details = await js(`(() => {
+    const selectors = ['#nav', '#account-btn', '#btn-theme', '#view-${view}', '#btn-skills-refresh', '#btn-install-folder', '#btn-install-zip'];
+    return {inner: [innerWidth, innerHeight], elements: Object.fromEntries(selectors.map(selector => {
+      const el = document.querySelector(selector); if (!el) return [selector, null];
+      const r = el.getBoundingClientRect();
+      return [selector, {rect: {left:r.left, top:r.top, right:r.right, bottom:r.bottom, width:r.width, height:r.height},
+        animations: el.getAnimations().map(a => ({name:a.animationName, state:a.playState, currentTime:a.currentTime}))}];
+    }))};
+  })()`);
+  details.outer = win.getSize(); details.content = win.getContentSize(); details.layout = layout;
+  const name = `clipped-${theme}-${size.join("x")}-${view}`;
+  fs.writeFileSync(path.join(fixture, name + ".json"), JSON.stringify(details, null, 2));
+  console.error("Aura clipped layout:", JSON.stringify(details));
+  await capture(name);
 }
 async function freePorts() {
   const servers = [], ports = [];
@@ -162,6 +201,7 @@ const deadline = setTimeout(async () => { console.error("FAIL Aura UI hard deadl
     win.setSize(...size);
     for (const view of ["workspace", "skills", "logs", "settings"]) {
       await navigate(view);
+      await waitLayout(size, view);
       const layout = await js(`(() => {
         const selectors = ['#nav', '#account-btn', '#view-${view}'];
         if ('${view}' === 'skills') selectors.push('#btn-install-folder', '#btn-install-zip');
@@ -171,6 +211,7 @@ const deadline = setTimeout(async () => { console.error("FAIL Aura UI hard deadl
         }) };
       })()`);
       assert.equal(layout.overflow, false, `${size} ${view} horizontal overflow`);
+      if (layout.clipped.length) await reportClipped(size, view, layout, "day");
       assert.deepEqual(layout.clipped, [], `${size} ${view} clipped controls`);
       await capture(`${size[0]}x${size[1]}-${view}`);
     }
@@ -203,6 +244,7 @@ const deadline = setTimeout(async () => { console.error("FAIL Aura UI hard deadl
     win.setSize(...size);
     for (const view of ["workspace", "skills", "logs", "settings"]) {
       await navigate(view);
+      await waitLayout(size, view);
       const layout = await js(`(() => {
         const selectors = ['#nav', '#account-btn', '#btn-theme', '#view-${view}'];
         if ('${view}' === 'skills') selectors.push('#btn-skills-refresh', '#btn-install-folder', '#btn-install-zip');
@@ -212,6 +254,7 @@ const deadline = setTimeout(async () => { console.error("FAIL Aura UI hard deadl
         }) };
       })()`);
       assert.equal(layout.overflow, false, `night ${size} ${view} horizontal overflow`);
+      if (layout.clipped.length) await reportClipped(size, view, layout, "night");
       assert.deepEqual(layout.clipped, [], `night ${size} ${view} clipped controls`);
       await capture(`night-${size[0]}x${size[1]}-${view}`);
     }
@@ -248,7 +291,7 @@ const deadline = setTimeout(async () => { console.error("FAIL Aura UI hard deadl
   const secondId = await js("window.__harness.core.snapshot().selectedId");
   const secondDataDir = path.join(defaultDataDir, "accounts", secondId);
   await navigate("settings");
-  await waitFor(`document.querySelector('#data-location').textContent === ${JSON.stringify(secondDataDir)}`, "new account data location");
+  await waitFor(`document.querySelector('#data-location').value === ${JSON.stringify(secondDataDir)}`, "new account data location");
   assert.equal(await js("document.querySelector('#btn-copy-data-location').disabled"), false);
   await click("#btn-copy-data-location");
   await waitFor("document.querySelector('#toast-text').textContent.includes('数据位置')", "copy data location feedback");
@@ -270,10 +313,10 @@ const deadline = setTimeout(async () => { console.error("FAIL Aura UI hard deadl
   try {
     assert.equal(await js("window.__harness.core.snapshot().selectedId"), "default");
     assert.equal(await js("document.querySelector('#btn-copy-data-location').disabled"), true, "copy must be disabled while the new account path is loading");
-    assert.notEqual(await js("document.querySelector('#data-location').textContent"), secondDataDir, "previous account path must not remain visible during loading");
+    assert.notEqual(await js("document.querySelector('#data-location').value"), secondDataDir, "previous account path must not remain visible during loading");
   } finally { appInfoGate = null; gateRelease(); }
   await waitFor(`window.__harness.core.snapshot().selectedId === 'default' && window.__harness.core.snapshot().account.config.mcpPort === ${ports[0]}`, "default account restored");
-  await waitFor(`document.querySelector('#data-location').textContent === ${JSON.stringify(defaultDataDir)}`, "default account data location restored");
+  await waitFor(`document.querySelector('#data-location').value === ${JSON.stringify(defaultDataDir)}`, "default account data location restored");
   await click("#btn-copy-data-location");
   await waitFor("document.querySelector('#toast-text').textContent.includes('数据位置')", "default location copied");
   assert.equal(copiedTexts.at(-1), defaultDataDir);

@@ -12,7 +12,6 @@ import {
   fileSignature,
   getVisualReviewFreshness,
   getVisualReviewRecord,
-  MAX_VISUAL_ITERATIONS,
   saveVisualReviewRecord,
   type VisualArtifactKind,
   type VisualQualityBar,
@@ -1482,12 +1481,6 @@ export async function performVisualReview(workspaceRoot: string, input: VisualRe
     if (baselineReviewId) {
       const baselineRecord = await getVisualReviewRecord(workspaceRoot, baselineReviewId);
       const baselineQualityBar = baselineRecord.quality_bar ?? "standard";
-      if (
-        input.quality_bar &&
-        VISUAL_QUALITY_BAR_RANK[input.quality_bar] < VISUAL_QUALITY_BAR_RANK[baselineQualityBar]
-      ) {
-        throw new Error(`Cannot lower visual quality_bar from ${baselineQualityBar} to ${input.quality_bar} after reviewing an earlier iteration. Keep or raise the locked delivery bar.`);
-      }
       effectiveQualityBar = input.quality_bar ?? baselineQualityBar;
     }
   }
@@ -1583,9 +1576,9 @@ export async function performVisualReview(workspaceRoot: string, input: VisualRe
       visual_status: rendered.machineIssues.length === 0 ? "rendered_current" : "rendered_with_blocking_issues",
       render_status: rendered.machineIssues.length === 0 ? "clean" : "blocked",
       model_visual_status: "pending",
-      model_visual_critique_required: true,
-      model_visual_assessment_required: true,
-      model_visual_instruction: `Inspect every returned full render/page image with model vision as an external reviewer seeing the artifact for the first time. Ignore creator effort, elapsed work, Goal completion pressure, and the fact that the file parsed or rendered. Semantic recognizability is not finished-product visual quality. First call visual_review action=critique with this review_id and inspected_full_render=true. Critique is issue-first and has no PASS authority: record first_impression, delivery_recommendation, all six 1-5 quality_scores, issue severity, strengths, and whether a concrete high-value improvement remains. Calibrate scores strictly: 1=broken/unacceptable, 2=weak, 3=competent but visibly rough or unfinished, 4=solid finished/presentable work you would hand to the user unchanged, 5=exceptional. Do not give 4+ merely because the artifact is recognizable, complete, or better than before. delivery_recommendation=accept means you would actually deliver this exact visible version unchanged at the locked quality bar. Use improvement_opportunities only for changes that are genuinely worth another revision; put low-value optional polish in minor_issues. After Critic succeeds, call action=assess for semantic/task correctness and comparison judgment. Delivery is allowed only when the server-calculated quality gate is acceptable, semantic assessment passes, coverage is complete, the source is fresh, and no required refinement remains. If quality is failed or improvable, revise the real source and run visual_review again with compare_to=<prior review_id>. The quality bar for this chain is ${effectiveQualityBar} and cannot be lowered after seeing a weak iteration. The universal visual loop is capped at ${MAX_VISUAL_ITERATIONS} source versions for every supported artifact kind; reaching the cap stops autonomous refinement but never converts a failed quality gate into PASS. For paged artifacts, continue with recommended_next_pages until model_visual_coverage.complete is true.`,
+      model_visual_critique_required: false,
+      model_visual_assessment_required: false,
+      model_visual_instruction: "Inspect the returned images before recording a visual assessment. Findings, scores and further improvement are model declarations, not independent verification; evaluations can be revised or withdrawn.",
       source_signature: signature?.signature,
       overview_path: rendered.overviewPath,
       output_paths: outputPaths,

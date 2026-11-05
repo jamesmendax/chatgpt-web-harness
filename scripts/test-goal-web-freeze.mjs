@@ -49,6 +49,7 @@ const { appendGoalRunEvidenceToResult, ensureGoalRunAuthority } = await import("
 const { createDurableTask, recordToolObservation } = await import("../dist/lib/durable-tasks.js");
 const { createGoal, getGoal, writeGoalRunProjection } = await import("../dist/lib/goals.js");
 const { createRuntimeScope, runWithRuntimeScope } = await import("../dist/lib/runtime-scope.js");
+const { runtimePrincipalId } = await import("../dist/lib/mcp-request-identity.js");
 const { appendHarnessRuntimeContextToResult, buildHarnessRuntimeContext } = await import("../dist/lib/context-broker.js");
 
 function resultText(result) {
@@ -85,7 +86,8 @@ async function withServer(workspace, sessionId, operation) {
   await client.connect(clientTransport);
   serverTransport.sessionId = sessionId;
   try {
-    return await operation(client);
+    return await runWithRuntimeScope(createRuntimeScope({ workspaceRoot: workspace, projectRoots: [workspace],
+      principalId: runtimePrincipalId(workspace) }, { sessionId }), () => operation(client));
   } finally {
     await client.close().catch(() => {});
     await server.close().catch(() => {});
@@ -141,30 +143,13 @@ try {
       },
     });
     data(created);
-    assert.ok(resultText(created).includes("MUST_CONTINUE_TO_TOOL"), "new RUNNING Goal lost its continuation signal");
+    assert.ok(!resultText(created).includes("MUST_CONTINUE_TO_TOOL"), "Goal record imposed a continuation gate");
 
-    let blockerResult;
-    let readOnlyCalls = 0;
-    const realDateNow = Date.now;
-    let noProgressClock = realDateNow();
-    try {
-      Date.now = () => noProgressClock;
-      for (; readOnlyCalls < 13; readOnlyCalls += 1) {
-        const result = await client.callTool({ name: "list_directory", arguments: { path: loopWorkspace } });
-        data(result);
-        if (resultText(result).includes("GOAL_NO_PROGRESS_BLOCKER")) {
-          blockerResult = result;
-          readOnlyCalls += 1;
-          break;
-        }
-        noProgressClock += Math.ceil((30 * 60_000) / 11) + 1;
-      }
-    } finally {
-      Date.now = realDateNow;
+    for (let readOnlyCalls = 0; readOnlyCalls < 13; readOnlyCalls += 1) {
+      const result = await client.callTool({ name: "list_directory", arguments: { path: loopWorkspace } });
+      data(result);
+      assert.doesNotMatch(resultText(result), /MUST_CONTINUE_TO_TOOL|STOP_AUTONOMOUS_TOOL_CALLS|GOAL_NO_PROGRESS_BLOCKER/);
     }
-    assert.ok(blockerResult, "no-progress Goal loop was not bounded after thirty minutes of exact repeats");
-    assert.equal(readOnlyCalls, 13, `timed no-progress blocker fired after an unexpected number of results: ${readOnlyCalls}`);
-    assert.ok(!resultText(blockerResult).includes("MUST_CONTINUE_TO_TOOL"), "blocker tail conflicts with a continue lock");
     assert.deepEqual(await fs.readdir(loopWorkspace), [], "safe reproduction unexpectedly changed workspace files");
 
     const failedPause = await client.callTool({
@@ -172,7 +157,7 @@ try {
       arguments: { action: "pause", pause_kind: "no_progress", current_phase: "Blocked: no semantic progress", expected_revision: 999_999 },
     });
     assertToolFailed(failedPause, "stale pause fixture unexpectedly succeeded");
-    assert.ok(resultText(failedPause).includes("GOAL_NO_PROGRESS_PAUSE_FAILED"), "failed bounded pause invited another retry");
+    assert.ok(resultText(failedPause).includes("GOAL_STALE_REVISION"), "stale revision error was lost");
     assert.ok(!resultText(failedPause).includes("Call goal(action=pause"), "failed pause repeated the pause instruction");
 
     const paused = await client.callTool({
@@ -184,7 +169,7 @@ try {
 
     const resumed = await client.callTool({ name: "goal", arguments: { action: "resume" } });
     assert.equal(data(resumed).goal_run.state, "RUNNING", "paused GoalRun did not resume");
-    assert.ok(resultText(resumed).includes("MUST_CONTINUE_TO_TOOL"), "resume did not reset the semantic-progress bound");
+    assert.ok(!resultText(resumed).includes("MUST_CONTINUE_TO_TOOL"), "resume imposed a continuation gate");
 
     // Exercise the real WAITING_USER state behind the Web adapter. Store
     // invalidation must make the very next result state-aware (no 2s stale tail).
@@ -211,7 +196,8 @@ try {
     );
     const waitingResult = await client.callTool({ name: "list_directory", arguments: { path: loopWorkspace } });
     const waitingText = resultText(waitingResult);
-    assert.ok(waitingText.includes("GOAL_WAITING_USER") && waitingText.includes("YIELD_TO_USER"), "WAITING_USER did not release the Web turn");
+    assert.ok(data(waitingResult), "unrelated read must continue during WAITING_USER");
+    assert.doesNotMatch(waitingText, /YIELD_TO_USER|STOP_AUTONOMOUS_TOOL_CALLS/);
     assert.ok(!waitingText.includes("MUST_CONTINUE_TO_TOOL"), "WAITING_USER conflicts with the RUNNING continue lock");
   });
 
@@ -236,14 +222,13 @@ try {
       arguments: { action: "confirm", criterion: "workspace was inspected", evidence_ids: [evidenceId] },
     });
     const finishText = resultText(confirmed);
-    assert.ok(finishText.includes("goal(action=complete)"), "confirmed goal did not request explicit finalization");
+    assert.equal(data(confirmed).goal.success_criteria[0].passed, true);
+    assert.doesNotMatch(finishText, /MUST_CONTINUE_TO_TOOL|STOP_AUTONOMOUS_TOOL_CALLS/);
     assert.ok(!finishText.includes("task_state(action=complete)"), "goal-only finish invented a durable task completion call");
     data(await client.callTool({ name: "goal", arguments: { action: "complete" } }));
   });
 
-  // Goal completion is only the first half of the finish chain when a durable
-  // task is still active. The goal result must carry the one remaining task
-  // completion call, and a failed task completion must stop rather than loop.
+  // Goal and Task completion are separate records; unmet checks stay visible.
   const taskFinishWorkspace = path.join(tmpRoot, "goal-task-finish");
   await withServer(taskFinishWorkspace, "goal-task-finish-session", async (client) => {
     const inspectedFile = path.join(taskFinishWorkspace, "inspection.txt");
@@ -275,33 +260,19 @@ try {
     }));
     const completedGoal = await client.callTool({ name: "goal", arguments: { action: "complete" } });
     data(completedGoal);
-    assert.ok(resultText(completedGoal).includes("GOAL_COMPLETED_TASK_PENDING"), "Goal completion dropped the active task finish call");
-    assert.ok(resultText(completedGoal).includes("task_state(action=complete)"), "Goal completion did not name the task completion action");
-    const failedTaskCompletion = await client.callTool({
-      name: "task_state",
-      arguments: { action: "complete", task_id: taskId },
-    });
-    assertToolFailed(failedTaskCompletion, "task with an unmet blocking check unexpectedly completed");
-    assert.ok(resultText(failedTaskCompletion).includes("GOAL_COMPLETED_TASK_BLOCKER"), "failed task completion invited a retry loop");
-    data(await client.callTool({
-      name: "task_state",
-      arguments: {
-        action: "checkpoint",
-        task_id: taskId,
-        current_step: "Ready to complete",
-        blocking_checks: [{ name: "task finish check", passed: true }],
-      },
-    }));
+    assert.doesNotMatch(resultText(completedGoal), /GOAL_COMPLETED_TASK_PENDING|STOP_AUTONOMOUS_TOOL_CALLS/);
     const completedTask = await client.callTool({
       name: "task_state",
-      arguments: { action: "complete", task_id: taskId, note: "Goal and task finish ordering verified" },
+      arguments: { action: "complete", task_id: taskId, note: "Task completion declared independently" },
     });
     assert.equal(data(completedTask).handoff.status, "completed", "durable task did not complete after Goal completion");
+    assert.equal(data(completedTask).completion_status, "model_declared");
+    assert.equal(data(completedTask).unmet_checks[0]?.name, "task finish check");
+    assert.equal(data(completedTask).unmet_checks[0]?.passed, false);
     assert.ok(!resultText(completedTask).includes("GOAL_COMPLETED_TASK_PENDING"), "completed task retained a finish-loop instruction");
   });
 
-  // A Task created before the Goal has no Goal binding. It must never be
-  // advertised as this Goal's finish chain, even when both share a session.
+  // A prior Task remains independent of a later Goal in the same session.
   const unrelatedWorkspace = path.join(tmpRoot, "unrelated-task-finish");
   await withServer(unrelatedWorkspace, "unrelated-task-session", async (client) => {
     const inspectedFile = path.join(unrelatedWorkspace, "inspection.txt");
@@ -322,11 +293,10 @@ try {
     const completed = await client.callTool({ name: "goal", arguments: { action: "complete" } });
     data(completed);
     assert.ok(!resultText(completed).includes("GOAL_COMPLETED_TASK_PENDING"), "unrelated Task was falsely reported as Goal work");
-    const rejected = await client.callTool({ name: "task_state", arguments: { action: "complete", task_id: prior.handoff.task_id } });
-    assertToolFailed(rejected, "unbound prior Task must not complete against the Goal");
-    assert.ok(resultText(rejected).includes("TASK_GOAL_MISMATCH"));
+    const declared = await client.callTool({ name: "task_state", arguments: { action: "complete", task_id: prior.handoff.task_id } });
+    assert.equal(data(declared).completion_status, "model_declared");
     const priorStatus = data(await client.callTool({ name: "task_state", arguments: { action: "list" } }));
-    assert.equal(priorStatus.tasks.find(task => task.task_id === prior.handoff.task_id)?.status, "active", "unrelated Task must remain untouched");
+    assert.equal(priorStatus.tasks.find(task => task.task_id === prior.handoff.task_id)?.status, "completed", "independent Task declaration must be recorded");
   });
 
   // A status call from another session is read-only, redacted, and cannot
@@ -334,7 +304,7 @@ try {
   const foreignWorkspace = path.join(tmpRoot, "foreign-session");
   await fs.mkdir(foreignWorkspace, { recursive: true });
   const ownerScope = createRuntimeScope(
-    { workspaceRoot: foreignWorkspace, projectRoots: [foreignWorkspace] },
+    { workspaceRoot: foreignWorkspace, projectRoots: [foreignWorkspace], principalId: runtimePrincipalId(foreignWorkspace) },
     { sessionId: "foreign-owner-session" }
   );
   await runWithRuntimeScope(ownerScope, async () => {
@@ -360,7 +330,7 @@ try {
       }
     );
   });
-  const ownerContext = await buildHarnessRuntimeContext(foreignWorkspace, undefined, "foreign-owner-session");
+  const ownerContext = await runWithRuntimeScope(ownerScope, () => buildHarnessRuntimeContext(foreignWorkspace, undefined, "foreign-owner-session"));
   assert.ok(ownerContext.recent_evidence.length > 0, "owner evidence fixture was not recorded");
   await withServer(foreignWorkspace, "foreign-observer-session", async (client) => {
     const status = await client.callTool({ name: "goal", arguments: { action: "status" } });
@@ -387,14 +357,13 @@ try {
     }
     // Plan A: observer may create its own goal in its own shard — that is legal.
     // The critical invariant is that the owner's shard remains untouched.
-    const preserved = await getGoal(foreignWorkspace, "foreign-owner-session");
+    const preserved = await runWithRuntimeScope(ownerScope, () => getGoal(foreignWorkspace, "foreign-owner-session"));
     assert.equal(preserved?.objective, "PRIVATE FOREIGN GOAL OBJECTIVE", "foreign mutation changed the owner's goal");
     assert.equal(await readGoalRun(foreignWorkspace), null, "foreign mutation created or changed GoalRun state");
   });
 
-  // External-process waits must be both result-aware and bounded. A matching
-  // successful terminal status resumes the run, repeated polls hit a hard
-  // stop, and the next result after the deadline persists a timeout.
+  // External wait records update on matching results and preserve timeouts,
+  // while repeated polls do not impose a tool-use gate.
   const externalWorkspace = path.join(tmpRoot, "external-wait");
   await fs.mkdir(externalWorkspace, { recursive: true });
   const externalScope = createRuntimeScope(
@@ -439,7 +408,8 @@ try {
       );
     }
   });
-  assert.ok(resultText(pollLimitResult).includes("GOAL_EXTERNAL_WAIT_POLL_LIMIT"), "external wait polling was not bounded");
+  assert.equal(pollLimitResult.structuredContent.ok, true);
+  assert.doesNotMatch(resultText(pollLimitResult), /GOAL_EXTERNAL_WAIT_POLL_LIMIT|STOP_AUTONOMOUS_TOOL_CALLS/);
   await runWithRuntimeScope(externalScope, () =>
     appendGoalRunEvidenceToResult(
       externalWorkspace,
@@ -498,10 +468,12 @@ try {
   assert.equal(timedOutEnvelope?.run.stopReason?.kind, "WAIT_TIMEOUT", "expired external wait lost its timeout reason");
 
   // A crash/failure after the authoritative run commits but before goal.json
-  // projects must surface a repair preflight, not a false completion. Status
+  // projects must surface a repair record, not a false completion. Status
   // observes the issue; explicit reconciliation repairs and clears the marker.
   const repairWorkspace = path.join(tmpRoot, "projection-repair");
   await fs.mkdir(repairWorkspace, { recursive: true });
+  await runWithRuntimeScope(createRuntimeScope({ workspaceRoot: repairWorkspace, projectRoots: [repairWorkspace],
+    principalId: runtimePrincipalId(repairWorkspace) }, { sessionId: "projection-repair-session" }), async () => {
   const repairGoal = await createGoal(repairWorkspace, {
     objective: "Repair a committed completion projection",
     success_criteria: [{ name: "completion evidence recorded" }],
@@ -584,7 +556,7 @@ try {
   );
   const repairIssueText = resultText(repairIssueResult);
   assert.ok(repairIssueText.includes("GOAL_RUN_PROJECTION_REPAIR_PENDING"), "repair-pending completion was exposed as complete");
-  assert.ok(repairIssueText.includes("GOALRUN_PREFLIGHT_REQUIRED"), "repair-pending completion did not request one status preflight");
+  assert.doesNotMatch(repairIssueText, /GOALRUN_PREFLIGHT_REQUIRED|STOP_AUTONOMOUS_TOOL_CALLS/);
   assert.ok(!repairIssueText.includes("GOAL_COMPLETED:"), "repair-pending completion emitted a false terminal signal");
   await withServer(repairWorkspace, "projection-repair-session", async (client) => {
     const observedStatus = data(await client.callTool({ name: "goal", arguments: { action: "status" } }));
@@ -595,9 +567,9 @@ try {
   });
   const repairedEnvelope = await readGoalRun(repairWorkspace, "projection-repair-session");
   assert.equal(repairedEnvelope?.parity?.repairPending, false, "verified projection repair left repairPending set");
+  });
 
-  // Future/corrupt GoalRun state is a visible stop condition, never a silent
-  // fallback to the legacy active Goal's unconditional continuation tail.
+  // Future/corrupt GoalRun state is visible without imposing a tool-use gate.
   const futureWorkspace = path.join(tmpRoot, "future-goal-run");
   await fs.mkdir(futureWorkspace, { recursive: true });
   const futureGoal = await createGoal(futureWorkspace, {
@@ -618,7 +590,8 @@ try {
     { toolName: "fixture" }
   );
   const futureText = resultText(futureResult);
-  assert.ok(futureText.includes("GOALRUN_BLOCKER") && futureText.includes("GOAL_RUN_STATE_UNREADABLE"), "future GoalRun schema failed open");
+  assert.ok(futureText.includes("GOAL_RUN_STATE_UNREADABLE"), "future GoalRun schema error was not recorded");
+  assert.doesNotMatch(futureText, /GOALRUN_BLOCKER|STOP_AUTONOMOUS_TOOL_CALLS/);
   assert.ok(!futureText.includes("MUST_CONTINUE_TO_TOOL"), "future GoalRun blocker retained an unconditional continue lock");
 
   // Risk annotations must stay truthful. Host/app permission decides whether
@@ -663,7 +636,7 @@ try {
   });
 
   console.log(
-    "goal-web-freeze: exact vector workflow bounded, WAITING_USER yields, GoalRun errors fail closed, foreign status is redacted, goal-only finish and truthful risk annotations OK"
+    "goal-web-freeze: nonblocking Goal records, independent Task declarations, foreign-session isolation, wait/repair evidence and truthful risk annotations OK"
   );
 } finally {
   await fs.rm(tmpRoot, { recursive: true, force: true });

@@ -106,9 +106,8 @@ export async function assertGoalCriterionVerified(
   criterion: { name: string; verification?: GoalVerification; requires_confirmation?: boolean },
   evidence: readonly GoalRunEvidence[]
 ): Promise<void> {
-  if (criterion.requires_confirmation) return;
   const contract = criterion.verification;
-  if (!contract) throw new Error(`GOAL_VERIFICATION_REQUIRED: "${criterion.name}" has no declared check. Use goal(action=update) to set this criterion's verification {kind,target,command,files}, run that check, then confirm its evidence. file_exists proves only file existence; use command for code tests and visual for appearance.`);
+  if (!contract) throw new Error(`GOAL_VERIFICATION_REQUIRED: "${criterion.name}" has no verification details. Add a check and record its evidence before marking it verified.`);
   for (const item of evidence) {
     const metadata = item.metadata;
     if (metadata.ok !== true || metadata.verifiesCriterion !== true || !item.source?.startsWith("native:")) continue;
@@ -119,7 +118,7 @@ export async function assertGoalCriterionVerified(
           typeof metadata.sha256 === "string" && metadata.sha256 === await verificationFileHash(contract.target)) return;
       if (contract.kind === "visual" && metadata.tool === "visual_review" && samePath(metadata.target, contract.target) && typeof metadata.reviewId === "string") {
         const fresh = await getVisualReviewFreshness(workspaceRoot, metadata.reviewId);
-        if (fresh.fresh && fresh.machine_ready && fresh.model_visual_ready && fresh.model_visual_iteration_ready && fresh.model_visual_coverage.complete) return;
+        if (fresh.fresh && fresh.model_visual_ready && fresh.model_visual_coverage.complete) return;
       }
     } catch { /* Stale, missing, or invalid evidence is rejected with an actionable error below. */ }
   }

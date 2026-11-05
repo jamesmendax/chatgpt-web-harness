@@ -48,6 +48,15 @@ const deadline=setTimeout(async()=>{console.error("Native feedback deadline",fix
  const privatePorts=await ports();
  const config=await js("window.launcher.saveConfig("+JSON.stringify({setupDone:true,autoStart:false,mcpPort:privatePorts[0],adminPort:privatePorts[1],tunnelPort:privatePorts[2],workspacePath:workspace})+")"); assert.equal(config.ok,true,config.error);
  await js("window.__harness.core.act.startMcp()"); await wait("window.__harness.core.snapshot().account.mcp.healthy && window.__harness.core.snapshot().account.mcp.managed",25000);
+ await wait("window.AuraMemoryGuard.status().scene?.ready===true");
+ const uniform=()=>js("(()=>{const gl=document.querySelector('#scene').getContext('webgl');const p=gl.getParameter(gl.CURRENT_PROGRAM);const v=gl.getUniform(p,gl.getUniformLocation(p,'uEffects'));return {edge:v[0],resources:window.AuraMemoryGuard.status().resources};})()");
+ const startCurtain=await uniform();assert.equal(startCurtain.edge,1,"original High curtain is still enabled");
+ await js("window.__harness.setCurtain(false)");await pause(240);
+ const disabledCurtain=await uniform();assert.equal(disabledCurtain.edge,0,"curtain must skip shader edge work when off");
+ assert.equal(disabledCurtain.resources.created,startCurtain.resources.created,"toggle must not allocate another WebGL context");
+ await js("window.__harness.setCurtain(true)");await pause(240);
+ const enabledCurtain=await uniform();assert.equal(enabledCurtain.edge,1,"turning curtain on restores the exact original High edge coefficients");
+ assert.equal(enabledCurtain.resources.created,startCurtain.resources.created);
  await js("window.__harness.applyTheme?.('light'); window.__harness.setView('workspace'); window.__feedbackEvents=[]; window.__harness.core.on('activity', e=>window.__feedbackEvents.push({kind:e.kind,tool:e.record.tool,phase:e.record.phase,ms:e.record.ms,id:e.record.callId})); window.__feedbackSamples=[]; window.__feedbackSampling=true; (function sample(){const gl=document.querySelector('#scene').getContext('webgl');const p=gl?.getParameter(gl.CURRENT_PROGRAM);if(p){const read=n=>gl.getUniform(p,gl.getUniformLocation(p,n));window.__feedbackSamples.push({at:performance.now(),active:read('uActive'),pulse:read('uPulse'),on:read('uOn')});}if(window.__feedbackSampling)requestAnimationFrame(sample);})()");
  await pause(700); const idle=await capture("idle"); await js("window.__feedbackSamples=[]");
  const {Client}=await import("@modelcontextprotocol/sdk/client/index.js"), {StreamableHTTPClientTransport}=await import("@modelcontextprotocol/sdk/client/streamableHttp.js");

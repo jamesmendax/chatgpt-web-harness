@@ -77,12 +77,14 @@ export async function selectSkillContent(workspace: string, skill: ResolvedSkill
   const scope = getRuntimeScope();
   let taskId: string | null = null;
   if (scope?.mcpSessionId) {
-    const { getActiveTaskId, getDurableTask } = await import("./durable-tasks.js");
-    const activeId = await getActiveTaskId(workspace, scope.mcpSessionId);
-    if (activeId) {
-      const task = await getDurableTask(workspace, activeId);
-      if (task.status === "active" || task.status === "blocked") taskId = task.id;
-    }
+    try {
+      const { getActiveTaskId, getDurableTask } = await import("./durable-tasks.js");
+      const activeId = await getActiveTaskId(workspace, scope.mcpSessionId);
+      if (activeId) {
+        const task = await getDurableTask(workspace, activeId);
+        if (task.status === "active" || task.status === "blocked") taskId = task.id;
+      }
+    } catch { /* Optional evidence context must not prevent a resource read. */ }
   }
   const realDir = await fs.realpath(skill.dir);
   const realFile = await fs.realpath(skill.path);
@@ -91,10 +93,8 @@ export async function selectSkillContent(workspace: string, skill: ResolvedSkill
   for (const [id, row] of selections) if (Date.now() - Date.parse(row.created_at) > TTL) selections.delete(id);
   if (selectionId) {
     const row = selections.get(selectionId);
-    if (!row || row.binding !== owner || row.task_id !== taskId || row.skill_id !== skill.id || row.mode !== mode || row.content_sha256 !== skill.content_sha256 || row.resolved_identity !== identity) {
-      throw new Error("SKILL_SELECTION_INVALID: reselect in the current account, session, task and policy version.");
-    }
-    return row;
+    if (row && row.binding === owner && row.task_id === taskId && row.skill_id === skill.id && row.mode === mode && row.content_sha256 === skill.content_sha256 && row.resolved_identity === identity) return row;
+    // Legacy selection IDs are optional receipt correlation, never authority.
   }
   if (selections.size >= 256) selections.delete(selections.keys().next().value!);
   const row: Selection = { id: randomUUID(), binding: owner, skill_id: skill.id,
@@ -104,9 +104,16 @@ export async function selectSkillContent(workspace: string, skill: ResolvedSkill
   selections.set(row.id, row);
   return row;
 }
-export function resourcePage(selection: Selection, offset = 0, limit = 20) {
+export async function resourcePage(selection: Selection, offset = 0, limit = 20) {
   if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(limit) || limit < 1 || limit > 100) throw new Error("Invalid Skill resource page.");
-  const page = selection.resources.slice(offset, offset + limit).map(({ file, root, root_identity, ...entry }) => entry);
+  const page = await Promise.all(selection.resources.slice(offset, offset + limit).map(async ({ file, root, root_identity, ...entry }) => {
+    try {
+      const { sha256 } = await readSelectedResource(selection, entry.relative_path);
+      return { ...entry, sha256, load_params: { name: selection.skill_id, invocation_mode: selection.mode, resource_path: entry.relative_path, expected_resource_sha256: sha256 } };
+    } catch {
+      return { ...entry, sha256: null, load_params: { name: selection.skill_id, invocation_mode: selection.mode, resource_path: entry.relative_path }, unavailable: true };
+    }
+  }));
   return { total: selection.resources.length, offset, entries: page,
     next_offset: offset + page.length < selection.resources.length ? offset + page.length : null };
 }
@@ -130,7 +137,7 @@ export async function readSelectedResource(selection: Selection, relativePath: s
     if (st.size > 8_000_000) throw new Error("SKILL_RESOURCE_TOO_LARGE: read-only guidance resources are limited to 8 MB.");
     const data = await handle.readFile();
     const sha256 = digest(data);
-    if (expectedHash && sha256 !== expectedHash) throw new Error("SKILL_RESOURCE_VERSION_CHANGED: restart this resource read.");
+    if (expectedHash && sha256 !== expectedHash) throw new Error(`SKILL_RESOURCE_VERSION_CHANGED: supplied=${expectedHash}; current=${sha256}. Restart this resource read.`);
     return { data, sha256 };
   } finally { await handle.close(); }
 }

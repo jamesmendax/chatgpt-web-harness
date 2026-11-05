@@ -56,7 +56,10 @@ for (const phrase of [
   "explicit user invocation",
   "exact id and content hash",
 ]) assert.ok(listDescription.includes(phrase), `list_skills is missing contract phrase: ${phrase}`);
-assert.ok(loadDescription.includes("Use explicit mode only when the user selected it"));
+assert.match(loadDescription, /Use explicit mode when the user selected the Skill/i);
+assert.match(loadDescription, /resource_path/i);
+assert.match(loadDescription, /selection_id is optional/i);
+assert.match(loadDescription, /Content returned, model application declarations and artifact hash checks are separate evidence/i);
 
 const skills = [
   fixture("implicit-workflow"),

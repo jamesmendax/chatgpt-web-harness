@@ -157,7 +157,9 @@ function initializeIsolatedRuntime(app, options = {}) {
     isPackaged: app.isPackaged,
     portableExecutable: env.PORTABLE_EXECUTABLE_FILE || "",
   }));
-  return roots;
+  // This override exists only after the nonce, ancestry and expiry checks above.
+  // Normal Portable launches retain their Windows notification registration.
+  return fixtureAppData ? { ...roots, notificationAppDataDir: fixtureAppData } : roots;
 }
 
 module.exports = { DATA_NAME, isolatedPaths, isolatedEnvironment, initializeIsolatedRuntime, assertNoLinkedAncestor };

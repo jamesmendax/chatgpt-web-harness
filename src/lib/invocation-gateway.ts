@@ -5,28 +5,11 @@ import { observeMcpInvocationFailure, observeMcpToolResult } from "./mcp-outcome
 import { toolFailureDiagnostic, type ToolFailureDiagnostic } from "./tool-diagnostics.js";
 import { executeOperation } from "./operation-journal.js";
 import { toolError } from "./tool-result.js";
-import { assertRecoveryIngress } from "./recovery-integrity.js";
-import { admitExecutionContract, readAcceptedExecutionContractState } from "./execution-contract.js";
-import {
-  assertDriverMutationAdmission,
-  enterDriverMutationExecution,
-  readDriverLease,
-  relayEnabled,
-  renewDriverLeaseForOwnerActivity,
-  type DriverLease,
-} from "./driver-lease.js";
+import { relayEnabled, renewDriverLeaseForOwnerActivity } from "./driver-lease.js";
 import { getGoal } from "./goal-state-store.js";
-import { enterGoalEffect } from "./goal-effect-scope.js";
-import { parseIntentReference, resolveIntentReference, type IntentReference } from "./intent-contract.js";
 import { resolveRelayGoalForSession, withRelayGoal } from "./relay-scope.js";
-import { readWorkerRegistry, recordWorkerMcpActivityBySession } from "./worker-registry.js";
-import {
-  extractIntentArgument,
-  invocationRequiresExecutionContract,
-  parseRequirementModel,
-  requirementInputGuidance,
-  REQUIREMENT_READY_SCORE,
-} from "./requirement-readiness.js";
+import { recordWorkerMcpActivityBySession } from "./worker-registry.js";
+import { extractIntentArgument } from "./requirement-readiness.js";
 
 import {
   createRuntimeScope,
@@ -37,8 +20,6 @@ import {
   type RuntimeScopeSeed,
 } from "./runtime-scope.js";
 import {
-  conversationSessionIdFromHeaders,
-  conversationSessionIdFromMeta,
   getMcpRequestIdentity,
   operationRequestMetadata,
   scopedOperationIdentity,
@@ -144,31 +125,21 @@ export class InvocationGateway {
     const scope = createRuntimeScope(this.scopeSeed, requestContext);
     // This runs before runWithRuntimeScope: pass the trusted session explicitly.
     // The workspace projection is discovery data and cannot authorize this call.
+    // Goal state supplies context only; a damaged or pending historical Goal
+    // must not prevent an unrelated new operation from executing.
     let sessionGoal: Awaited<ReturnType<typeof getGoal>> = null;
-    let creationRecovery = false;
     try {
-      if (scope.mcpSessionId) sessionGoal = await getGoal(scope.workspaceRoot, scope.mcpSessionId);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      const code = /^[A-Z][A-Z0-9_]+(?=:|$)/.exec(message)?.[0] ?? "GOAL_AUTHORITY_UNAVAILABLE";
-      const action = (extractedIntent.sanitizedArgs as { action?: unknown } | undefined)?.action;
-      creationRecovery = code === "GOAL_CREATION_PENDING" && definition.source === "native" &&
-        toolName === "goal" && (action === "status" || action === "create" || action === "reconcile");
-      if (!creationRecovery) return toolError(toolName, code, {
-        error_code: code, retryable: false, detail: message,
-        next_action: "Read Goal status and explicitly reconcile its pending lifecycle transaction before new work.",
-      });
-    }
+      if (scope.mcpSessionId) sessionGoal = await runWithRuntimeScope(scope, () => getGoal(scope.workspaceRoot, scope.mcpSessionId));
+    } catch { /* Keep execution available when historical context is unavailable. */ }
     scope.goalId = sessionGoal?.id;
     scope.goalOwnerSessionId = sessionGoal?.owner_session;
     scope.goalStatus = sessionGoal?.status;
     let relayGoalId = scope.goalId;
-    let relayScopeError: unknown;
-    if (!relayGoalId && !creationRecovery && scope.mcpSessionId && relayEnabled()) {
+    if (!relayGoalId && scope.mcpSessionId && relayEnabled()) {
       try {
         // A terminal Worker must remain fenced after its Goal stops steering.
         relayGoalId = await resolveRelayGoalForSession(scope.workspaceRoot, scope.mcpSessionId) ?? undefined;
-      } catch (error) { relayScopeError = error; }
+      } catch { /* relay metadata is optional */ }
     }
     const inRelayScope = <T>(operation: () => T): T => relayGoalId
       ? withRelayGoal(scope.workspaceRoot, relayGoalId, operation)
@@ -196,193 +167,11 @@ export class InvocationGateway {
     try { metadata = operationRequestMetadata(requestExtra?._meta); }
     catch { return toolError(toolName, "INVALID_OPERATION_METADATA"); }
 
-    const sideEffectingInvocation =
-      invocationRequiresExecutionContract(
-        toolName,
-        definition.config.annotations,
-        extractedIntent.sanitizedArgs
-      ) && !metadata.observe;
-    let admittedDriverLease: DriverLease | null = null;
-    let admittedReference: IntentReference | null = null;
-    let issuedReference: { reference: IntentReference; expires_at: string } | null = null;
-
-    // All genuinely side-effecting tools are fail-closed until a Requirement
-    // Model compiles into a >=95 RRS Execution Contract with zero blockers.
-    // Operation observations are read-only recovery, so they may proceed.
-    if (sideEffectingInvocation) {
-      try {
-        if (relayScopeError) throw relayScopeError;
-      await inRelayScope(async () => {
-        await assertRelayWorkerMutationFence(scope.workspaceRoot, scope.mcpSessionId);
-        const workspaceGoal = sessionGoal;
-        const canReuseRelayContract =
-          extractedIntent.intent === undefined &&
-          relayEnabled() &&
-          workspaceGoal?.status === "active" &&
-          Boolean(workspaceGoal.owner_session) &&
-          workspaceGoal.owner_session === scope.mcpSessionId;
-
-        if (canReuseRelayContract) {
-          const inherited = await readAcceptedExecutionContractState(scope.workspaceRoot, scope.mcpSessionId, scope.goalId);
-          if (!inherited || inherited.readiness_score < REQUIREMENT_READY_SCORE) {
-            throw new Error("REQUIREMENT_INHERITED_CONTRACT_MISSING: current Driver has no valid inherited execution contract");
-          }
-          const driverAdmission = await assertDriverMutationAdmission(scope.workspaceRoot, {
-            goalId: workspaceGoal.id,
-            goalOwnerSessionId: workspaceGoal.owner_session!,
-            callerSessionId: scope.mcpSessionId,
-            executionContractHash: inherited.requirement_hash,
-            intentRevision: inherited.intent_revision,
-          });
-          admittedDriverLease = driverAdmission.lease;
-        } else {
-          admittedReference = parseIntentReference(extractedIntent.intent);
-          const accepted = admittedReference
-            ? await runWithRuntimeScope(scope, () => resolveIntentReference(scope, admittedReference!))
-            : (await runWithRuntimeScope(scope, () => admitExecutionContract(scope.workspaceRoot, scope.mcpSessionId,
-                parseRequirementModel(extractedIntent.intent), scope.goalId))).state;
-          if (!admittedReference && accepted.scope_binding && accepted.canonical_requirement_json) {
-            issuedReference = { reference: { intent_revision: accepted.intent_revision, requirement_hash: accepted.requirement_hash }, expires_at: accepted.expires_at };
-          }
-          if (workspaceGoal?.status === "active") {
-            if (!workspaceGoal.owner_session) {
-              if (relayEnabled()) {
-                throw new Error("DRIVER_GOAL_UNBOUND: relay-controlled active Goals require an owning ChatGPT session");
-              }
-            } else {
-              const driverAdmission = await assertDriverMutationAdmission(scope.workspaceRoot, {
-                goalId: workspaceGoal.id,
-                goalOwnerSessionId: workspaceGoal.owner_session,
-                callerSessionId: scope.mcpSessionId,
-                executionContractHash: accepted.requirement_hash,
-                intentRevision: accepted.intent_revision,
-              });
-              admittedDriverLease = driverAdmission.lease;
-            }
-          }
-        }
-        });
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        const errorCode = /^[A-Z][A-Z0-9_]+(?=:|$)/.exec(message)?.[0] ?? "REQUIREMENT_ADMISSION_FAILED";
-        const driverFailure = errorCode.startsWith("DRIVER_");
-        const revisionConflict = errorCode === "INTENT_REVISION_CONFLICT" || errorCode === "STALE_INTENT_REVISION";
-        let currentReference: { reference: IntentReference; expires_at: string } | null = null;
-        if (revisionConflict) {
-          try {
-            const accepted = await readAcceptedExecutionContractState(scope.workspaceRoot, scope.mcpSessionId, scope.goalId);
-            if (accepted) {
-              const reference = { intent_revision: accepted.intent_revision, requirement_hash: accepted.requirement_hash };
-              // Return only a reference that resolves in this exact trusted scope.
-              await runWithRuntimeScope(scope, () => resolveIntentReference(scope, reference));
-              currentReference = { reference, expires_at: accepted.expires_at };
-            }
-          } catch { /* Optional correction metadata must not replace the original rejection. */ }
-        }
-        const blocked: CallToolResult = toolError(toolName, errorCode, {
-          error_code: errorCode,
-          failure_class: driverFailure ? "conflict" : "validation",
-          outcome_kind: driverFailure ? "blocked" : "needs_input",
-          failure_phase: "admission",
-          operation_started: false,
-          retryable: false,
-          retry_policy: driverFailure ? "refresh_state" : "retry_with_changed_args",
-          detail: message,
-          ...(!driverFailure ? requirementInputGuidance() : {}),
-          ...(currentReference ? { accepted_intent_reference: currentReference } : {}),
-          authority: {
-            caller_session_id: scope.mcpSessionId ?? null,
-            session_goal_id: scope.goalId ?? null,
-            relay_goal_id: relayGoalId ?? null,
-          },
-          next_action:
-            driverFailure
-              ? "Stop side-effecting work in this Turn. Read Goal/relay status and continue only from the current Driver session/epoch; stale Drivers may keep using read-only discovery."
-              : revisionConflict
-              ? "The operation has not started. For the same authorized objective and scope, reuse the exact previously accepted _intent or JSON.stringify({reference: accepted_intent_reference.reference}) when returned. Do not rewrite a contract with the same revision. Increase intent_revision only for a material change to the actual user request, scope or constraints; do not invent a change to clear this error."
-              : "The operation has not started. Correct _intent using the required fields and actual user request; do not resend unchanged arguments. Use read-only discovery for missing facts. Do not ask the user to approve a concrete action they already authorized.",
-        });
-        if (currentReference) blocked._meta = { ...blocked._meta, "harness/intent_reference": currentReference };
-        observeMcpToolResult({
-          requestId: scope.requestId,
-          tool: definition.name,
-          invocationId: scope.invocationId,
-          result: blocked,
-        });
-        return blocked;
-      }
-    }
-
-    // Recovery Integrity is independent of Requirement Gate admission. A
-    // model-supplied _intent, tool annotation or document READY cannot grant
-    // a write; the strict profile requires an operator-signed scoped record.
-    // Apply this to *all* effective tools, including upstream and aliases.
-    let recoveryPermit: Awaited<ReturnType<typeof assertRecoveryIngress>> = null;
-    try {
-      recoveryPermit = await assertRecoveryIngress(toolName, definition.source, context.rawArgs, scope, metadata.observe);
-      if (recoveryPermit && metadata.id && metadata.id !== recoveryPermit.operationId) {
-        throw new Error("RI_BLOCKED: supplied operation metadata conflicts with operator-signed operation ID");
-      }
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      const errorCode = message.startsWith("RI_RECONCILE_REQUIRED") ? "RI_RECONCILE_REQUIRED" : "RI_BLOCKED";
-      const blocked = toolError(toolName, errorCode, {
-        error_code: errorCode, failure_class: errorCode === "RI_RECONCILE_REQUIRED" ? "conflict" : "validation", retryable: false,
-        outcome_kind: "blocked", failure_phase: "admission", operation_started: false, retry_policy: "refresh_state",
-        detail: message, next_action: "Inspect the signed operation's original durable receipt and actual target state. Never blindly repeat its effect.",
-      });
-      observeMcpToolResult({
-        requestId: scope.requestId, tool: definition.name,
-        invocationId: scope.invocationId, result: blocked,
-      });
-      return blocked;
-    }
-
+    // Execution no longer depends on intent, Goal/Driver admission, or legacy
+    // recovery grants. Concrete resources and the operation journal retain their
+    // own locks and duplicate protection.
     let effectDispatched = false, effectSettled = false;
-    const withDriverExecutionFence = async <T>(operation: () => Promise<T>): Promise<T> => {
-      const goalEffect = sideEffectingInvocation && scope.goalId
-        ? await enterGoalEffect(scope.workspaceRoot, scope.goalId, scope.goalOwnerSessionId) : undefined;
-      const releaseGoal = goalEffect ?? (async (_outcome: "settled" | "uncertain") => {});
-      if (definition.source === "native" && definition.name === "start_process") scope.goalEffectLease = goalEffect;
-      try {
-        if (sideEffectingInvocation && scope.goalId) {
-          const currentGoal = await getGoal(scope.workspaceRoot, scope.mcpSessionId);
-          if (currentGoal?.id !== scope.goalId || currentGoal.owner_session !== scope.mcpSessionId) {
-            throw new Error("GOAL_SCOPE_CHANGED: the session changed Goal after this invocation was admitted");
-          }
-        }
-        if (admittedReference) await runWithRuntimeScope(scope, () => resolveIntentReference(scope, admittedReference!));
-        if (!sideEffectingInvocation || !admittedDriverLease) return await operation();
-        const release = await inRelayScope(() => enterDriverMutationExecution(scope.workspaceRoot, admittedDriverLease!));
-        try { return await operation(); } finally { release(); }
-      } finally {
-        try { await releaseGoal(!effectDispatched || effectSettled ? "settled" : "uncertain"); }
-        catch (error) {
-          throw new Error(`GOAL_ADMISSION_RELEASE_UNCERTAIN: effect may have executed; do not replay. ${error instanceof Error ? error.message : String(error)}`);
-        }
-      }
-    };
-
-    // Providers may queue or connect after their handler is admitted. The outer
-    // fence still owns the whole invocation; this callback prevents a new
-    // dispatch after Goal lifecycle or Driver authority changed while waiting.
-    // It never reacquires authority or replays an already-dispatched effect.
-    scope.beforeDispatch = async () => {
-      if (!sideEffectingInvocation) return;
-      const currentGoal = await getGoal(scope.workspaceRoot, scope.mcpSessionId);
-      if (currentGoal?.id !== sessionGoal?.id ||
-          currentGoal?.owner_session !== sessionGoal?.owner_session ||
-          currentGoal?.status !== sessionGoal?.status) {
-        throw new Error("GOAL_SCOPE_CHANGED: Goal identity, owner or lifecycle changed before provider dispatch");
-      }
-      await inRelayScope(async () => {
-        await assertRelayWorkerMutationFence(scope.workspaceRoot, scope.mcpSessionId);
-        if (admittedDriverLease) {
-          const release = await enterDriverMutationExecution(scope.workspaceRoot, admittedDriverLease);
-          release();
-        }
-      });
-    };
+    const withDriverExecutionFence = async <T>(operation: () => Promise<T>): Promise<T> => operation();
 
     const executeOnce = () => runWithRuntimeScope(scope, () => inRelayScope(async () => {
       await this.emitTrace({
@@ -398,16 +187,16 @@ export class InvocationGateway {
       });
 
       const identity = getMcpRequestIdentity();
-      const conversationId = scope.mcpSessionId?.startsWith("oai_conv_") ? scope.mcpSessionId : undefined;
+      const conversationId = scope.conversationContinuity === "trusted" ? scope.conversationSessionId : undefined;
       // Product telemetry retains a bounded, redacted target; debug trace remains argument-free.
       let safeSummary = "";
       try { safeSummary = redactSensitiveText(summarizeToolArgs(definition.name, context.rawArgs)).replace(/\s+/g, " ").trim().slice(0, 160); } catch {}
       let heartbeat: ReturnType<typeof setInterval> | undefined;
-      const lifecycle = (status: "running" | "ok" | "error", duration: number, failure?: ToolFailureDiagnostic) => {
+      const lifecycle = (status: "running" | "ok" | "error" | "unknown", duration: number, failure?: ToolFailureDiagnostic) => {
         if (status !== "running" && heartbeat) clearInterval(heartbeat);
         try { appendActivity({ kind: "tool", action: "tools/call", tool: definition.name, status,
           duration_ms: duration, session_id: identity?.transportSessionId, conversation_id: conversationId,
-          summary: failure ? [safeSummary, failure.error_summary].filter(Boolean).join(" — ") : safeSummary || (status === "running" ? "started" : status === "ok" ? "completed" : "failed"),
+          summary: failure ? [safeSummary, failure.error_summary].filter(Boolean).join(" — ") : safeSummary || (status === "running" ? "started" : status === "ok" ? "completed" : status === "unknown" ? "outcome unknown" : "failed"),
           details: { invocation_id: scope.invocationId, canonical_lifecycle: true, ...(failure ? { ...failure } : {}) } }); } catch {}
       };
       const executionStartedAt = Date.now();
@@ -432,13 +221,7 @@ export class InvocationGateway {
           : protectedResult;
         const guarded = await guardToolResult(context, result, { stage: "wire", compactDuplicates: true,
           budget: Math.max(16 * 1024, resultByteBudget() - 1024) });
-        // Make the first admitted full contract discoverable in both ordinary
-        // model-visible content and machine-readable MCP metadata.
-        const wireResult = issuedReference ? {
-          ...guarded,
-          content: [...guarded.content, { type: "text" as const, text: `Accepted _intent reference (expires ${issuedReference.expires_at}): ${JSON.stringify({ reference: issuedReference.reference })}` }],
-          _meta: { ...guarded._meta, "harness/intent_reference": issuedReference },
-        } : guarded;
+        const wireResult = guarded;
         observeMcpToolResult({
           requestId: scope.requestId,
           tool: definition.name,
@@ -459,7 +242,9 @@ export class InvocationGateway {
           handlerEntered, handlerReturned, postprocessingCompleted: true, reconciliationNeeded: false,
         });
         const failure = toolFailureDiagnostic(wireResult);
-        lifecycle(failure ? "error" : "ok", elapsedMs(executionStartedAt), failure);
+        const lifecycleStatus = failure?.outcome_kind === "running" ? "running"
+          : failure?.outcome_kind === "unknown" ? "unknown" : failure ? "error" : "ok";
+        lifecycle(lifecycleStatus, elapsedMs(executionStartedAt), failure);
         // Only an acknowledged native host handoff may end the submission
         // reservation. The separate managed reservation survives until child close.
         // This line remains after all result guards, success hooks and trace hooks.
@@ -563,9 +348,9 @@ export class InvocationGateway {
       principalId: scope.principalId, tunnelProfile: scope.tunnelProfile,
       conversationSessionId: scope.mcpSessionId,
     };
-    const legacyIdentity = !recoveryPermit && scope.goalId && metadata.id
+    const legacyIdentity = scope.goalId && metadata.id
       ? scopedOperationIdentity(identityNamespace, transport, scope.requestId, metadata.id) : undefined;
-    const identity = recoveryPermit?.identity ?? scopedOperationIdentity({
+    const identity = scopedOperationIdentity({
       ...identityNamespace, goalId: scope.goalId,
     }, transport, scope.requestId, metadata.id);
     if ((metadata.id || metadata.observe) && !identity) return toolError(toolName, "OPERATION_SCOPE_REQUIRED");
@@ -579,7 +364,7 @@ export class InvocationGateway {
       let entered = false;
       const result = await executeOperation({
         workspaceRoot: scope.workspaceRoot, identity, tool: toolName,
-        goalId: recoveryPermit ? undefined : scope.goalId, ownerSessionId: scope.goalOwnerSessionId, legacyIdentity,
+        goalId: scope.goalId, ownerSessionId: scope.goalOwnerSessionId, legacyIdentity,
         args: context.rawArgs, signal: scope.signal, observe: metadata.observe,
       }, () => { entered = true; return executeOnce(); });
       // A replay/observation is still a tool response for this RPC. It does not
@@ -602,33 +387,6 @@ export class InvocationGateway {
   }
 }
 
-/**
- * Driver fencing must outlive the active Goal projection.  A recovered Goal can
- * complete while an old browser turn is still alive or waiting on a tool
- * approval.  Limiting fencing to `goal.status === active` allowed that stale,
- * terminal Worker to enter a side-effect handler after completion.  Only
- * sessions known to Relay are constrained here; ordinary non-Relay clients
- * retain their existing behavior.
- */
-async function assertRelayWorkerMutationFence(workspaceRoot: string, callerSessionId?: string): Promise<void> {
-  if (!relayEnabled() || !callerSessionId) return;
-  const lease = await readDriverLease(workspaceRoot);
-  const registry = await readWorkerRegistry(workspaceRoot);
-  const workers = Object.values(registry.workers).filter((worker) => worker.bound_session_id === callerSessionId);
-
-  const terminal = new Set(["DEAD", "FAILED", "RETIRED"]);
-  const liveWorkers = workers.filter((worker) => !terminal.has(worker.state));
-  if (workers.length > 0 && liveWorkers.length === 0) {
-    throw new Error("DRIVER_WORKER_FENCED: this Relay Worker is terminal and cannot perform side effects");
-  }
-
-  // A handoff predecessor may have no Worker record. Its durable Driver history
-  // still fences it after ownership moves, including after the successor stops.
-  if (lease && lease.owner_session_id !== callerSessionId) {
-    throw new Error("DRIVER_LEASE_LOST: this Relay session does not own the scoped Driver lease");
-  }
-}
-
 function elapsedMs(startedAt: number): number {
   return Math.max(0, Date.now() - startedAt);
 }
@@ -638,16 +396,9 @@ function findRequestContext(callbackArgs: readonly unknown[]): RequestContext | 
   if (!isRequestContextLike(candidate)) return undefined;
 
   return {
-    // OpenAI tunnel command dispatch can create a fresh transport-level MCP
-    // session for every tool call while keeping one stable workflow request
-    // id for the ChatGPT turn/workflow. Goal/task ownership must follow that
-    // stable workflow identity rather than the ephemeral transport session.
-    // Fall back to the SDK sessionId for ordinary MCP clients.
-    sessionId:
-      conversationSessionIdFromMeta(candidate._meta) ??
-      conversationSessionIdFromHeaders(candidate.requestInfo?.headers) ??
-      getMcpRequestIdentity()?.conversationSessionId ??
-      (typeof candidate.sessionId === "string" ? candidate.sessionId : undefined),
+    // Pass the raw metadata to the shared identity resolver in createRuntimeScope.
+    sessionId: typeof candidate.sessionId === "string" ? candidate.sessionId : undefined,
+    _meta: candidate._meta,
     signal: candidate.signal as AbortSignal | undefined,
     requestId: isRequestId(candidate.requestId) ? candidate.requestId : undefined,
   };

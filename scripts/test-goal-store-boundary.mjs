@@ -90,11 +90,10 @@ try {
   await Promise.race([enteredEffect, running.then(() => { throw new Error("fixture handler was not entered"); }),
     new Promise((_, reject) => { effectTimer = setTimeout(() => reject(new Error("effect barrier timeout")), 5000); })]);
   clearTimeout(effectTimer);
-  const journalBytes = await read(goals.goalCreationJournalPath(workspace, "A"));
+  let duringEffect;
   try {
-    await assert.rejects(() => inSession("A", () => goals.createGoal(workspace, input("must wait for effect"))), /GOAL_CREATION_EFFECT_BUSY/);
-    assert.equal(await read(goals.goalCreationJournalPath(workspace, "A")), journalBytes, "busy effect rejection published a creation transaction");
-    assert.equal((await goals.getGoal(workspace, "A")).id, next.id);
+    duringEffect = await inSession("A", () => goals.createGoal(workspace, input("replacement while effect runs")));
+    assert.notEqual(duringEffect.id, next.id, "an unrelated new Goal must not be held by an in-flight effect");
     const independent = await inSession("C", () => goals.createGoal(workspace, input("independent owner")));
     const independentNext = await inSession("C", () => goals.createGoal(workspace, input("independent successor")));
     assert.notEqual(independent.id, independentNext.id, "another owner's replacement must not share this effect fence");
@@ -102,8 +101,8 @@ try {
   await running;
   const final = await inSession("A", () => goals.createGoal(workspace, input("after effect settled")));
   assert.notEqual(final.id, next.id);
-  assert.ok((await runs.readArchivedGoalRun(workspace, next.id, "A")).run.typedEvidence.length > 0,
-    "completed effect evidence must remain with the old Goal");
+  assert.equal((await runs.readArchivedGoalRun(workspace, next.id, "A")).run.typedEvidence.length, 0,
+    "late effect must not rewrite an archived Goal");
   assert.equal((await runs.readGoalRun(workspace, "A")).run.typedEvidence.length, 0,
     "old effect evidence must not enter the new Goal");
   assert.equal(await read(driver.driverLeasePath(workspace, foreign.id)), foreignLeaseBytes, "superseding A changed B's Driver lease");
@@ -135,8 +134,9 @@ try {
   const failingGateway = new InvocationGateway(failingRegistry, { workspaceRoot: workspace, projectRoots: [workspace] });
   await assert.rejects(failingGateway.invoke("write_file", [{ path: "fixture", _intent: intent },
     { sessionId: "A", requestId: 125, signal: new AbortController().signal }]), /fixture effect failure/);
-  await assert.rejects(() => inSession("A", () => goals.createGoal(workspace, input("failed effect remains uncertain"))), /GOAL_CREATION_EFFECT_BUSY/);
-  console.log("goal-store-boundary: evidence retained, late hook fenced, live non-Relay effect blocks replacement, foreign Driver untouched OK");
+  const afterFailure = await inSession("A", () => goals.createGoal(workspace, input("failed effect remains uncertain")));
+  assert.notEqual(afterFailure.id, afterRead.id);
+  console.log("goal-store-boundary: late evidence stays isolated, in-flight/failed effects do not block replacement, foreign Driver untouched OK");
 } finally {
   for (const [key, value] of Object.entries(saved)) {
     if (value === undefined) delete process.env[key]; else process.env[key] = value;

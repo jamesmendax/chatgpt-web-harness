@@ -1,0 +1,37 @@
+{
+  "manifest_version": 3,
+  "name": "Web Harness Relay Companion",
+  "version": "0.2.9.10",
+  "version_name": "0.2.9-rc.10",
+  "description": "Local browser control plane for capability-verified Web Harness Worker relay.",
+  "permissions": [
+    "storage",
+    "alarms",
+    "debugger"
+  ],
+  "host_permissions": [
+    "https://chatgpt.com/*",
+    "https://chat.openai.com/*",
+    "http://127.0.0.1/*"
+  ],
+  "background": {
+    "service_worker": "service-worker.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://chatgpt.com/*",
+        "https://chat.openai.com/*"
+      ],
+      "js": [
+        "visible-feedback-ledger.js",
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_title": "Web Harness Relay Companion",
+    "default_popup": "popup.html"
+  }
+}

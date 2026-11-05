@@ -1,6 +1,6 @@
 {
   "name": "chatgpt-web-harness-isolated",
-  "version": "3.1.2",
+  "version": "3.2.0",
   "description": "ChatGPT Web Harness 桌面启动器：多账号隔离配置、独立 MCP / Secure MCP Tunnel 生命周期与实时活动日志",
   "private": true,
   "main": "src/main.js",
@@ -37,7 +37,7 @@
     "test:ui:isolated": "node scripts/run-electron.cjs scripts/test-isolated-ui.cjs",
     "test:status:native": "node scripts/test-status-native.cjs",
     "test:installer:isolated": "node --test scripts/test-isolated-installer.cjs",
-    "test:aura": "node scripts/test-aura-core.cjs && node --test scripts/test-idle-watch.cjs scripts/test-idle-notification.cjs scripts/test-notification-sound.cjs scripts/test-notification-sounds-library.cjs scripts/test-conversation-index.cjs scripts/test-notification-identity.cjs scripts/test-activity-feeds.cjs scripts/test-relay-retired.cjs && node scripts/run-electron.cjs scripts/test-aura-boot.cjs && node scripts/run-electron.cjs scripts/test-aura-ui.cjs && node scripts/run-electron.cjs scripts/test-aura-feedback.cjs && node scripts/run-electron.cjs scripts/test-aura-preferences.cjs"
+    "test:aura": "node scripts/test-aura-core.cjs && node --test scripts/test-idle-watch.cjs scripts/test-idle-notification.cjs scripts/test-notification-sound.cjs scripts/test-notification-sounds-library.cjs scripts/test-conversation-index.cjs scripts/test-notification-identity.cjs scripts/test-activity-feeds.cjs scripts/test-aura-frame-scheduler.cjs scripts/test-aura-quality.cjs scripts/test-aura-motion.cjs scripts/test-renderer-memory-guard.cjs scripts/test-v32-diagnostics.cjs scripts/test-relay-retired.cjs && node scripts/run-electron.cjs scripts/test-aura-boot.cjs && node scripts/run-electron.cjs scripts/test-aura-ui.cjs && node scripts/run-electron.cjs scripts/test-aura-feedback.cjs && node scripts/run-electron.cjs scripts/test-aura-preferences.cjs && node scripts/run-electron.cjs scripts/test-renderer-memory-recovery.cjs && node scripts/run-electron.cjs scripts/test-renderer-memory-recovery.cjs --gpu-pressure && node scripts/run-electron.cjs scripts/test-aura-quality-ui.cjs"
   },
   "devDependencies": {
     "electron": "41.10.3",

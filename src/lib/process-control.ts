@@ -17,6 +17,8 @@ export interface ProcessHostSpec {
   stderr_path: string;
   state_path: string;
   control_dir: string;
+  output_encoding?: string;
+  execution_mode?: "shell" | "argv";
   /** Internal one-use capability, consumed before spawning the user's command. */
   goal_effect?: ManagedProcessEffectLaunch;
 }
@@ -31,6 +33,10 @@ export interface ProcessHostState {
   signal: string | null;
   stdout_bytes: number;
   stderr_bytes: number;
+  output_encoding?: string;
+  decode_anomaly?: boolean;
+  execution_mode?: "shell" | "argv";
+  log_error?: string;
   stdin_open: boolean;
   started_at: string;
   updated_at: string;
@@ -187,7 +193,7 @@ export async function sendProcessControl(
   }
 }
 
-export async function readTextTail(filePath: string | null | undefined, maxBytes: number): Promise<{ text: string; bytes: number }> {
+export async function readTextTail(filePath: string | null | undefined, maxBytes: number, encoding = "utf-8"): Promise<{ text: string; bytes: number }> {
   if (!filePath) return { text: "", bytes: 0 };
   try {
     const stat = await fs.stat(filePath);
@@ -197,7 +203,7 @@ export async function readTextTail(filePath: string | null | undefined, maxBytes
     try {
       const buffer = Buffer.alloc(length);
       const { bytesRead } = await handle.read(buffer, 0, length, Math.max(0, size - length));
-      return { text: buffer.subarray(0, bytesRead).toString("utf8"), bytes: size };
+      return { text: new TextDecoder(encoding.toLowerCase() === "cp936" ? "gbk" : encoding).decode(buffer.subarray(0, bytesRead)), bytes: size };
     } finally { await handle.close(); }
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return { text: "", bytes: 0 };

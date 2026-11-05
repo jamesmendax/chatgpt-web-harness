@@ -58,7 +58,7 @@ const conversation = conversationSessionIdFromMeta({ "openai/session": "activity
 assert.match(conversation, /^oai_conv_[0-9a-f]{32}$/);
 const short = conversation.slice("oai_conv_".length, "oai_conv_".length + 8);
 assert.equal(activityConversationId({ method: "tools/call", params: { _meta: { "openai/session": "activity-conversation-fixture" } } }), conversation);
-assert.equal(activityConversationId({ params: {} }, { "X-OpenAI-Session": "activity-conversation-fixture" }), conversation);
+assert.equal(activityConversationId({ params: {} }, { "X-OpenAI-Session": "activity-conversation-fixture" }), undefined, "untrusted header must not establish conversation identity");
 assert.equal(activityConversationId({ params: {} }, { "x-client-request-id": "wfr_legacyWorkflow1/command_1" }), undefined);
 assert.equal(activityConversationId({ params: {} }, { "mcp-session-id": "transport-only" }), undefined);
 assert.equal(activityConversationId([{ params: { _meta: { "openai/session": "batch" } } }]), undefined);

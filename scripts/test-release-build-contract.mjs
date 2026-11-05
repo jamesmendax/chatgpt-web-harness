@@ -27,13 +27,23 @@ for (const test of ['scripts/test-retired-entrypoints.mjs', 'scripts/test-goal-s
 for (const name of [
   'scripts/test-route-skill-loading.mjs', 'scripts/test-route-skill-mcp.mjs',
   'scripts/test-binary-upload-integrity.mjs', 'scripts/test-skill-resources.mjs',
-  'scripts/test-intent-reference.mjs', 'scripts/test-result-phases.mjs',
+  'scripts/test-v32-execution.ts', 'scripts/test-v32-identity.ts', 'scripts/test-v32-skills.mjs',
+  'scripts/test-v32-process.mjs', 'scripts/test-v32-visual.ts', 'scripts/test-result-phases.mjs',
   'scripts/test-retired-relay-compat.mjs', 'scripts/test-goal-run-crossprocess.mjs',
   'desktop/scripts/test-account-profile-transfer.cjs', 'desktop/scripts/test-account-import-transactions.cjs', 'desktop/scripts/test-account-delete-transactions.cjs',
   'desktop/scripts/test-ipc-source.cjs',
 ]) assert.ok(fullTests.includes(name) && dailyTests.includes(name), `${name} missing from active suites`);
-for (const name of ['binary-upload-integrity', 'runtime-race-repairs', 'goal-run-crossprocess', 'intent-reference', 'result-phases', 'retired-relay-compat']) {
+for (const name of ['binary-upload-integrity', 'runtime-race-repairs', 'goal-run-crossprocess', 'result-phases', 'retired-relay-compat']) {
   assert.deepEqual(nodeArgs(`scripts/test-${name}.mjs`).slice(0, 2), ['--import', 'tsx']);
+}
+for (const name of ['scripts/test-v32-execution.ts', 'scripts/test-v32-identity.ts', 'scripts/test-v32-skills.mjs', 'scripts/test-v32-tooling.ts', 'scripts/test-v32-visual.ts']) {
+  assert.deepEqual(nodeArgs(name).slice(0, 2), ['--import', 'tsx']);
+  assert.ok(fullTests.includes(name), `3.2 source regression missing: ${name}`);
+}
+assert.ok(fullTests.includes('scripts/test-v32-checkpoint-concurrency.mjs'));
+for (const name of ['scripts/test-requirement-readiness.mjs', 'scripts/test-intent-reference.mjs', 'scripts/test-visual-review.mjs']) {
+  assert.ok(historicalTests.includes(name), `retired 3.2 contract lacks historical provenance: ${name}`);
+  assert.ok(!fullTests.includes(name) && !dailyTests.includes(name), `retired 3.2 contract is active: ${name}`);
 }
 assert.equal(includeDist('admin/companion.js'), false);
 assert.equal(includeDist('admin/companion.d.ts'), false);

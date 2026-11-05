@@ -234,7 +234,8 @@ export async function loadProjectSkill(
   offset_bytes: number; total_bytes: number; truncated: boolean; continuation?: SkillContinuation;
   selection_id: string; end_bytes: number; resource_path: string; resource_sha256?: string;
   body_sha256?: string;
-  resource_catalog: ReturnType<typeof resourcePage>;
+  resource_root: string; encoding?: "utf8" | "base64";
+  resource_catalog: Awaited<ReturnType<typeof resourcePage>>;
   content_receipt: Awaited<ReturnType<typeof recordSkillRange>>;
   references?: Array<{ path: string; content: string; truncated: boolean }>;
   reference_paths?: string[];
@@ -247,7 +248,7 @@ export async function loadProjectSkill(
   const allSkills = await resolveAllSkills(workspaceRoot);
   const skill = selectSkill(allSkills, name, mode);
   if (!skill.content_sha256 || (options.expected_content_sha256 && options.expected_content_sha256 !== skill.content_sha256)) {
-    throw new Error("SKILL_VERSION_CHANGED: refresh list_skills and select the current skill version before loading.");
+    throw new Error(`SKILL_VERSION_CHANGED: supplied=${options.expected_content_sha256 ?? "none"}; current=${skill.content_sha256 ?? "unavailable"}. Refresh list_skills.`);
   }
   const data = await fs.readFile(skill.path);
   let policyData: Buffer | undefined;
@@ -258,15 +259,17 @@ export async function loadProjectSkill(
     throw new Error("SKILL_VERSION_CHANGED: skill bytes or invocation policy changed while loading; refresh list_skills and retry.");
   }
   const selection = await selectSkillContent(workspaceRoot, skill, mode, options.selection_id, options.phase);
-  const resourceCatalog = resourcePage(selection, options.resource_offset, options.resource_limit);
+  const resourceCatalog = await resourcePage(selection, options.resource_offset, options.resource_limit);
   if (options.resource_path) {
-    if (!options.selection_id) throw new Error("SKILL_SELECTION_REQUIRED: read the Skill body before selected resources.");
     const resource = await readSelectedResource(selection, options.resource_path, options.expected_resource_sha256);
     if (offset > resource.data.length) throw new Error("Skill resource offset_bytes exceeds the file size.");
-    const chunk = readUtf8Chunk(resource.data, offset, maxBytes);
+    const decoded = resource.data.toString("utf8");
+    const isText = !resource.data.includes(0) && Buffer.from(decoded, "utf8").equals(resource.data);
+    const end = Math.min(resource.data.length, offset + maxBytes);
+    const chunk = isText ? readUtf8Chunk(resource.data, offset, maxBytes) : { content: resource.data.subarray(offset, end).toString("base64"), end };
     const truncated = chunk.end < resource.data.length;
     const receipt = await recordSkillRange(selection, options.resource_path, resource.sha256, resource.data.length, offset, chunk.end);
-    return { skill, resolved_via: resolvedVia(skill, name), dir: skill.dir, layout: skill.layout,
+    return { skill, resolved_via: resolvedVia(skill, name), dir: skill.dir, resource_root: skill.dir, encoding: isText ? "utf8" : "base64", layout: skill.layout,
       usage: "Read-only selected Skill resource. Loading content does not apply its workflow or grant execution permission.",
       content: chunk.content, content_sha256: contentHash, content_complete: !truncated,
       offset_bytes: offset, end_bytes: chunk.end, total_bytes: resource.data.length, truncated,
@@ -311,7 +314,7 @@ export async function loadProjectSkill(
     }
   }
   return {
-    skill, resolved_via: resolvedVia(skill, name), dir: skill.dir, layout: skill.layout,
+    skill, resolved_via: resolvedVia(skill, name), dir: skill.dir, resource_root: skill.dir, layout: skill.layout,
     usage: `SKILL_DIR=${skill.dir}; use absolute paths or run_command working_directory=${skill.dir}; do not cd into the Skill directory` +
       (truncated ? "; content is incomplete: read the returned continuation/reference_continuations before applying required instructions" : ""),
     content, content_sha256: contentHash, content_complete: !bodyTruncated, offset_bytes: offset,

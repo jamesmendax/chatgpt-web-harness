@@ -143,6 +143,17 @@ function verifyRuntime(paths: ReturnType<typeof runtimePaths>): RuntimeProvenanc
   return provenance;
 }
 
+/** Resolve the provisioned Chrome only after applying the same runtime integrity checks. */
+export function verifiedOfflineBrowserPath(): string {
+  const paths = runtimePaths();
+  const provenance = verifyRuntime(paths);
+  const expected = provenance.critical_files?.["chrome/chrome-win64/chrome.exe"];
+  if (!expected || sha256File(paths.chrome) !== expected.toLowerCase()) {
+    throw new Error("Bundled Chrome is missing a verified critical-file hash");
+  }
+  return paths.chrome;
+}
+
 /** Validate the pinned runtime before using a retained browser capability. */
 export function browserUseProvisioning(): BrowserUseProvisioning {
   const paths = runtimePaths();

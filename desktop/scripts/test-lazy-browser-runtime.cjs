@@ -73,8 +73,10 @@ test("corrupt archive fails SHA256 before extracting or publishing a cache", { s
 
 test("stream extraction supports nested archive entries and portable cache paths beyond MAX_PATH", { skip: process.platform !== "win32" }, async t => {
   const input = await fixture(t, true);
+  // Keep the long-path precondition independent of the source checkout length.
+  const longPathParent = path.join(input.root, "long-path-fixture-" + "x".repeat(64));
   for (const padding of [35, 70]) {
-    input.cacheBase = path.join(input.root, "portable-parent-" + "p".repeat(padding), "canonical-portable-name-" + "n".repeat(padding), "appdata", "chatgpt-web-harness-isolated", "br");
+    input.cacheBase = path.join(longPathParent, "portable-parent-" + "p".repeat(padding), "canonical-portable-name-" + "n".repeat(padding), "appdata", "chatgpt-web-harness-isolated", "br");
     const root = await materializeBrowserRuntime(input);
     const file = path.join(root, "site-packages/browser_harness/__init__.py");
     assert.ok(file.length > 280, `Expected long portable path, got ${file.length}`);

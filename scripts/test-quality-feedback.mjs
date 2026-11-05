@@ -27,8 +27,9 @@ const { createMcpServer } = await load("server-factory.js");
 const { createGoal } = await load("lib/goals.js");
 const { confirmGoalRunCriterion, transitionGoalRunLifecycle } = await load("lib/goal-run-web.js");
 const { createRuntimeScope, runWithRuntimeScope } = await load("lib/runtime-scope.js");
+const { runtimePrincipalId } = await load("lib/mcp-request-identity.js");
 const fixtureSessionId = "quality-feedback-fixture";
-const fixtureScopeSeed = { workspaceRoot: workspace, projectRoots: [workspace] };
+const fixtureScopeSeed = { workspaceRoot: workspace, projectRoots: [workspace], principalId: runtimePrincipalId(workspace) };
 const server = createMcpServer(workspace, 30_000, [workspace], true);
 const client = new Client({ name: "quality-feedback-regression", version: "1" });
 const [ct, st] = InMemoryTransport.createLinkedPair();
@@ -55,7 +56,7 @@ async function check(name, run) {
     await runWithRuntimeScope(createRuntimeScope(fixtureScopeSeed, { sessionId: fixtureSessionId }), run);
     results.push({ name, passed: true });
   }
-  catch (error) { results.push({ name, passed: false, error: String(error.message ?? error) }); }
+  catch (error) { results.push({ name, passed: false, error: String(error.stack ?? error) }); }
 }
 const call = (name, args) => client.callTool({
   name,
@@ -87,7 +88,10 @@ try {
     assert.equal(value.next_offset, null);
   });
   await check("business errors carry the MCP error flag", async () => {
-    const result = await call("visual_review", { action: "status" });
+    const empty = await call("visual_review", { action: "status" });
+    assert.equal(empty.structuredContent.ok, true);
+    assert.equal(empty.structuredContent.data.review, null);
+    const result = await call("visual_review", { action: "withdraw" });
     assert.equal(result.structuredContent.ok, false);
     assert.equal(result.isError, true);
   });
@@ -113,7 +117,7 @@ try {
     assert.equal(checked.exit_code, 0);
     await confirmGoalRunCriterion(workspace, { criterion, evidenceIds: [checked.goal_run_evidence.id] });
     await fs.writeFile(path.join(workspace, "source.mjs"), "export function add(a,b){return a-b;}\n");
-    await assert.rejects(transitionGoalRunLifecycle(workspace, "complete"), /GOAL_VERIFICATION_MISMATCH/);
+    await assert.rejects(confirmGoalRunCriterion(workspace, { criterion, evidenceIds: [checked.goal_run_evidence.id] }), /GOAL_VERIFICATION_MISMATCH/);
     const failed = payload(await call("run_command", { command: "node checks.mjs", working_directory: workspace }));
     assert.notEqual(failed.exit_code, 0);
     await assert.rejects(confirmGoalRunCriterion(workspace, { criterion, evidenceIds: [failed.goal_run_evidence.id] }), /GOAL_VERIFICATION_MISMATCH/);
@@ -145,11 +149,10 @@ try {
       const replay = payload(await call(tool, { id: started.id }));
       await assert.rejects(confirmGoalRunCriterion(workspace, { criterion, evidenceIds: [replay.goal_run_evidence.id] }), /GOAL_VERIFICATION_MISMATCH/);
     }
-    await assert.rejects(transitionGoalRunLifecycle(workspace, "complete"), /GOAL_VERIFICATION_MISMATCH/);
+    assert.equal((await transitionGoalRunLifecycle(workspace, "complete")).goal.status, "completed", "Goal completion is a record, not a verification gate");
   });
   await check("legacy criteria recover by declaring a check without discarding the goal", async () => {
-    // The preceding stale-background case deliberately leaves an active goal.
-    await transitionGoalRunLifecycle(workspace, "cancel");
+    // The preceding case completes its own Goal before this independent fixture.
     const file = path.join(workspace, "legacy-proof.txt");
     await fs.writeFile(file, "migration fixture");
     const criterion = "Proof file exists";

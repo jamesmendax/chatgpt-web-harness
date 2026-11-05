@@ -52,13 +52,17 @@ const {
   getDurableTask,
   runWithActiveDurableTaskSessionRebind,
 } = await import("../dist/lib/durable-tasks.js");
-const { createRuntimeScope, runWithRuntimeScope } = await import("../dist/lib/runtime-scope.js");
+const { createRuntimeScope, runWithRuntimeScope, getRuntimeScope } = await import("../dist/lib/runtime-scope.js");
+const { runtimePrincipalId } = await import("../dist/lib/mcp-request-identity.js");
+const { createMcpServer } = await import("../dist/server-factory.js");
+const withAccount = (workspaceRoot, fn) => runWithRuntimeScope(createRuntimeScope({workspaceRoot, projectRoots:[workspaceRoot], principalId:runtimePrincipalId(workspaceRoot), tunnelProfile:process.env.CHATGPT_TUNNEL_PROFILE?.trim() || undefined}), fn);
 const { buildInstructionContext } = await import("../dist/lib/instruction-context.js");
 const { buildHarnessRuntimeContext, formatHarnessRuntimeContext } = await import("../dist/lib/context-broker.js");
+const { readHarnessEvents } = await import("../dist/lib/harness-events.js");
 
 function readTaskAsSession(workspaceRoot, sessionId, taskId) {
   return runWithRuntimeScope(
-    createRuntimeScope({ workspaceRoot, projectRoots: [workspaceRoot] }, { sessionId }),
+    createRuntimeScope({ workspaceRoot, projectRoots: [workspaceRoot], principalId:getRuntimeScope()?.principalId, tunnelProfile:getRuntimeScope()?.tunnelProfile }, { sessionId }),
     () => getDurableTask(workspaceRoot, taskId),
   );
 }
@@ -80,15 +84,8 @@ try {
 
   const instructions = await formatActiveGoalForInstructions(workspace);
   if (!instructions.includes("## ACTIVE GOAL") || !instructions.includes(created.objective)) throw new Error("active goal instructions missing");
-  if (!instructions.includes(GOAL_CONTINUATION_CONTRACT) || !instructions.includes("checkpoint, not a stop condition")) {
-    throw new Error("active goal instructions missing continuous-execution contract");
-  }
-  if (!instructions.includes(GOAL_VISIBLE_PROGRESS_HEARTBEAT) || !instructions.includes("user-visible assistant text")) {
-    throw new Error("active goal instructions missing visible-progress heartbeat contract");
-  }
-  if (!instructions.includes(GOAL_WATCHDOG_POLICY) || !instructions.includes("do not manually run watchdog scripts")) {
-    throw new Error("active goal instructions missing managed watchdog policy");
-  }
+  if (!instructions.includes(GOAL_CONTINUATION_CONTRACT) || !instructions.includes("unverified")) throw new Error("active Goal record lacks verification distinction");
+  if (!instructions.includes(GOAL_WATCHDOG_POLICY)) throw new Error("active Goal record lacks watchdog status");
 
   const context = await buildInstructionContext({ workspaceRoot: workspace, workspaceRoots: [workspace], pid: process.pid, adminPort: 0 });
   // Session scoping: the goal reaches windows through the HOT channel (broker
@@ -99,24 +96,14 @@ try {
   }
 
   const summary = (await import("../dist/lib/goals.js")).goalSummary(created);
-  if (summary.execution_mode !== "continuous" || summary.continuation_contract !== GOAL_CONTINUATION_CONTRACT) {
-    throw new Error("goal summary missing structured continuous-execution contract");
-  }
-  if (summary.execution_policy?.visible_heartbeat?.soft_after_ms !== 270000 ||
-      summary.execution_policy?.visible_heartbeat?.hard_before_ms !== 300000 ||
-      summary.execution_policy?.visible_heartbeat?.tool_activity_counts_as_heartbeat !== false ||
-      summary.execution_policy?.visible_heartbeat?.ends_execution !== false) {
-    throw new Error("goal summary missing structured visible-progress heartbeat policy");
-  }
+  if (summary.continuation_contract !== GOAL_CONTINUATION_CONTRACT || summary.execution_policy !== undefined) throw new Error("goal summary must report records without a mandatory execution policy");
   if (summary.watchdog_policy?.mode !== "goal_scoped" || summary.watchdog_policy?.lifecycle !== "managed_by_goal" || summary.watchdog_policy?.auto_resume_web !== false) {
     throw new Error("goal summary missing structured watchdog lifecycle policy");
   }
 
   const brokerContext = await buildHarnessRuntimeContext(workspace, workspace);
   const brokerText = formatHarnessRuntimeContext(brokerContext);
-  if (!brokerText.includes("GOAL CONTINUATION CONTRACT") || !brokerText.includes("checkpoint, not a stop condition")) {
-    throw new Error("Context Broker V2 missing continuous-execution contract");
-  }
+  if (!brokerText.includes(created.objective)) throw new Error("Context Broker omitted the active Goal");
 
   await pauseGoal(workspace, "Waiting for user");
   await resumeGoal(workspace, "Continue implementation");
@@ -201,80 +188,19 @@ try {
   const bumped = await updateGoal(wsCAS, { current_phase: "bump" }, { expectedRevision: casGoal.revision });
   if (bumped.revision !== casGoal.revision + 1) throw new Error("goal revision must increment on mutation");
 
-  let confirmBypassRejected = false;
-  try {
-    await updateGoal(wsCAS, { success_criteria: [{ name: "human sign-off", passed: true }] });
-  } catch (error) {
-    confirmBypassRejected = String(error).includes("requires explicit user confirmation");
-  }
-  if (!confirmBypassRejected) throw new Error("requires_confirmation criterion must reject self-asserted pass");
-
-  let untrustedRelayedTextRejected = false;
-  try {
-    await confirmGoalCriterion(wsCAS, { criterion: "human sign-off", detail: "user said ok in chat" });
-  } catch (error) {
-    untrustedRelayedTextRejected = String(error).includes("HOST_USER_TURN_REQUIRED");
-  }
-  if (!untrustedRelayedTextRejected) throw new Error("model-relayed user text was accepted as Host authorization");
-  // A genuine Host turn is not available in this local test. Use an ephemeral
-  // test-only signature to preserve a positive legacy contract fixture.
-  const { generateKeyPairSync, randomUUID, sign } = await import("node:crypto");
-  const { runWithVerifiedHostUserTurn } = await import("../dist/lib/host-user-confirmation.js");
-  const testKeys = generateKeyPairSync("ed25519");
-  const hostTestSession = "goal-mode-test-only-host-owner";
-  const t = Date.now();
-  const signedFixture = Buffer.from(JSON.stringify({
-    version: 1, audience: "web-harness-goal-user-confirmation-v1",
-    issuer: "operator-trusted-host-v1",
-    goal_id: bumped.id, goal_revision: bumped.revision,
-    session_id: hostTestSession, criterion: "human sign-off",
-    source_turn_ref: "goal-mode-only-fake-host-turn-0001",
-    nonce: randomUUID().replace(/-/g, ""),
-    issued_at_ms: t - 1000, expires_at_ms: t + 60000,
-  }));
-  const fixtureReceipt = {
-    body_base64url: signedFixture.toString("base64url"),
-    signature_base64url: sign(null, signedFixture, testKeys.privateKey).toString("base64url"),
-  };
-  const savedTrustAnchor = process.env.HARNESS_HOST_USER_TURN_PUBLIC_KEY_SPKI;
-  let confirmed;
-  try {
-    process.env.HARNESS_HOST_USER_TURN_PUBLIC_KEY_SPKI =
-      testKeys.publicKey.export({ type: "spki", format: "der" }).toString("base64url");
-    confirmed = await runWithRuntimeScope(
-      createRuntimeScope({ workspaceRoot: wsCAS, projectRoots: [wsCAS] }, { sessionId: hostTestSession }),
-      () => runWithVerifiedHostUserTurn(fixtureReceipt, () =>
-        confirmGoalCriterion(wsCAS, { criterion: "human sign-off", detail: "isolated signature fixture only" })),
-    );
-  } finally {
-    if (savedTrustAnchor === undefined) delete process.env.HARNESS_HOST_USER_TURN_PUBLIC_KEY_SPKI;
-    else process.env.HARNESS_HOST_USER_TURN_PUBLIC_KEY_SPKI = savedTrustAnchor;
-  }
-  if (!confirmed.success_criteria.find((c) => c.name === "human sign-off")?.passed) {
-    throw new Error("confirm must pass the criterion");
-  }
-
-  await updateGoal(wsCAS, { success_criteria: [{ name: "free criterion", passed: true }] });
-  const casDone = await completeGoal(wsCAS);
-  if (casDone.status !== "completed") throw new Error("CAS goal did not complete");
-
-  const { readHarnessEvents } = await import("../dist/lib/harness-events.js");
-  const casEvidence = await readHarnessEvents(wsCAS, { type: "evidence/recorded", limit: 10 });
-  if (!casEvidence.some((event) => event.evidence_kind === "user_confirmed" &&
-      event.data?.criterion === "human sign-off" &&
-      event.data?.source_verification === "operator_pinned_signature_v1")) {
-    throw new Error("user_confirmed evidence event missing");
-  }
+  // CAS did not change either criterion or manufacture confirmation evidence.
+  const afterCas = await getGoal(wsCAS);
+  if (afterCas.success_criteria.some((criterion) => criterion.passed)) throw new Error("CAS update changed verification");
 
   // --- Goal tool entry: bind action and cancellation CAS ---
   const wsTool = path.join(tmpRoot, "ws-tool");
   await fs.mkdir(wsTool, { recursive: true });
+  await withAccount(wsTool, async () => {
   const toolGoal = await createGoal(wsTool, {
     objective: "Exercise Goal Mode tool entry",
     success_criteria: [{ name: "tool entry exercised", passed: false }],
   });
   process.env.GOAL_WATCHDOG_ENABLED = "false";
-  const { createMcpServer } = await import("../dist/server-factory.js");
   const server = createMcpServer(wsTool, 30_000, [wsTool], true);
   const client = new Client({ name: "goal-mode-test", version: "1" });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
@@ -329,9 +255,12 @@ try {
     await server.close().catch(() => {});
   }
 
+  });
+
   // --- Goal bind must migrate the session-scoped durable task too ---
   const wsBindTask = path.join(tmpRoot, "ws-bind-task");
   await fs.mkdir(wsBindTask, { recursive: true });
+  await withAccount(wsBindTask, async () => {
   const bindServer = createMcpServer(wsBindTask, 30_000, [wsBindTask], true);
   const bindClient = new Client({ name: "goal-task-bind-test", version: "1" });
   const [bindClientTransport, bindServerTransport] = InMemoryTransport.createLinkedPair();
@@ -398,7 +327,7 @@ try {
     const foreignStatus = await bindClient.callTool({ name: "goal", arguments: { action: "status" } });
     const takeoverCandidate = foreignStatus.structuredContent?.data?.takeover_candidate;
     if (
-      foreignStatus.structuredContent?.data?.takeover_confirmation_required !== true ||
+      foreignStatus.structuredContent?.data?.target_selection_required !== true ||
       takeoverCandidate?.goal_id !== createdGoal.id ||
       takeoverCandidate?.revision !== legacyBeforeBind.revision
     ) {
@@ -412,10 +341,10 @@ try {
     const firstBindData = firstBind.structuredContent?.data;
     if (
       firstBind.structuredContent?.ok !== false ||
-      firstBindData?.error !== "GOAL_TAKEOVER_CONFIRMATION_REQUIRED" ||
-      typeof firstBindData?.takeover_token !== "string"
+      firstBindData?.error !== "GOAL_BIND_TARGET_REQUIRED" ||
+      firstBindData?.takeover_candidate?.goal_id !== createdGoal.id
     ) {
-      throw new Error("first cross-window bind must return a confirmation token without migrating ownership");
+      throw new Error("cross-window bind must select the exact Goal before migration");
     }
 
     const reboundResult = await bindClient.callTool({
@@ -423,7 +352,7 @@ try {
       arguments: {
         action: "bind",
         expected_revision: legacyBeforeBind.revision,
-        takeover_token: firstBindData.takeover_token,
+        goal_id: createdGoal.id,
       },
     });
     const rebound = reboundResult.structuredContent?.data?.goal;
@@ -492,6 +421,8 @@ try {
   // The durable-task lock must span preflight -> Goal owner mutation -> task
   // migration. Otherwise a destination-session task mutation can interleave
   // after preflight and make migration fail after Goal ownership already moved.
+  });
+
   const wsBindAtomic = path.join(tmpRoot, "ws-bind-atomic");
   await fs.mkdir(wsBindAtomic, { recursive: true });
   const atomicOldSession = "goal-task-atomic-old";
@@ -551,6 +482,7 @@ try {
   // conflict is rejected before Goal ownership changes.
   const wsBindConflict = path.join(tmpRoot, "ws-bind-conflict");
   await fs.mkdir(wsBindConflict, { recursive: true });
+  await withAccount(wsBindConflict, async () => {
   const conflictServer = createMcpServer(wsBindConflict, 30_000, [wsBindConflict], true);
   const conflictClient = new Client({ name: "goal-task-bind-conflict-test", version: "1" });
   const [conflictClientTransport, conflictServerTransport] = InMemoryTransport.createLinkedPair();
@@ -588,20 +520,19 @@ try {
       name: "goal",
       arguments: { action: "bind", expected_revision: conflictGoal.revision },
     });
-    const conflictToken = conflictFirstBind.structuredContent?.data?.takeover_token;
     if (
       conflictFirstBind.structuredContent?.ok !== false ||
-      conflictFirstBind.structuredContent?.data?.error !== "GOAL_TAKEOVER_CONFIRMATION_REQUIRED" ||
-      typeof conflictToken !== "string"
+      conflictFirstBind.structuredContent?.data?.error !== "GOAL_BIND_TARGET_REQUIRED" ||
+      conflictFirstBind.structuredContent?.data?.takeover_candidate?.goal_id !== conflictGoal.id
     ) {
-      throw new Error("conflict bind must still issue a takeover token before migration preflight");
+      throw new Error("conflict bind must require explicit target selection");
     }
     const rejectedBind = await conflictClient.callTool({
       name: "goal",
       arguments: {
         action: "bind",
         expected_revision: conflictGoal.revision,
-        takeover_token: conflictToken,
+        goal_id: conflictGoal.id,
       },
     });
     if (rejectedBind.structuredContent?.ok !== false || !JSON.stringify(rejectedBind).includes("GOAL_BIND_TASK_CONFLICT")) {
@@ -621,6 +552,8 @@ try {
     await conflictClient.close().catch(() => {});
     await conflictServer.close().catch(() => {});
   }
+
+  });
 
   // --- Supersede: a different new task must get a CLEAN goal, never append ---
   const wsSuper = path.join(tmpRoot, "ws-supersede");
@@ -651,15 +584,9 @@ try {
     throw new Error("supersede must cancel the old goal via event");
   }
   const policy = (await import("../dist/lib/goals.js")).goalSummary(newGoal).execution_policy;
-  if (policy.progress_messages !== "checkpoint_and_visible_heartbeat" ||
-      policy.user_reply !== "visible_heartbeat_then_continue_until_DELIVERABLE_READY_or_verified_blocker" ||
-      policy.visible_heartbeat?.counts_as_heartbeat !== "user_visible_assistant_text_only" ||
-      policy.visible_heartbeat?.tool_activity_counts_as_heartbeat !== false ||
-      policy.visible_heartbeat?.ends_execution !== false) {
-    throw new Error("goal summary missing execution_policy");
-  }
+  if (policy !== undefined) throw new Error("goal summary must not impose an execution policy");
 
-  console.log("goal-mode: persistence, session instructions, pause/resume, criteria gate, explicit completion, revision CAS, user confirmation, and supersede OK");
+  console.log("goal-mode: persistence, session instructions, pause/resume, independent Task records, revision CAS, session binding and supersede OK");
 } finally {
   await fs.rm(tmpRoot, { recursive: true, force: true });
 }

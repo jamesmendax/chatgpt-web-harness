@@ -15,7 +15,6 @@ import {
   getAllowedRoots,
 } from "./lib/path-security.js";
 import {
-  consumeSessionTransportError,
   createSessionManager,
   extractRequestId,
   isInitializeRequest,
@@ -28,6 +27,7 @@ import {
   logMcpRequest,
 } from "./lib/activity-log.js";
 import { consumeMcpOutcome } from "./lib/mcp-outcome.js";
+import { getMcpRequestIdentity, runWithMcpRequestIdentity, runtimePrincipalId } from "./lib/mcp-request-identity.js";
 import {
   buildInstructionContext,
   summarizeInstructionContext,
@@ -49,14 +49,8 @@ import {
   isServerDiscoverRequest,
 } from "./lib/mcp-modern-compat.js";
 
-// RI v1 fences only a deliberately isolated MCP server. The normal product
-// entrypoint also exposes Admin HTTP and background effects whose
-// reachable sinks are not closed. Refuse partial-mode deployment rather than
-// advertising a misleading system-wide recovery guarantee.
-const requestedRecoveryMode = process.env.HARNESS_RECOVERY_SCOPE_MODE?.trim();
-if (requestedRecoveryMode && requestedRecoveryMode !== "off") {
-  throw new Error("RI_PARTIAL_PROFILE_NOT_SHARED: the Recovery Integrity scoped-write preview is isolated-MCP-only; Admin, Companion and background effects require a separate coverage closure before enabling the full runtime");
-}
+// Legacy approval configuration is inert in 3.2. Authentication and actual
+// resource validation remain enforced by their owning layers.
 
 function intEnv(name: string, fallback: number, min: number, max: number): number {
   const parsed = Number.parseInt(process.env[name] || "", 10);
@@ -198,6 +192,10 @@ app.use(express.json({ limit: MCP_JSON_LIMIT }));
 const MCP_PATHS = MCP_TOKEN ? [`/${MCP_TOKEN}`, `/mcp/${MCP_TOKEN}`] : ["/", "/mcp"];
 const MCP_PATHS_SET = new Set(MCP_PATHS);
 
+app.use((req, _res, next) => {
+  runWithMcpRequestIdentity(req.headers, req.headers["mcp-session-id"] as string | undefined, next, req.body);
+});
+
 app.use((req, res, next) => {
   const started = Date.now();
   const isMcpRoute = MCP_PATHS_SET.has(req.path);
@@ -208,6 +206,9 @@ app.use((req, res, next) => {
     ? rpc.params.name
     : undefined;
   const conversationId = tool ? activityConversationId(req.body, req.headers) : undefined;
+  const requestIdentity = getMcpRequestIdentity();
+  const originalBody = req.body;
+  const originalSessionId = req.headers["mcp-session-id"] as string | undefined;
   // InvocationGateway owns admitted-call start/heartbeat/end telemetry.
   res.on("finish", () => {
     const duration = Date.now() - started;
@@ -216,10 +217,17 @@ app.use((req, res, next) => {
 
     if (req.method === "POST" && isMcpRoute) {
       const transportError =
-        consumeSessionTransportError(sessionId) ||
         (typeof res.locals.mcpError === "string" ? res.locals.mcpError : undefined);
-      const outcome = consumeMcpOutcome(extractRequestId(req.body) ?? undefined, tool);
-      logMcpRequest(req.body, sessionId, duration, res.statusCode, transportError, outcome, conversationId);
+      const outcome = consumeMcpOutcome(extractRequestId(originalBody) ?? undefined, tool, requestIdentity?.requestInstanceId);
+      logMcpRequest(originalBody, sessionId, duration, res.statusCode, transportError, outcome, conversationId, {
+        request_instance_id: requestIdentity?.requestInstanceId,
+        account_id: runtimePrincipalId(workspaceRoot),
+        runtime_instance_id: requestIdentity?.runtimeInstanceId,
+        original_headers: requestIdentity?.originalHeaders,
+        original_transport_session_id: originalSessionId,
+        conversation_source: requestIdentity?.source,
+        conversation_continuity: requestIdentity?.continuity,
+      });
       return;
     }
 

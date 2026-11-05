@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Web Harness Relay Companion</title>
+  <style>
+    body { font-family: system-ui, sans-serif; width: 390px; margin: 0; padding: 14px; color: #111; background: #fff; }
+    h1 { font-size: 16px; margin: 0 0 12px; }
+    h2 { font-size: 13px; margin: 14px 0 6px; }
+    label { display: block; font-size: 12px; margin-top: 10px; }
+    input, select, button { box-sizing: border-box; width: 100%; margin-top: 4px; padding: 8px; }
+    button { cursor: pointer; }
+    .row { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+    .worker { border: 1px solid #ddd; border-radius: 8px; padding: 9px; margin-top: 7px; }
+    .worker-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 12px; font-weight: 650; }
+    .worker-meta { margin-top: 5px; font-size: 11px; line-height: 1.45; word-break: break-all; color: #444; }
+    .worker-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-top: 6px; }
+    .worker-actions button { padding: 6px; font-size: 11px; }
+    .status { margin-top: 10px; font-size: 12px; white-space: pre-wrap; word-break: break-word; }
+    .hint { font-size: 11px; color: #555; margin-top: 8px; }
+    .badge { font-size: 10px; font-weight: 600; }
+  </style>
+</head>
+<body>
+  <h1>Web Harness Worker Companion</h1>
+  <label>本地 Companion API
+    <input id="baseUrl" value="http://127.0.0.1:3001/companion/v1" spellcheck="false">
+  </label>
+  <label>Companion Token
+    <input id="token" type="password" autocomplete="off" spellcheck="false">
+  </label>
+  <label>Goal ID
+    <input id="goalId" placeholder="粘贴本次要连接的 Goal ID" spellcheck="false">
+  </label>
+  <div class="row">
+    <button id="saveConfig">保存配置</button>
+    <button id="test">刷新状态</button>
+  </div>
+
+  <h2>自动 Worker</h2>
+  <div class="worker" data-lane="A">
+    <div class="worker-head"><span>Lane A · <span id="workerA">—</span></span><span id="stateA" class="badge">—</span></div>
+    <div id="urlA" class="worker-meta">未创建</div>
+    <div class="worker-actions"><button id="openA">打开 A</button><button id="replaceA">替换 A</button></div>
+  </div>
+  <div class="worker" data-lane="B">
+    <div class="worker-head"><span>Lane B · <span id="workerB">—</span></span><span id="stateB" class="badge">—</span></div>
+    <div id="urlB" class="worker-meta">未创建</div>
+    <div class="worker-actions"><button id="openB">打开 B</button><button id="replaceB">替换 B</button></div>
+  </div>
+
+  <h2>手动兼容绑定</h2>
+  <label>当前 Chat 标签页作为
+    <select id="lane">
+      <option value="">未绑定</option>
+      <option value="A">Chat A</option>
+      <option value="B">Chat B</option>
+    </select>
+  </label>
+  <div class="row">
+    <button id="save">保存并绑定</button>
+    <button id="unbind">解除当前绑定</button>
+  </div>
+
+  <div id="status" class="status"></div>
+  <div class="hint">正常模式下无需手工创建或绑定 Chat。A/B 是稳定逻辑 Lane，具体 Chat 会以 Worker generation 自动换代；手动绑定/替换仅作为兼容与故障操作入口。</div>
+  <script src="popup.js"></script>
+</body>
+</html>

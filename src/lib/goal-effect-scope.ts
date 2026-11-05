@@ -385,25 +385,8 @@ export async function claimManagedProcessEffect(launch: ManagedProcessEffectLaun
 /** Caller holds the existing cross-process Goal definition fence. Recovery of a
  * journaled transition requires exact transaction identity; pre-journal recovery
  * additionally requires a fresh unchanged Goal snapshot and absent journal. */
-export async function enterGoalReplacement(workspace: string, goal: string, owner: string | undefined,
-  options: { transaction?: string; revision?: number; preJournalUnchanged?: boolean } = {}): Promise<() => Promise<void>> {
-  const dir = await location(workspace, goal);
-  let item = record("transition", goal, owner, options.transaction ?? null, options.revision ?? null);
-  await locked(dir, async () => {
-    await reconcileManagedRecordsLocked(dir, goal);
-    const all = await readRecords(dir, goal);
-    if (all.some(r => r.kind === "effect")) throw new Error("GOAL_CREATION_EFFECT_BUSY: the previous Goal has an unresolved effect.");
-    const old = all.find(r => r.kind === "transition");
-    if (old) {
-      const matchingJournal = options.transaction && old.transaction === options.transaction && old.owner === (owner ?? null);
-      const unchangedPreJournal = options.preJournalUnchanged && old.transaction !== null && old.owner === (owner ?? null) &&
-        old.revision !== null && old.revision === options.revision;
-      if (!matchingJournal && !unchangedPreJournal) throw new Error("GOAL_CREATION_PENDING: Goal replacement requires reconciliation.");
-      if (matchingJournal) { item = old; return; }
-      await remove(dir, old);
-    }
-    await publish(dir, item);
-  });
-  let released = false;
-  return async () => { if (!released) { await locked(dir, () => remove(dir, item)); released = true; } };
+export async function enterGoalReplacement(_workspace: string, _goal: string, _owner: string | undefined,
+  _options: { transaction?: string; revision?: number; preJournalUnchanged?: boolean } = {}): Promise<() => Promise<void>> {
+  // Preserve effect receipts for inspection; definition locking is independent.
+  return async () => {};
 }

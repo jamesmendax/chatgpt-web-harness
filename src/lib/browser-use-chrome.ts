@@ -81,6 +81,36 @@ function snapshotSync(filter: { pid?: number; parentPid?: number }): NativeSnaps
   try { return parseSnapshot(result.stdout); } catch { return undefined; }
 }
 
+/** CIM can retain an exited process object while another handle is open.
+ * Confirm termination on a native handle only when it still names the same
+ * creation identity. Failure or access denial remains unknown. */
+export async function ownedChromeDefinitelyExited(identity: ChromeNativeProcess): Promise<boolean> {
+  if (process.platform !== "win32" || !positivePid(identity.pid) ||
+      !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}0Z$/.test(identity.created_at)) return false;
+  const script = [
+    "$ErrorActionPreference='Stop'",
+    "[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false)",
+    "Add-Type -TypeDefinition @'\nusing System;\nusing System.Runtime.InteropServices;\npublic static class OwnedChromeExitProbe {\n [DllImport(\"kernel32.dll\", SetLastError=true)] public static extern IntPtr OpenProcess(uint access, bool inherit, uint pid);\n [DllImport(\"kernel32.dll\", SetLastError=true)] public static extern bool GetProcessTimes(IntPtr process, out long creation, out long exit, out long kernel, out long user);\n [DllImport(\"kernel32.dll\", SetLastError=true)] public static extern bool GetExitCodeProcess(IntPtr process, out uint code);\n [DllImport(\"kernel32.dll\")] public static extern bool CloseHandle(IntPtr process);\n}\n'@",
+    `$h=[OwnedChromeExitProbe]::OpenProcess(0x1000,$false,${identity.pid})`,
+    "if($h -eq [IntPtr]::Zero){[Console]::Out.Write('unknown');exit 0}",
+    "try { $c=[long]0;$e=[long]0;$k=[long]0;$u=[long]0;$code=[uint32]0",
+    "if(-not [OwnedChromeExitProbe]::GetProcessTimes($h,[ref]$c,[ref]$e,[ref]$k,[ref]$u)){[Console]::Out.Write('unknown');exit 0}",
+    "if(-not [OwnedChromeExitProbe]::GetExitCodeProcess($h,[ref]$code)){[Console]::Out.Write('unknown');exit 0}",
+    // Win32_Process.CreationDate retains microseconds; native FILETIME adds
+    // one 100ns digit. Compare precisely the WMI-representable six digits.
+    `$expected='${identity.created_at.slice(0, 26)}'`,
+    "$actual=[DateTime]::FromFileTimeUtc($c).ToString('o').Substring(0,26)",
+    "if($actual -eq $expected -and $code -ne 259){[Console]::Out.Write('exited')}else{[Console]::Out.Write('unknown')}",
+    "} finally { [OwnedChromeExitProbe]::CloseHandle($h)|Out-Null }",
+  ].join("\n");
+  try {
+    const result = await execFileAsync(powershell(),
+      ["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", Buffer.from(script, "utf16le").toString("base64")],
+      { windowsHide: true, timeout: 5000, maxBuffer: 64 * 1024, encoding: "utf8" });
+    return result.stdout.trim() === "exited";
+  } catch { return false; }
+}
+
 /** The launcher ChildProcess is diagnostic state, not necessarily the live
  * browser: Windows Chrome can exit 0 after starting an owned replacement root.
  * Adoption is restricted to its direct child, exact exe/profile/port and launch
@@ -93,6 +123,7 @@ export class OwnedChromeProcess {
     private readonly track: (pid: number, confirm: () => number | undefined) => void,
     private readonly untrack: (pid: number) => void,
     private readonly kill: (pid: number) => void,
+    private readonly definitelyExited: (identity: ChromeNativeProcess) => Promise<boolean> = ownedChromeDefinitelyExited,
   ) {
     this.track(launch.launcher_pid, () => {
       if (launcher.exitCode === null && launcher.signalCode === null) return launch.launcher_pid;
@@ -145,9 +176,15 @@ export class OwnedChromeProcess {
     const deadline = Date.now() + 10_000;
     while (await this.refresh()) {
       const identity = this.pid + ":" + (this.identity?.created_at ?? "launcher");
+      if (this.identity && killed.has(identity) && await this.definitelyExited(this.identity)) break;
       if (!killed.has(identity)) { this.kill(this.pid); killed.add(identity); }
       if (Date.now() >= deadline) {
-        if (await this.refresh()) throw new Error("BROWSER_CHROME_CLOSE_INCOMPLETE: owned browser has not exited");
+        if (await this.refresh()) {
+          const current = this.identity && (this.pid + ":" + this.identity.created_at);
+          if (!current || !killed.has(current) || !(await this.definitelyExited(this.identity!))) {
+            throw new Error("BROWSER_CHROME_CLOSE_INCOMPLETE: owned browser has not exited");
+          }
+        }
         break;
       }
       await new Promise(resolve => setTimeout(resolve, 100));

@@ -123,11 +123,10 @@ function syncGoalWatchdog(workspaceRoot: string, status: string) {
 }
 
 function executionContract(envelope?: GoalRunEnvelope | null): string {
-  return envelope
-    ? renderGoalRunPolicyText(envelope.run, { maxBytes: 1200, maxPolicyBytes: 400 })
-    : GOAL_CONTINUATION_CONTRACT;
+  return GOAL_CONTINUATION_CONTRACT;
 }
 const criterionSchema = z.object({
+  id: z.string().min(1).max(128).optional().describe("For update, the stable criterion ID returned by status; use it to rename an existing unconfirmed criterion."),
   name: z.string().min(1).max(300),
   passed: z.boolean().optional().default(false),
   detail: z.string().max(2000).optional(),
@@ -137,7 +136,7 @@ const criterionSchema = z.object({
     target: z.string().min(1).max(2000).describe("Absolute test working directory, or visual/file target"),
     command: z.string().min(1).max(2000).optional().describe("Exact verification command for command checks"),
     files: z.array(z.string().min(1).max(2000)).min(1).max(128).optional().describe("Source/test files verified by the command; edits invalidate its evidence"),
-  }).optional().describe("Required before machine confirmation. file_exists proves existence only; command verifies tests; visual verifies appearance."),
+  }).optional().describe("Optional verification details; file existence does not prove content or appearance."),
 });
 
 export function registerGoalTool(server: McpServer, workspaceRoot: string): void {
@@ -150,7 +149,7 @@ export function registerGoalTool(server: McpServer, workspaceRoot: string): void
       inputSchema: {
         action: actionSchema,
         objective: z.string().min(1).max(4000).optional(),
-        success_criteria: z.array(criterionSchema).min(1).max(40).optional(),
+        success_criteria: z.array(z.union([criterionSchema, z.string().min(1).max(300).transform(name => ({ name, passed: false }))])).min(1).max(40).optional(),
         constraints: z.array(z.string().min(1).max(1000)).max(24).optional(),
         current_phase: z.string().max(2000).optional(),
         pause_kind: z.enum(["manual", "no_progress"]).optional(),
@@ -161,13 +160,14 @@ export function registerGoalTool(server: McpServer, workspaceRoot: string): void
         supersede: z.boolean().optional().describe("Compatibility flag for session-less clients; same-session create automatically replaces the prior Goal."),
         takeover_token: z.string().min(16).max(128).optional(),
         target_session_id: z.string().min(1).max(512).optional(),
+        goal_id: z.string().min(1).max(128).optional().describe("For cross-session bind, select the exact Goal ID returned by status."),
         handoff_id: z.string().min(8).max(128).optional(),
         evidence_offset: z.number().int().nonnegative().optional().default(0),
         evidence_limit: z.number().int().min(1).max(MAX_GOAL_EVIDENCE_PAGE_SIZE).optional().default(DEFAULT_GOAL_EVIDENCE_PAGE_SIZE),
       },
       annotations: toolAnnotations("edit"),
     },
-    async ({ action, objective, success_criteria, constraints, current_phase, pause_kind, expected_revision, criterion, evidence_ids, detail, supersede, takeover_token, target_session_id, handoff_id, evidence_offset, evidence_limit }) => {
+    async ({ action, objective, success_criteria, constraints, current_phase, pause_kind, expected_revision, criterion, evidence_ids, detail, supersede, takeover_token, target_session_id, goal_id, handoff_id, evidence_offset, evidence_limit }) => {
       if (handoff_id) throw new Error("RELAY_RETIRED: automatic Companion/Worker handoff identifiers are no longer accepted.");
       const executeAction = async () => {
       const mutationOptions = expected_revision === undefined ? undefined : { expectedRevision: expected_revision };
@@ -277,8 +277,8 @@ export function registerGoalTool(server: McpServer, workspaceRoot: string): void
         }
         if (action === "create") {
           if (!objective?.trim()) throw new Error("goal action=create requires objective");
-          if (!success_criteria?.length) throw new Error("goal action=create requires at least one success criterion");
-          const prePassed = success_criteria.find((candidate) => candidate.passed === true);
+          const criteria = success_criteria?.length ? success_criteria : [{ name: objective.trim(), passed: false }];
+          const prePassed = criteria.find((candidate) => candidate.passed === true);
           if (prePassed) {
             throw new Error(
               `goal action=create cannot pre-pass criterion "${prePassed.name}"; criteria require typed evidence after the goal starts`
@@ -286,7 +286,7 @@ export function registerGoalTool(server: McpServer, workspaceRoot: string): void
           }
           const goal = await createGoal(workspaceRoot, {
             objective,
-            success_criteria,
+            success_criteria: criteria,
             constraints,
             current_phase,
             supersede,
@@ -309,9 +309,8 @@ export function registerGoalTool(server: McpServer, workspaceRoot: string): void
               watchdog_policy: GOAL_WATCHDOG_POLICY,
               goal_run: view(envelope),
               execution_contract: executionContract(envelope),
-              continue_execution: true,
             },
-            { summary: `goal active: ${goal.id} — continue execution` }
+            { summary: `goal active: ${goal.id}` }
           );
           });
         }
@@ -375,13 +374,13 @@ export function registerGoalTool(server: McpServer, workspaceRoot: string): void
                   goal_run: null,
                   summary: null,
                   takeover_candidate: takeoverCandidate,
-                  takeover_confirmation_required: true,
+                  target_selection_required: true,
                   watchdog: goalWatchdogStatus(workspaceRoot, sessionId),
                   watchdog_unchanged: true,
                   watchdog_policy: GOAL_WATCHDOG_POLICY,
                   relay,
                 },
-                { summary: "another ChatGPT window owns an active goal; explicit confirmation is required to take it over" }
+                { summary: "another ChatGPT window owns an active goal; select its exact ID to bind" }
               );
             }
           }
@@ -441,10 +440,10 @@ export function registerGoalTool(server: McpServer, workspaceRoot: string): void
               watchdog,
               watchdog_policy: GOAL_WATCHDOG_POLICY,
               ...(needsWork
-                ? { continue_execution: true, execution_contract: executionContract(envelope) }
+                ? { has_unverified_criteria: true, execution_contract: executionContract(envelope) }
                 : {}),
             },
-            { summary: needsWork ? `goal updated: ${goal.id} — continue execution` : `goal updated: ${goal.id}` }
+            { summary: `goal updated: ${goal.id}` }
           );
         }
 
@@ -470,10 +469,10 @@ export function registerGoalTool(server: McpServer, workspaceRoot: string): void
               watchdog,
               watchdog_policy: GOAL_WATCHDOG_POLICY,
               ...(needsWork
-                ? { continue_execution: true, execution_contract: executionContract(envelope) }
+                ? { has_unverified_criteria: true, execution_contract: executionContract(envelope) }
                 : {}),
             },
-            { summary: needsWork ? `criterion confirmed: ${criterion} — continue execution` : `criterion confirmed: ${criterion}` }
+            { summary: `criterion confirmed: ${criterion}` }
           );
         }
 
@@ -659,9 +658,9 @@ export function registerGoalTool(server: McpServer, workspaceRoot: string): void
                 relay_intent_json: inheritedContract.canonical_requirement_json,
                 watchdog,
                 watchdog_policy: GOAL_WATCHDOG_POLICY,
-                ...(needsWork ? { continue_execution: true, execution_contract: executionContract(envelope) } : {}),
+                ...(needsWork ? { has_unverified_criteria: true, execution_contract: executionContract(envelope) } : {}),
               },
-              { summary: needsWork ? `goal recovered on ${workerId}: ${goal.id} — continue execution` : `goal recovered on ${workerId}: ${goal.id}` }
+              { summary: `goal recovered on ${workerId}: ${goal.id}` }
             );
           }
 
@@ -718,6 +717,11 @@ export function registerGoalTool(server: McpServer, workspaceRoot: string): void
           }
           let ordinaryTakeoverAuthorized = false;
           if (takeoverCandidate) {
+            if (!goal_id || goal_id !== takeoverCandidate.goal_id) {
+              return toolResult("goal", {
+                action, error: "GOAL_BIND_TARGET_REQUIRED", takeover_candidate: takeoverCandidate,
+              }, { ok: false, summary: "select the exact Goal ID before binding" });
+            }
             if (expected_revision !== takeoverCandidate.revision) {
               return toolResult(
                 "goal",
@@ -730,31 +734,7 @@ export function registerGoalTool(server: McpServer, workspaceRoot: string): void
                 { ok: false, summary: "cross-window goal takeover requires the current goal revision" }
               );
             }
-            const expectedToken = goalTakeoverToken(workspaceRoot, takeoverCandidate, targetSession);
-            if (takeover_token === undefined) {
-              return toolResult(
-                "goal",
-                {
-                  action,
-                  error: "GOAL_TAKEOVER_CONFIRMATION_REQUIRED",
-                  takeover_candidate: takeoverCandidate,
-                  takeover_token: expectedToken,
-                  expected_revision: takeoverCandidate.revision,
-                },
-                { ok: false, summary: "cross-window goal takeover requires explicit confirmation" }
-              );
-            }
-            if (takeover_token !== expectedToken) {
-              return toolResult(
-                "goal",
-                {
-                  action,
-                  error: "GOAL_TAKEOVER_TOKEN_MISMATCH",
-                  takeover_candidate: takeoverCandidate,
-                },
-                { ok: false, summary: "cross-window goal takeover token did not match the current goal" }
-              );
-            }
+            // Legacy takeover_token is accepted but carries no authority.
             ordinaryTakeoverAuthorized = true;
           }
 
@@ -1012,10 +992,10 @@ export function registerGoalTool(server: McpServer, workspaceRoot: string): void
               watchdog,
               watchdog_policy: GOAL_WATCHDOG_POLICY,
               ...(needsWork
-                ? { continue_execution: true, execution_contract: executionContract(envelope) }
+                ? { has_unverified_criteria: true, execution_contract: executionContract(envelope) }
                 : {}),
             },
-            { summary: needsWork ? `goal bound: ${goal.id} — continue execution` : `goal bound: ${goal.id}` }
+            { summary: `goal bound: ${goal.id}` }
           );
         }
 
@@ -1048,23 +1028,23 @@ export function registerGoalTool(server: McpServer, workspaceRoot: string): void
               watchdog,
               watchdog_policy: GOAL_WATCHDOG_POLICY,
               execution_contract: executionContract(envelope),
-              continue_execution: true,
             },
-            { summary: `goal active: ${goal.id} — continue execution` }
+            { summary: `goal active: ${goal.id}` }
           );
         }
 
         if (action === "complete") {
           const completed = await transitionGoalRunLifecycle(workspaceRoot, "complete", {
             expectedRevision: expected_revision,
+            declaration: detail,
           });
           const goal = completed.goal;
           const driverLease = await releaseDriverLease(workspaceRoot, goal.id);
           const watchdog = syncGoalWatchdog(workspaceRoot, goal.status);
           return toolResult(
             "goal",
-            { action, goal, goal_run: view(completed.envelope), goal_complete: true, driver_lease: driverLease, grounding: GOAL_GROUNDING_NOTE, summary: goalSummary(goal), watchdog, watchdog_policy: GOAL_WATCHDOG_POLICY },
-            { summary: `GOAL_COMPLETE ${goal.id}` }
+            { action, goal, goal_run: view(completed.envelope), goal_complete: true, completion_basis: completed.envelope.run.completionBasis, unverified_criteria: completed.envelope.run.criteria.filter(item => completed.envelope.run.completionBasis?.unverifiedCriterionIds.includes(item.id)), driver_lease: driverLease, grounding: GOAL_GROUNDING_NOTE, summary: goalSummary(goal), watchdog, watchdog_policy: GOAL_WATCHDOG_POLICY },
+            { summary: `Goal ${goal.id} declared complete by model` }
           );
         }
 

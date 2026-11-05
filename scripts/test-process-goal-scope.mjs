@@ -19,7 +19,6 @@ const {
   upsertProcessJournalRecord, listProcessJournalRecords, getProcessJournalRecord,
 } = await import("../dist/lib/process-journal.js");
 const { createRuntimeScope, runWithRuntimeScope } = await import("../dist/lib/runtime-scope.js");
-const { enterGoalEffect } = await import("../dist/lib/goal-effect-scope.js");
 const { withRelayGoal } = await import("../dist/lib/relay-scope.js");
 const { registerShellTools } = await import("../dist/tools/shell.js");
 const { bootstrapShellSession } = await import("../dist/lib/persistent-shell.js");
@@ -165,23 +164,14 @@ try {
     'setTimeout(() => process.exit(0), 300000);',
   ].join("\n"));
   const mutableInvocation = scopeA();
-  // This fixture intentionally bypasses the gateway. Supply its real submission
-  // fence before invoking the callback, without changing the capture-before-await assertion.
-  const submission = await enterGoalEffect(sandbox, mutableInvocation.goalId, mutableInvocation.goalOwnerSessionId);
-  mutableInvocation.goalEffectLease = submission;
+  // An obsolete admission callback must not block the process, and ownership
+  // must still be captured synchronously before the first asynchronous step.
+  mutableInvocation.beforeDispatch = async () => { throw new Error("retired effect gate called"); };
   const startPending = invoke("start_process", { command: commandFor(childPath), working_directory: sandbox }, mutableInvocation);
   mutableInvocation.goalId = "goal-process-b";
   mutableInvocation.goalOwnerSessionId = "owner-b";
-  let startedA;
-  try {
-    startedA = await startPending;
-    owned.push({ id: startedA.id, scope: scopeA() });
-    assert.equal(submission.managedProcessConfirmed(), true);
-    await submission("settled");
-  } catch (error) {
-    await submission("uncertain");
-    throw error;
-  }
+  const startedA = await startPending;
+  owned.push({ id: startedA.id, scope: scopeA() });
   assert.equal(startedA.goal_id, "goal-process-a", "start captures scope before first await");
   assert.equal(startedA.owner_session_id, "owner-a");
   assert.equal((await getProcessJournalRecord(sandbox, startedA.id)).goal_id, "goal-process-a");

@@ -1,17 +1,14 @@
 import fs from "fs/promises";
-import os from "os";
 import path from "path";
-import { execFile } from "child_process";
-import { promisify } from "util";
 import { pathToFileURL } from "url";
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { validatePath } from "../lib/path-security.js";
 import { toolAnnotations } from "../lib/tool-annotations.js";
 import { toolError } from "../lib/tool-result.js";
-import { findBrowserExecutable } from "../lib/browser-runtime.js";
+import { launchBrowser } from "../lib/browser-runtime.js";
+import { resolveBrowserTarget } from "../lib/browser-target.js";
 
-const execFileAsync = promisify(execFile);
 const MAX_IMAGE_BYTES = 12 * 1024 * 1024;
 const MAX_RENDER_DIMENSION = 4096;
 
@@ -56,56 +53,51 @@ async function readImageForModel(filePath: string, maxBytes = MAX_IMAGE_BYTES): 
   return { bytes: await fs.readFile(filePath), mimeType };
 }
 
-async function chromiumScreenshot(
-  target: string,
-  outputPath: string,
-  width: number,
-  height: number,
-  timeoutMs: number
-): Promise<void> {
-  const browser = findBrowserExecutable();
-  if (!browser) {
-    throw new Error("No supported Chromium browser found. Set CHATGPT_BROWSER_PATH to Edge/Chrome/Chromium executable.");
-  }
-
+export async function chromiumScreenshot(
+  target: string, outputPath: string, width: number, height: number, timeoutMs: number
+): Promise<{ browser: string; browser_version: string; cleanup_errors: string[]; phases: string[] }> {
+  const deadline = Date.now() + timeoutMs;
+  const remaining = (phase: string) => {
+    const value = deadline - Date.now();
+    if (value <= 0) throw new Error(`Screenshot deadline exceeded in ${phase}`);
+    return value;
+  };
   await fs.mkdir(path.dirname(outputPath), { recursive: true });
-  const profileDir = await fs.mkdtemp(path.join(os.tmpdir(), "chatgpt-local-coder-browser-"));
+  let phase = "launch";
+  let browser: Awaited<ReturnType<typeof launchBrowser>>["browser"] | undefined;
+  let context: Awaited<ReturnType<NonNullable<typeof browser>["newContext"]>> | undefined;
+  const cleanupErrors: string[] = [];
+  const phases: string[] = [];
+  const bounded = async <T>(promise: Promise<T>, ms: number, label: string): Promise<T> => {
+    let timer: NodeJS.Timeout | undefined;
+    try { return await Promise.race([promise, new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error(`${label} deadline exceeded`)), ms); })]); }
+    finally { if (timer) clearTimeout(timer); }
+  };
+  let result: { browser: string; browser_version: string; cleanup_errors: string[]; phases: string[] } | undefined;
+  let failure: string | undefined;
   try {
-    await execFileAsync(
-      browser,
-      [
-        "--headless=new",
-        "--disable-gpu",
-        "--hide-scrollbars",
-        "--no-first-run",
-        "--disable-extensions",
-        "--run-all-compositor-stages-before-draw",
-        `--user-data-dir=${profileDir}`,
-        `--window-size=${width},${height}`,
-        `--screenshot=${outputPath}`,
-        target,
-      ],
-      { timeout: timeoutMs, windowsHide: true, maxBuffer: 2 * 1024 * 1024 }
-    );
+    const launched = await launchBrowser(remaining(phase));
+    browser = launched.browser; phases.push("launch");
+    const browserVersion = browser.version();
+    phase = "context";
+    context = await bounded(browser.newContext({ viewport: { width, height }, deviceScaleFactor: 1 }), remaining(phase), phase);
+    const page = await bounded(context.newPage(), remaining(phase), phase);
+    phases.push("context");
+    phase = "navigation";
+    await page.goto(target, { waitUntil: "domcontentloaded", timeout: remaining(phase) });
+    phases.push("navigation");
+    phase = "screenshot";
+    await page.screenshot({ path: outputPath, type: "png", timeout: remaining(phase), animations: "disabled" });
+    phases.push("screenshot");
+    result = { browser: launched.executablePath, browser_version: browserVersion, cleanup_errors: cleanupErrors, phases };
+  } catch (error) {
+    failure = `Screenshot failed during ${phase}: ${String(error)}`;
   } finally {
-    await fs.rm(profileDir, { recursive: true, force: true }).catch(() => {});
+    if (context) await bounded(context.close(), 5000, "close context").then(() => phases.push("close context")).catch(error => cleanupErrors.push(`close context: ${String(error)}`));
+    if (browser) await bounded(browser.close(), 5000, "close browser").then(() => phases.push("close browser")).catch(error => cleanupErrors.push(`close browser: ${String(error)}`));
   }
-
-  const stat = await fs.stat(outputPath).catch(() => null);
-  if (!stat?.isFile() || stat.size === 0) throw new Error("Browser finished without producing a screenshot");
-}
-
-async function resolveBrowserTarget(raw: string): Promise<{ target: string; label: string }> {
-  const trimmed = raw.trim();
-  if (/^https?:\/\//i.test(trimmed)) {
-    const url = new URL(trimmed);
-    return { target: url.toString(), label: url.toString() };
-  }
-
-  const localPath = await validatePath(trimmed);
-  const stat = await fs.stat(localPath);
-  if (!stat.isFile()) throw new Error("Local browser target must be a file");
-  return { target: pathToFileURL(localPath).toString(), label: localPath };
+  if (failure) throw new Error(`${failure}; phases=${JSON.stringify(phases)}; cleanup_errors=${JSON.stringify(cleanupErrors)}`);
+  return result!;
 }
 
 export function registerVisualTools(server: McpServer): void {
@@ -165,11 +157,11 @@ export function registerVisualTools(server: McpServer): void {
           : path.join(path.dirname(svgPath), `${path.basename(svgPath, ".svg")}.preview.png`);
         if (path.extname(outputPath).toLowerCase() !== ".png") throw new Error("render_svg output_path must end in .png");
 
-        await chromiumScreenshot(pathToFileURL(svgPath).toString(), outputPath, width, height, timeout_ms);
+        const capture = await chromiumScreenshot(pathToFileURL(svgPath).toString(), outputPath, width, height, timeout_ms);
         const { bytes, mimeType } = await readImageForModel(outputPath);
         return visualResult(
           "render_svg",
-          { source_path: svgPath, output_path: outputPath, width, height, bytes: bytes.length, browser: findBrowserExecutable() },
+          { source_path: svgPath, output_path: outputPath, width, height, bytes: bytes.length, ...capture },
           bytes,
           mimeType,
           `render_svg: ${svgPath}`
@@ -203,11 +195,11 @@ export function registerVisualTools(server: McpServer): void {
           : await validatePath(path.join(".chatgpt-local-coder", "previews", `web-${Date.now()}.png`));
         if (path.extname(outputPath).toLowerCase() !== ".png") throw new Error("capture_webpage output_path must end in .png");
 
-        await chromiumScreenshot(resolved.target, outputPath, width, height, timeout_ms);
+        const capture = await chromiumScreenshot(resolved.target, outputPath, width, height, timeout_ms);
         const { bytes, mimeType } = await readImageForModel(outputPath);
         return visualResult(
           "capture_webpage",
-          { target: resolved.label, output_path: outputPath, width, height, bytes: bytes.length, browser: findBrowserExecutable() },
+          { target: resolved.label, output_path: outputPath, width, height, bytes: bytes.length, ...capture },
           bytes,
           mimeType,
           `capture_webpage: ${resolved.label}`

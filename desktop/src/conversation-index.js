@@ -25,7 +25,7 @@ function titleOf(value) {
   return title;
 }
 
-function newState() { return { schema: 1, nextNumber: 1, records: [] }; }
+function newState() { return { schema: 2, nextNumber: 1, records: [] }; }
 function checkId(id) {
   if (!CONVERSATION_ID.test(id)) throw new Error("无法可靠识别当前会话，未保存备注。");
   return id;
@@ -51,13 +51,18 @@ function load(file) {
   if (fs.lstatSync(file).size > FILE_MAX_BYTES) throw new Error("会话显示索引超过限额，未覆盖旧文件。");
   let state;
   try { state = JSON.parse(fs.readFileSync(file, "utf8")); } catch { throw new Error("会话显示索引损坏，未覆盖旧文件。"); }
-  if (state?.schema !== 1 || !Number.isSafeInteger(state.nextNumber) || state.nextNumber < 1 ||
+  if (![1, 2].includes(state?.schema) || !Number.isSafeInteger(state.nextNumber) || state.nextNumber < 1 ||
       !Array.isArray(state.records) || !state.records.every(validateRecord)) {
     throw new Error("会话显示索引格式不支持，未覆盖旧文件。");
   }
   if (new Set(state.records.map(r => r.id)).size !== state.records.length ||
       new Set(state.records.map(r => r.number)).size !== state.records.length) {
     throw new Error("会话显示索引含重复身份，未覆盖旧文件。");
+  }
+  if (state.schema === 1) {
+    return { ...state, schema: 2, migratedFrom: 1, records: state.records.map(record => ({
+      ...record, originalId: record.id, identitySource: "legacy-unknown", identityVersion: 1,
+    })) };
   }
   return state;
 }
@@ -73,13 +78,24 @@ function prune(state, now) {
     if (drop < 0) break;
     limited.splice(drop, 1);
   }
-  return { schema: 1, nextNumber: state.nextNumber, records: limited.sort((a,b)=>a.number-b.number) };
+  return { ...state, schema: 2, nextNumber: state.nextNumber, records: limited.sort((a,b)=>a.number-b.number) };
 }
 function publish(file, state) {
   const dir=path.dirname(file);
   context.assertUnlinked(dir);
   fs.mkdirSync(dir,{recursive:true});
   context.assertUnlinked(file);
+  // Preserve the exact prior format once; never infer identity aliases from
+  // titles, timing, language or transport IDs during this schema migration.
+  if (fs.existsSync(file)) {
+    const original = fs.readFileSync(file);
+    if (JSON.parse(original.toString("utf8")).schema === 1) {
+      const backup = file + ".v1.backup";
+      context.assertUnlinked(backup);
+      try { fs.writeFileSync(backup, original, { flag: "wx", mode: 0o600 }); }
+      catch (error) { if (error.code !== "EEXIST") throw error; }
+    }
+  }
   const bytes=Buffer.from(JSON.stringify(state,null,2)+"\n");
   if(bytes.length>FILE_MAX_BYTES) throw new Error("会话索引容量已满，请清理收藏记录。");
   const temp=file+"."+process.pid+"."+crypto.randomBytes(6).toString("hex")+".tmp";
@@ -96,7 +112,7 @@ class ConversationIndex {
     this.rootFor=rootFor; this.now=now;
   }
   file(accountId) { return relativeFile(this.rootFor(accountId)); }
-  observe(accountId, conversationId, { hint, at, tool } = {}) {
+  observe(accountId, conversationId, { hint, at, tool, identitySource, identityVersion } = {}) {
     checkId(conversationId);
     const file=this.file(accountId),now=this.now(),current=load(file);
     const state=prune(current,now);
@@ -105,7 +121,9 @@ class ConversationIndex {
     let dirty = state.records.length!==current.records.length;
     if(!record) {
       record={id:conversationId,number:state.nextNumber++,title:proposed,alias:"",
-        createdAt:now,lastAt:now,pinned:false,lastTool:""};
+        createdAt:now,lastAt:now,pinned:false,lastTool:"",originalId:conversationId,
+        identitySource:identitySource === "openai/session" ? identitySource : "unspecified",
+        identityVersion:identitySource === "openai/session" && identityVersion === 2 ? 2 : 1};
       state.records.push(record);dirty=true;
     } else if(proposed && !record.title && !record.alias) { record.title=proposed;dirty=true; }
     if(typeof tool==="string" && /^[A-Za-z][A-Za-z0-9._-]{0,63}$/.test(tool) && record.lastTool!==tool) {
@@ -122,7 +140,9 @@ class ConversationIndex {
     const number=String(record.number).padStart(2,"0");
     return {number:record.number,id:record.id,display:"会话 "+number+(record.alias||record.title?"「"+(record.alias||record.title)+"」":" · "+day),
       title:record.alias||record.title,source:record.alias?"manual":record.title?"task":"number",
-      pinned:record.pinned,lastAt:record.lastAt,lastTool:record.lastTool||""};
+      pinned:record.pinned,lastAt:record.lastAt,lastTool:record.lastTool||"",
+      identitySource:record.identitySource || "legacy-unknown",identityVersion:record.identityVersion || 1,
+      originalId:record.originalId || record.id};
   }
   lookup(accountId,conversationId) {
     if(!CONVERSATION_ID.test(conversationId||"")) return null;

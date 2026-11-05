@@ -1,6 +1,6 @@
 {
   "name": "chatgpt-local-coder",
-  "version": "3.1.2",
+  "version": "3.2.0",
   "description": "Turn ChatGPT web into a local coding agent via MCP — files, shell, git, apply_patch, semantic code intelligence, and task-driven Skill discovery",
   "repository": {
     "type": "git",

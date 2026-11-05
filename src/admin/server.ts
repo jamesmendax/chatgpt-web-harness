@@ -5,7 +5,6 @@ import type { Server } from "http";
 import type { McpUpstreamManager } from "../lib/mcp-upstream-manager.js";
 import { createAdminRouter } from "./routes.js";
 import { adminAuth, localhostOnly } from "./localhost-guard.js";
-import { createPasskeyApprovalRouter } from "./passkey-approval.js";
 import { recoveryNonMcpHttpFence } from "../lib/recovery-non-mcp-fence.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -37,16 +36,7 @@ export function startAdminServer(options: AdminServerOptions): Server {
   app.use(express.json({ limit: "5mb" }));
   app.use(localhostOnly);
 
-  // A1.1 optional *human* approval page. Entirely off unless the operator
-  // explicitly enables a separate pinned WebAuthn credential + store.
-  // Keep this before generic adminAuth only to serve public non-sensitive
-  // approval HTML; the router independently requires ADMIN_TOKEN for all
-  // /api routes and authenticates every approval with a passkey.
-  if (process.env.HARNESS_PASSKEY_APPROVAL_ENABLED === "1" && options.workspaceRoot) {
-    app.use("/approval", createPasskeyApprovalRouter({
-      workspaceRoot: options.workspaceRoot, adminPort: options.port,
-    }));
-  }
+  // Product action approval routes are retired, including legacy env opt-ins.
 
   // OAuth callbacks must not require ADMIN_TOKEN: OAuth providers redirect the browser here.
   // The route is still loopback-only and protected by the per-flow OAuth state value.

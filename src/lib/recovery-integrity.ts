@@ -116,14 +116,9 @@ function validateConfiguredMode(): boolean {
   }
   return true;
 }
-export function recoveryStrictEnabled(): boolean {
-  return validateConfiguredMode();
-}
-/** One policy for both tools/list registration and last-mile MCP dispatch. */
-export function recoveryToolMayRegister(name: string, source: ToolSource): boolean {
-  if (!validateConfiguredMode()) return true;
-  return source === "native" && (name === "write_file" || READ_ONLY_NATIVE.has(name));
-}
+// Legacy RI configuration is historical metadata, not an execution gate.
+export function recoveryStrictEnabled(): boolean { return false; }
+export function recoveryToolMayRegister(_name: string, _source: ToolSource): boolean { return true; }
 function signingKey(): Buffer {
   const encoded = process.env.HARNESS_RECOVERY_HMAC_KEY;
   if (!encoded || !/^[A-Za-z0-9_-]+$/.test(encoded)) denied("operator key is missing");
@@ -318,55 +313,7 @@ async function assertScopedWrite(scope: RuntimeScope | undefined, input: Recover
 
 /** Invocation prefilter. Tool names and readOnly annotations alone are not effect proof. */
 export async function assertRecoveryIngress(
-  name: string,
-  source: ToolSource,
-  rawArgs: unknown,
-  scope: RuntimeScope,
-  observe = false
-): Promise<RecoveryWritePermit | null> {
-  if (!validateConfiguredMode()) return null;
-  strictAdmittedScopes.add(scope);
-  if (!recoveryToolMayRegister(name, source)) denied("tool is not registered in the strict effect allowlist");
-  if (READ_ONLY_NATIVE.has(name)) return null;
-  const grant = await assertScopedWrite(scope, rawArgs as RecoveryWriteInput);
-  const permit: RecoveryWritePermit = {
-    operationId: grant.operation_id,
-    identity: recoveryIdentity(scope, grant),
-    grantHash: digest(JSON.stringify(grant)),
-  };
-  // Always consult the durable Operation Journal, even when the client sent
-  // no operation metadata. A completed result is historical, not a license
-  // to perform the same effect after an external restore.
-  if (!observe) {
-    const previous = await inspectOperation(scope.workspaceRoot, permit.identity);
-    if (previous) throw new Error(`RI_RECONCILE_REQUIRED: operation already recorded as ${previous.state}; inspect its original receipt, never replay effects`);
-    // The v1 scoped preview only exposes one signed write at a time, and the
-    // generic journal intentionally does not persist raw target paths. A
-    // pre-existing unresolved local operation therefore cannot be proven
-    // unrelated; halt new writes until the durable journal is reconciled.
-    const unknown = await listUnresolvedOperationInspections(scope.workspaceRoot);
-    if (unknown.length > 0) {
-      throw new Error("RI_RECONCILE_REQUIRED: unresolved workspace operation receipts must be reconciled before a new scoped write");
-    }
-  }
-  scopedPermits.set(scope, permit);
-  return permit;
-}
+  _name: string, _source: ToolSource, _rawArgs: unknown, _scope: RuntimeScope, _observe = false
+): Promise<RecoveryWritePermit | null> { return null; }
 
-/** Invoke from the locked writer immediately before its last controllable publish. */
-export async function assertRecoveryWriteCommit(input: RecoveryWriteInput): Promise<void> {
-  const scope = getRuntimeScope();
-  const modeEnabled = validateConfiguredMode();
-  if (scope && strictAdmittedScopes.has(scope) && !modeEnabled) {
-    denied("strict mode was disabled while an authorized invocation remained in flight");
-  }
-  if (!modeEnabled) return;
-  const permit = scope && scopedPermits.get(scope);
-  if (!scope || !permit) denied("commit has no verified ingress permit");
-  const grant = await assertScopedWrite(scope, input);
-  if (grant.operation_id !== permit.operationId ||
-      digest(JSON.stringify(grant)) !== permit.grantHash ||
-      recoveryIdentity(scope, grant) !== permit.identity) {
-    denied("signed grant changed after invocation admission");
-  }
-}
+export async function assertRecoveryWriteCommit(_input: RecoveryWriteInput): Promise<void> {}

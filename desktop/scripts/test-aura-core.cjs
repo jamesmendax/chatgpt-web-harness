@@ -63,14 +63,15 @@ test("collection timestamps, stderr marker and production activity grammar", () 
     api.parseLine("mcp", "[TOOL] [blocked] apply_patch — rejected 1ms"),
     api.parseLine("mcp", "[HARNESS] status=success invocation=I1 tool=read_text_file duration_ms=12")
   ]);
-  assert.equal(rows.length, 3);
+  assert.equal(rows.length, 2, "unattributed transport failures remain logs, not failed tool calls");
   assert.equal(rows[0].tool, "read_text_file");
   assert.equal(rows[0].target, "test.txt");
   assert.equal(rows[0].ms, 12);
   assert.equal(rows[0].endedAt - rows[0].startedAt, 12);
   assert.equal(rows[1].phase, "failed");
-  assert.equal(rows[1].ms, 27);
-  assert.equal(rows[2].ok, false);
+  assert.equal(rows[1].ms, 1);
+  assert.equal(rows[1].ok, false);
+  assert.equal(rows[1].tool, "apply_patch");
 });
 
 test("conversation tags at the end of production lines keep summaries and durations intact", () => {
@@ -80,9 +81,10 @@ test("conversation tags at the end of production lines keep summaries and durati
     api.parseLine("mcp", "14:00:01 ! [MCP ERROR] HTTP 400 tools/call write_file — denied 27ms session=123 conv=0123abcd"),
     api.parseLine("mcp", "14:00:02   [MCP] [running] tools/call run_command — npm test 60000ms session=123 conv=0123abcd")
   ]);
-  assert.equal(rows.length, 2, "in-flight reports are not extra calls");
+  assert.equal(rows.length, 1, "uncorrelated HTTP errors and in-flight reports are not extra calls");
   assert.deepEqual([rows[0].target, rows[0].ms], ["test.txt", 12]);
-  assert.deepEqual([rows[1].summary, rows[1].ms, rows[1].phase], ["denied", 27, "failed"]);
+  const correlated = api.activityFromLogs([api.parseLine("mcp", "14:00:01 ! [MCP ERROR] HTTP 400 tools/call write_file — denied 27ms call=call-known session=123 conv=0123abcd")]);
+  assert.deepEqual([correlated[0].summary, correlated[0].ms, correlated[0].phase], ["denied", 27, "failed"]);
 });
 
 test("legacy HTTP durations are never guessed onto uncorrelated tool records", () => {

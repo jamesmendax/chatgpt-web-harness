@@ -18,10 +18,13 @@ const goals = await import("../dist/lib/goals.js");
 const runs = await import("../dist/lib/goal-run-store.js");
 const tasks = await import("../dist/lib/durable-tasks.js");
 const { createRuntimeScope, runWithRuntimeScope } = await import("../dist/lib/runtime-scope.js");
+const { runtimePrincipalId } = await import("../dist/lib/mcp-request-identity.js");
+const { accountProjectDir } = await import("../dist/lib/account-project-scope.js");
 const workspace = path.join(temp, "workspace");
 await fs.mkdir(workspace);
-const inSession = (sessionId, fn) => runWithRuntimeScope(createRuntimeScope({ workspaceRoot: workspace, projectRoots: [workspace] }, { sessionId }), fn);
-const stateRoot = path.join(process.env.CODEX_HOME, "projects", crypto.createHash("sha256").update(path.resolve(workspace)).digest("hex").slice(0, 12));
+const seed = { workspaceRoot: workspace, projectRoots: [workspace], principalId: runtimePrincipalId(workspace), tunnelProfile: process.env.CHATGPT_TUNNEL_PROFILE?.trim() || undefined };
+const inSession = (sessionId, fn) => runWithRuntimeScope(createRuntimeScope(seed, { sessionId }), fn);
+const stateRoot = inSession("session-A", () => accountProjectDir(path.join(process.env.CODEX_HOME, "projects", crypto.createHash("sha256").update(path.resolve(workspace)).digest("hex").slice(0, 12))));
 const sessionFile = (session, file) => path.join(stateRoot, "sessions", session, file);
 const read = (file) => fs.readFile(file, "utf8");
 const server = createMcpServer(workspace, 30_000, [workspace], true);
@@ -39,7 +42,7 @@ const ok = (result) => {
 };
 const create = (objective) => ({ action: "create", objective, success_criteria: [{ name: objective + " verified", passed: false }] });
 
-try {
+await inSession("session-A", async () => { try {
   const first = ok(await call("session-A", create("first task"))).goal;
   const oldTask = ok(await call("session-A", { action: "create", goal: "first task" }, "task_state")).handoff.task_id;
   const paused = ok(await call("session-A", { action: "pause", expected_revision: first.revision })).goal;
@@ -96,8 +99,9 @@ try {
     assert.equal(badRevision.structuredContent?.ok, false);
     const different = await call("session-A", create("different pending request"));
     assert.equal(different.structuredContent?.ok, false, "different create replaced a pending transaction");
-    const blockedTask = await call("session-A", { action: "create", goal: "must remain blocked" }, "task_state");
-    assert.equal(blockedTask.structuredContent?.ok, false, "task mutation escaped the pending Goal fence");
+    const independentTask = ok(await call("session-A", { action: "create", goal: "independent task during recovery" }, "task_state"));
+    assert.equal(independentTask.handoff.status, "active");
+    ok(await call("session-A", { action: "cancel", task_id: independentTask.handoff.task_id }, "task_state"));
     const after = await Promise.all(["goal.json", "goal-run.json", "goal-create-transaction.json"].map((file) => read(sessionFile("session-A", file))));
     assert.deepEqual(after, before, "read/error paths mutated a pending Goal transaction");
     const recovered = ok(await call("session-A", recoveryAction === "create"
@@ -117,8 +121,8 @@ try {
     const movingGoal = ok(await call(sourceSession, create(`moving ${failureAt}`))).goal;
     const fixedTaskId = ok(await call(sourceSession, { action: "create", goal: `fixed ${failureAt}` }, "task_state")).handoff.task_id;
     const challenge = await call(targetSession, { action: "bind", expected_revision: movingGoal.revision });
-    const token = challenge.structuredContent?.data?.takeover_token;
-    assert.equal(typeof token, "string", JSON.stringify(challenge));
+    assert.equal(challenge.structuredContent?.data?.error, "GOAL_BIND_TARGET_REQUIRED", JSON.stringify(challenge));
+    assert.equal(challenge.structuredContent?.data?.takeover_candidate?.goal_id, movingGoal.id);
     const fixedTaskFile = path.join(tasks.durableTaskDir(workspace), fixedTaskId + ".json");
     const targetPointer = path.join(tasks.durableTaskDir(workspace), `active-task.${targetSession}.json`);
     const journalFile = path.join(tasks.durableTaskDir(workspace), "goal-bind-transactions",
@@ -135,7 +139,7 @@ try {
     };
     let failed;
     try {
-      failed = await call(targetSession, { action: "bind", expected_revision: movingGoal.revision, takeover_token: token });
+      failed = await call(targetSession, { action: "bind", goal_id: movingGoal.id, expected_revision: movingGoal.revision });
     } finally { fs.rename = originalRename; }
     assert.equal(injected, true, "bind did not reach the injected publication boundary");
     assert.equal(failed.structuredContent?.ok, false, "partially committed bind was reported as success");
@@ -163,7 +167,7 @@ try {
       assert.equal(await tasks.getActiveTaskId(workspace, targetSession), null, "a mismatched journal task acquired the destination pointer");
       assert.equal(await read(newSourceTaskFile), sourceBeforeRetry[2], "a mismatched journal moved the new Goal's task");
     } finally { await fs.writeFile(journalFile, JSON.stringify(pending)); }
-    const retried = ok(await call(targetSession, { action: "bind", expected_revision: movingGoal.revision, takeover_token: token }));
+    const retried = ok(await call(targetSession, { action: "bind", goal_id: movingGoal.id, expected_revision: movingGoal.revision }));
     assert.equal(retried.result, "ALREADY_BOUND");
     assert.equal(retried.durable_task_rebind.migrated, true);
     assert.equal(retried.durable_task_rebind.task_id, fixedTaskId);
@@ -190,4 +194,4 @@ try {
     if (savedEnv[key] === undefined) delete process.env[key]; else process.env[key] = savedEnv[key];
   }
   await fs.rm(temp, { recursive: true, force: true });
-}
+} });

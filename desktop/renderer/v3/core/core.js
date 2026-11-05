@@ -47,21 +47,24 @@
   function invocationDiagnostic(text) {
     const values = Object.fromEntries(text.trim().split(/\s+/).filter(Boolean).map(token => token.split("=")));
     return {
-      outcomeKind: ["needs_input", "review_rejected", "blocked", "execution_error"].includes(values.outcome) ? values.outcome : undefined,
+      outcomeKind: ["needs_input", "review_rejected", "blocked", "execution_error", "unknown", "running"].includes(values.outcome) ? values.outcome : undefined,
       errorCode: /^[A-Z][A-Z0-9_]{1,79}$/.test(values.code || "") ? values.code : undefined,
       failurePhase: ["admission", "validation", "execution", "postprocessing"].includes(values.phase) ? values.phase : undefined,
       operationStarted: values.started === "true" ? true : values.started === "false" ? false : undefined,
+      exitCode: /^-?\d+$/.test(values.exit || "") ? Number(values.exit) : undefined,
+      timedOut: values.timeout === "true" ? true : values.timeout === "false" ? false : undefined,
+      mayHavePartiallyCompleted: values.partial === "true" ? true : values.partial === "false" ? false : undefined,
       retryPolicy: ["retry_with_changed_args", "refresh_state", "inspect_original_result", "repair_then_review", "none"].includes(values.retry) ? values.retry : undefined
     };
   }
   function invocationFromLine(text) {
-    const stdout = /^\[(TOOL|MCP)\] \[(running|ok|transport_ok|error|blocked|failed|failure)\] (?:tools\/call )?([\w.-]+)(.*)$/.exec(text);
+    const stdout = /^\[(TOOL|MCP)\] \[(running|unknown|ok|transport_ok|error|blocked|failed|failure)\] (?:tools\/call )?([\w.-]+)(.*)$/.exec(text);
     const error = /^\[MCP ERROR\](?: HTTP \d+)? tools\/call ([\w.-]+)(.*)$/.exec(text);
-    const feed = /^\[(tool|mcp)\] tools\/call ([\w.-]+) (running|ok|transport_ok|error|blocked|failed|failure) (\d+)ms((?: (?:outcome|code|phase|started|retry)=[A-Za-z0-9_]+)*) call=([^\s]+)(?: client=\S+)?(?: session=\S+)?(?: conv=[0-9a-f]+)?(?: — (.*))?$/.exec(text);
+    const feed = /^\[(tool|mcp)\] tools\/call ([\w.-]+) (running|unknown|ok|transport_ok|error|blocked|failed|failure) (\d+)ms((?: (?:outcome|code|phase|started|retry|exit|timeout|partial)=[A-Za-z0-9_.:-]+)*) call=([^\s]+)(?: client=\S+)?(?: session=\S+)?(?: conv=[0-9a-f]+)?(?: — (.*))?$/.exec(text);
     let status, tool, ms, callId, summary, transport, diagnostic;
     if (stdout || error) {
       const rest = stdout ? stdout[4] : error[2];
-      const tail = / (\d+)ms((?: (?:outcome|code|phase|started|retry)=[A-Za-z0-9_]+)*) call=([^\s]+)(?: session=\S+)?(?: conv=[0-9a-f]+)?$/.exec(rest);
+      const tail = / (\d+)ms((?: (?:outcome|code|phase|started|retry|exit|timeout|partial)=[A-Za-z0-9_.:-]+)*) call=([^\s]+)(?: session=\S+)?(?: conv=[0-9a-f]+)?$/.exec(rest);
       if (!tail) return null;
       status = stdout ? stdout[2] : "error"; tool = stdout ? stdout[3] : error[1];
       transport = !stdout || stdout[1] === "MCP";
@@ -70,7 +73,11 @@
       let kind; [, kind, tool, status, ms, diagnostic, callId, summary = ""] = feed;
       transport = kind === "mcp"; ms = Number(ms);
     } else return null;
-    return { callId, tool, phase: status === "running" ? "running" : /^(ok|transport_ok)$/.test(status) ? "done" : "failed", ms, target: summary, summary, transport, ...invocationDiagnostic(diagnostic || "") };
+    const detail = invocationDiagnostic(diagnostic || "");
+    const phase = detail.outcomeKind === "unknown" || status === "unknown" ? "unknown"
+      : detail.outcomeKind === "running" || status === "running" ? "running"
+      : /^(ok|transport_ok)$/.test(status) ? "done" : "failed";
+    return { callId, tool, phase, ms, target: summary, summary, transport, ...detail };
   }
   // Production TOOL lines already describe completed invocations. Preview
   // emits pairs without IDs; only pair these when exactly one call is open.
@@ -88,11 +95,11 @@
         // start may supersede a transport-only fallback with the same exact ID.
         if (known && !known.transport && known.phase !== "running" && invocation.phase === "running") continue;
         if (known && known.transport === invocation.transport && known.phase === invocation.phase && known.ms === invocation.ms && known.summary === invocation.summary &&
-          ["outcomeKind", "errorCode", "failurePhase", "operationStarted", "retryPolicy"].every(key => known[key] === invocation[key])) continue;
+          ["outcomeKind", "errorCode", "failurePhase", "operationStarted", "retryPolicy", "exitCode", "timedOut", "mayHavePartiallyCompleted"].every(key => known[key] === invocation[key])) continue;
         const record = known || { id: "C" + invocation.callId, callId: invocation.callId, startedAt: e.ts - invocation.ms };
         const wasRunning = known && known.phase === "running";
         const replacingFallback = known && known.transport && !invocation.transport;
-        Object.assign(record, invocation, { ok: invocation.phase === "running" ? null : invocation.phase === "done", endedAt: invocation.phase === "running" ? null : e.ts });
+        Object.assign(record, invocation, { ok: ["running", "unknown"].includes(invocation.phase) ? null : invocation.phase === "done", endedAt: invocation.phase === "running" ? null : e.ts });
         if (invocation.phase !== "running") record.startedAt = e.ts - invocation.ms;
         if (!known) into.push(record);
         changes.push({ kind: (!known || replacingFallback) && invocation.phase === "running" ? "start" : invocation.phase !== "running" && (!known || wasRunning) ? "end" : "update", record });
@@ -100,6 +107,9 @@
       }
       // HTTP timing without an invocation ID cannot be assigned to a tool record.
       if (timedCall(e.text)) continue;
+      // Without a canonical invocation ID, a transport error remains a log
+      // observation and cannot be counted as a separate failed tool operation.
+      if (/^\[(?:MCP(?: ERROR)?|mcp)\]/.test(e.text)) continue;
       if (/^\[TOOL\] \[running\]/.test(e.text)) continue;
       const completed = /^\[TOOL\](?:\s*\[([^\]]+)\])?\s+([\w.-]+)(?:\s+—\s+(.*?))?(?:\s+(\d+)ms)?(?:\s+session=\S+)?(?:\s+conv=[0-9a-f]+)?$/.exec(e.text);
       const failed = /^\[MCP ERROR\](?:\s+HTTP\s+\d+)?\s+tools\/call\s+([\w.-]+)(?:\s+—\s+(.*?))?(?:\s+(\d+)ms)?(?:\s+session=\S+)?(?:\s+conv=[0-9a-f]+)?$/.exec(e.text);

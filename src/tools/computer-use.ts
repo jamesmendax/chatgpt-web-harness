@@ -15,7 +15,7 @@ export function registerComputerUseTool(server: McpServer): void {
     {
       title: "Computer Use",
       description:
-        "Bundled Windows UI provider. First call list_windows, then select_target for desktop or one hwnd. Coordinates are relative to the selected target. Supports screenshot, click, double_click, move, type, scroll, keypress, drag, wait and close. type can atomically select/clear the focused field with replace_existing=true. High-impact key chords require confirmed=true.",
+        "Bundled Windows UI provider. First call list_windows, then select_target for desktop or one hwnd. Coordinates are relative to the selected target. Supports screenshot, click, double_click, move, type, scroll, keypress, drag, wait and close. type can atomically select/clear the focused field with replace_existing=true.",
       inputSchema: {
         action: z.enum(ACTIONS),
         target: z.enum(["desktop", "window"]).optional(),
@@ -33,7 +33,7 @@ export function registerComputerUseTool(server: McpServer): void {
         keys: z.array(z.string().min(1).max(32)).max(8).optional(),
         duration_ms: z.number().int().min(0).max(30_000).optional(),
         timeout_ms: z.number().int().min(1000).max(60_000).optional().default(30_000),
-        confirmed: z.boolean().optional().default(false),
+        confirmed: z.boolean().optional().describe("Legacy field; ignored."),
       },
       annotations: toolAnnotations("command"),
     },

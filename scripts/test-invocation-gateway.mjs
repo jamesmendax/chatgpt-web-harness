@@ -101,8 +101,7 @@ async function verifyRegistryBehavior() {
     const editConfig = { description: "edit", inputSchema: {}, annotations: { readOnlyHint: false } };
     const edit = slim.prepare("edit_file", editConfig, async () => result("edit"));
     assert.ok(edit, "slim enabled override was not admitted");
-    assert.notEqual(edit.config, editConfig, "side-effect config was not cloned for requirement metadata");
-    assert.ok(edit.config.inputSchema._intent, "side-effect config lacks reserved _intent field");
+    assert.equal(edit.config.inputSchema._intent, undefined, "legacy intent must not appear in tool schema");
     assert.equal(slim.prepare("git_diff", {}, async () => result("git")), undefined);
 
     const upstreamConfig = { description: "upstream", inputSchema: {}, annotations: { readOnlyHint: true } };
@@ -210,8 +209,8 @@ async function verifyGatewayBehavior() {
   await gateway.invoke("read_text_file", [args, workflowExtra]);
   assert.equal(
     scopeSeen.mcpSessionId,
-    "wfr_01abcDEF234",
-    "stable tunnel workflow id did not override ephemeral transport session"
+    "ephemeral-transport-session",
+    "unverified workflow header must not become a conversation identity"
   );
 
   const openAiConversation = "opaque-openai-conversation-fixture";
@@ -252,13 +251,13 @@ async function verifyGatewayBehavior() {
     sessionId: "ephemeral-transport-one",
     requestInfo: { headers: { "x-request-id": stableWorkflowHeader } },
   }]);
-  assert.equal(scopeSeen.mcpSessionId, "wfr_stableWorkflow123");
+  assert.equal(scopeSeen.mcpSessionId, "ephemeral-transport-one");
   await gateway.invoke("read_text_file", [args, {
     ...extra,
     sessionId: "ephemeral-transport-two",
     requestInfo: { headers: { "x-request-id": stableWorkflowHeader.replace("command_1", "command_2") } },
   }]);
-  assert.equal(scopeSeen.mcpSessionId, "wfr_stableWorkflow123", "stable workflow identity drifted across ephemeral transports");
+  assert.equal(scopeSeen.mcpSessionId, "ephemeral-transport-two", "workflow header must not merge separate transports");
 
   // Some real Web connector paths preserve the stable workflow header on the
   // raw HTTP request but the SDK callback omits requestInfo.headers. The outer
@@ -272,7 +271,7 @@ async function verifyGatewayBehavior() {
       requestInfo: { headers: {} },
     }])
   );
-  assert.equal(scopeSeen.mcpSessionId, "wfr_outerRequest456", "raw HTTP workflow identity did not reach invocation scope");
+  assert.equal(scopeSeen.mcpSessionId, "ephemeral-sdk-one", "unverified outer workflow header must not define identity");
   await runWithMcpRequestIdentity(
     { "x-request-id": "wfr_outerRequest456/command_2" },
     "outer-transport-two",
@@ -282,7 +281,7 @@ async function verifyGatewayBehavior() {
       requestInfo: { headers: {} },
     }])
   );
-  assert.equal(scopeSeen.mcpSessionId, "wfr_outerRequest456", "outer request workflow identity drifted across transports");
+  assert.equal(scopeSeen.mcpSessionId, "ephemeral-sdk-two", "unverified outer workflow header must not merge transports");
 
   await runWithMcpRequestIdentity(
     { "x-openai-session": "opaque-header-conversation-fixture" },
@@ -294,7 +293,7 @@ async function verifyGatewayBehavior() {
     }])
   );
   const derivedHeaderConversation = scopeSeen.mcpSessionId;
-  assert.match(derivedHeaderConversation, /^oai_conv_[0-9a-f]{32}$/);
+  assert.equal(derivedHeaderConversation, "ephemeral-header-sdk-one");
   await runWithMcpRequestIdentity(
     { "x-openai-session": "opaque-header-conversation-fixture" },
     "outer-openai-transport-two",
@@ -304,7 +303,7 @@ async function verifyGatewayBehavior() {
       requestInfo: { headers: {} },
     }])
   );
-  assert.equal(scopeSeen.mcpSessionId, derivedHeaderConversation, "x-openai-session fallback drifted across transports");
+  assert.equal(scopeSeen.mcpSessionId, "ephemeral-header-sdk-two", "unverified session header must not merge transports");
 
   await gateway.invoke("read_text_file", [args, {
     ...extra,
@@ -541,9 +540,6 @@ async function verifyProductLifecycle() {
     assert.equal(starts.length,5);assert.equal(ends.length,5);assert.equal(new Set(starts.map(e=>e.details.invocation_id)).size,5);
     for(const start of starts){const terminal=ends.filter(e=>e.details.invocation_id===start.details.invocation_id);assert.equal(terminal.length,1);assert.equal(start.duration_ms,0);assert.ok(Number.isInteger(terminal[0].duration_ms)&&terminal[0].duration_ms>=0);assert.match(start.conversation_id,/^oai_conv_/);}
     assert.equal(ends.filter(e=>e.status==='error').length,2);
-    registry.register(registry.prepare('write_file',{inputSchema:{},annotations:{readOnlyHint:false}},async()=>{throw Error('rejected handler entered');}));
-    await gateway.invoke('write_file',[{},extra]);
-    assert.equal(events.filter(e=>e.details?.canonical_lifecycle).length,10,'admission rejection emits no false lifecycle');
     assert.equal(ends[3].details.invocation_id,starts[4].details.invocation_id,'same-tool calls finish by identity out of order');assert.equal(ends[4].details.invocation_id,starts[3].details.invocation_id);
     assert.equal(events.filter(e=>e.details?.lifecycle_detail).length,5);
     assert.doesNotMatch(printed.join('\n'),/SECRET_ARG|SECRET_RESULT|PRIVATE_RESULT|opaque-product-fixture/);
@@ -554,6 +550,11 @@ async function verifyProductLifecycle() {
       assert.equal(end.details.failure_phase,'execution');
       assert.equal(end.details.retry_policy,'inspect_original_result');
     }
+    let directEffects=0;
+    registry.register(registry.prepare('write_file',{inputSchema:{},annotations:{readOnlyHint:false}},async()=>{directEffects++;return result('direct');}));
+    await gateway.invoke('write_file',[{},extra]);
+    assert.equal(directEffects,1,'side effect executes without intent');
+    assert.equal(events.filter(e=>e.details?.canonical_lifecycle).length,12,'direct execution emits lifecycle');
   } finally {console.log=log;unsubscribe();}
 }
 

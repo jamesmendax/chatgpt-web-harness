@@ -27,6 +27,8 @@ vm.runInNewContext(compiled.slice(middlewareStart, middlewareEnd), {
   activityConversationId: () => undefined, summarizeToolArgs: () => "",
   logMcpToolRunning: report => reports.push(report),
   consumeSessionTransportError() {}, extractRequestId() {}, consumeMcpOutcome() {}, logMcpRequest() {},
+  getMcpRequestIdentity: () => ({ requestInstanceId: "middleware-fixture", runtimeInstanceId: "runtime-fixture", continuity: "unknown", source: "none", originalHeaders: {} }),
+  runtimePrincipalId: () => "middleware-fixture-account", workspaceRoot: "middleware-fixture-workspace",
 });
 for (const throws of [false, true]) {
   const res = Object.assign(new EventEmitter(), { writableEnded: false, destroyed: false, statusCode: 200, locals: {} });
@@ -120,13 +122,13 @@ try {
   await delay(1000);
   assert.equal(lines(/\[TOOL\] \[running\] /).length, running.length, "reports stop once the call ends");
 
-  // The documented header works too; legacy workflow ids and plain calls stay unattributed.
+  // Headers and legacy workflow ids cannot establish the trusted body metadata identity.
   await call(3, sleep(10), sessionId, undefined, { "x-openai-session": "running-report-fixture" });
   await call(4, sleep(10), sessionId, undefined, { "x-client-request-id": "wfr_legacyWorkflow9/command_1" });
   await delay(150);
   const finished = lines(/\[MCP\] \[(?:ok|transport_ok)\] tools\/call run_command /);
   assert.equal(finished.length, 3, output);
-  assert.match(finished[1], new RegExp(` conv=${short}$`));
+  assert.doesNotMatch(finished[1], / conv=/);
   assert.doesNotMatch(finished[2], / conv=/);
   const failure=await post({jsonrpc:'2.0',id:5,method:'tools/call',params:{name:'read_text_file',arguments:{path:path.join(workspace,'missing-correlation-fixture.txt')},_meta:{'openai/session':'running-report-fixture'}}},sessionId);
   assert.equal(failure.status,200,failure.text);await delay(150);

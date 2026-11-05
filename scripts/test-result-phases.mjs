@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import nodeFs from "node:fs";
 import { Writable } from "node:stream";
+import { z } from "zod";
 import { EffectiveToolRegistry } from "../src/lib/effective-tool-registry.ts";
 import { InvocationGateway } from "../src/lib/invocation-gateway.ts";
 import { registerShellTools } from "../src/tools/shell.ts";
@@ -22,7 +23,11 @@ try {
   assert.match(result.structuredContent.data.next_action, /do not blindly repeat/i);
   const trace = traces.at(-1); assert.equal(trace.handlerEntered, true); assert.equal(trace.handlerReturned, true); assert.equal(trace.postprocessingCompleted, false);
   const handlers = new Map();
-  registerShellTools({ registerTool(name, _schema, handler) { handlers.set(name, handler); } }, temp, 5);
+  // Match the MCP registration boundary: schema defaults (including UTF-8) are
+  // applied before a handler is called, while the injected log failure stays real.
+  registerShellTools({ registerTool(name, schema, handler) {
+    handlers.set(name, args => handler(z.object(schema.inputSchema).parse(args)));
+  } }, temp, 5);
   const originalCreateWriteStream = nodeFs.createWriteStream;
   try {
     nodeFs.createWriteStream = () => new Writable({ write(_chunk, _enc, callback) {
@@ -30,7 +35,7 @@ try {
     } });
     for (const mode of ["compact", "full", "none"]) {
       const shell = await handlers.get("run_command")({ command: process.platform === "win32" ? "Write-Output shell-ok" : "echo shell-ok", output_mode:mode, output_chars:12000 });
-      assert.equal(shell.structuredContent.data.exit_code, 0);
+      assert.equal(shell.structuredContent.data.exit_code, 0, JSON.stringify(shell.structuredContent));
       assert.equal(shell.structuredContent.data.log_incomplete, true, mode);
       assert.equal(shell.structuredContent.data.log_error, "ENOSPC", mode);
     }

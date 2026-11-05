@@ -4,9 +4,14 @@ import fs from "node:fs";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
-// These sources exercise removed positive Relay/Companion flows. Keep them for
-// historical reproduction; current negative and shared-safety tests are below.
+// These sources exercise retired product contracts. Keep them for historical
+// reproduction; current direct-execution and shared-safety coverage is below.
 export const historicalTests = Object.freeze([
+  // v3.2 retires readiness-score and _intent-reference admission; test-v32-execution.ts
+  // covers direct execution, legacy metadata tolerance, operation dedupe and account isolation.
+  "scripts/test-requirement-readiness.mjs", "scripts/test-intent-reference.mjs",
+  // v3.2 replaces the retired numeric/order/iteration visual gates with test-v32-visual.ts.
+  "scripts/test-visual-review.mjs",
   "scripts/test-relay-goal-scope.mjs", "scripts/test-relay-foundation.mjs",
   "scripts/test-relay-manager.mjs", "scripts/test-relay-initial-driver-binding.mjs",
   "scripts/test-relay-orphan-recovery.mjs", "scripts/test-provision-storm-safety.mjs",
@@ -15,6 +20,12 @@ export const historicalTests = Object.freeze([
   "desktop/scripts/test-companion-capability.mjs", "scripts/test-desktop-relay-integration.mjs",
 ]);
 export const fullTests = Object.freeze([
+  "scripts/test-v32-execution.ts",
+  "scripts/test-v32-identity.ts",
+  "scripts/test-v32-skills.mjs",
+  "scripts/test-v32-tooling.ts",
+  "scripts/test-v32-process.mjs",
+  "scripts/test-v32-checkpoint-concurrency.mjs",
   "scripts/test-release-source-signature.mjs",
   "scripts/test-release-evidence-contract.mjs",
   "scripts/test-tools-list-budget.mjs",
@@ -95,7 +106,6 @@ export const fullTests = Object.freeze([
   "scripts/test-goal-run-policy.mjs",
   "scripts/test-goal-run-web.mjs",
   "scripts/test-goal-web-freeze.mjs",
-  "scripts/test-requirement-readiness.mjs",
   "scripts/test-worker-lifecycle.mjs",
   "scripts/test-visible-feedback-ledger.mjs",
   "scripts/test-invocation-gateway.mjs",
@@ -123,7 +133,7 @@ export const fullTests = Object.freeze([
   "scripts/verify-architecture.mjs",
   "scripts/test-shell-persist.mjs",
   "scripts/test-agent-harness.mjs",
-  "scripts/test-visual-review.mjs",
+  "scripts/test-v32-visual.ts",
   "scripts/test-svg-review-coverage.mjs",
   "scripts/test-office-visual-review.mjs",
   "scripts/test-mcp-upstream.mjs",
@@ -135,7 +145,6 @@ export const fullTests = Object.freeze([
   "scripts/test-runtime-race-repairs.mjs",
   "scripts/test-goal-run-crossprocess.mjs",
   "scripts/test-skill-resources.mjs",
-  "scripts/test-intent-reference.mjs",
   "scripts/test-result-phases.mjs",
   "scripts/test-retired-relay-compat.mjs",
   "scripts/test-retired-entrypoints.mjs",
@@ -149,6 +158,10 @@ export const fullTests = Object.freeze([
   "desktop/scripts/test-ipc-source.cjs"
 ]);
 export const dailyTests = Object.freeze([
+  "scripts/test-v32-execution.ts",
+  "scripts/test-v32-identity.ts",
+  "scripts/test-v32-skills.mjs",
+  "scripts/test-v32-process.mjs",
   "scripts/test-patch.mjs",
   "scripts/test-tools.mjs",
   "scripts/test-checkpoints.mjs",
@@ -181,13 +194,12 @@ export const dailyTests = Object.freeze([
   "scripts/test-invocation-gateway.mjs",
   "scripts/test-shell-persist.mjs",
   "scripts/test-agent-harness.mjs",
-  "scripts/test-visual-review.mjs",
+  "scripts/test-v32-visual.ts",
   "scripts/test-office-visual-review.mjs",
   "scripts/test-binary-upload-integrity.mjs",
   "scripts/test-runtime-race-repairs.mjs",
   "scripts/test-goal-run-crossprocess.mjs",
   "scripts/test-skill-resources.mjs",
-  "scripts/test-intent-reference.mjs",
   "scripts/test-result-phases.mjs",
   "scripts/test-retired-relay-compat.mjs",
   "scripts/test-retired-entrypoints.mjs",
@@ -208,10 +220,14 @@ export function assertTestManifest(base = root, full = fullTests, daily = dailyT
   for (const test of [...full, ...daily]) if (historicalTests.includes(test)) throw new Error(`Retired feature test in active suite: ${test}`);
 }
 const sourceTypeScriptTests = new Set([
+  "scripts/test-v32-visual.ts",
+  "scripts/test-v32-execution.ts",
+  "scripts/test-v32-identity.ts",
+  "scripts/test-v32-skills.mjs",
+  "scripts/test-v32-tooling.ts",
   "scripts/test-binary-upload-integrity.mjs",
   "scripts/test-runtime-race-repairs.mjs",
   "scripts/test-goal-run-crossprocess.mjs",
-  "scripts/test-intent-reference.mjs",
   "scripts/test-result-phases.mjs",
   "scripts/test-retired-relay-compat.mjs",
 ]);

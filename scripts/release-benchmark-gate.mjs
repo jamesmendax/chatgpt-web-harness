@@ -7,6 +7,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { performance } from 'node:perf_hooks';
+import { historicalTests } from './active-test-manifest.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const diagnosticsDir = path.resolve(root, '../diagnostics');
@@ -64,10 +65,11 @@ function runCase(entry) {
 }
 
 const stressScenarios = [
-  { name: 'http_drop_duplicate_large_payload', script: 'scripts/test-stream-survival.mjs', samples: 5 },
-  { name: 'source_dead_epoch_fencing', script: 'scripts/test-relay-manager.mjs', samples: 20 },
-  { name: 'turn_acceptance_and_ambiguity_fence', script: 'scripts/test-browser-turn-fence.mjs', samples: 50 },
-  { name: 'sse_last_event_id_replay', script: 'scripts/test-mcp-event-store.mjs', samples: 25 },
+  { name: 'http_drop_duplicate_large_payload', script: 'scripts/test-stream-survival.mjs', args: [], samples: 5 },
+  { name: 'retired_relay_compatibility_migration', script: 'scripts/test-retired-relay-compat.mjs', args: ['--import', 'tsx'], samples: 10 },
+  { name: 'operation_restart_unknown_no_replay', script: 'scripts/test-operation-recovery.mjs', args: [], samples: 10 },
+  { name: 'turn_acceptance_and_ambiguity_fence', script: 'scripts/test-browser-turn-fence.mjs', args: [], samples: 50 },
+  { name: 'sse_last_event_id_replay', script: 'scripts/test-mcp-event-store.mjs', args: [], samples: 25 },
 ];
 
 function runStreamRecoveryStress() {
@@ -76,7 +78,7 @@ function runStreamRecoveryStress() {
     const samples = [];
     for (let index = 0; index < scenario.samples; index++) {
       const started = performance.now();
-      const result = spawnSync(process.execPath, [scenario.script], {
+      const result = spawnSync(process.execPath, [...scenario.args, scenario.script], {
         cwd: root,
         encoding: 'utf8',
         windowsHide: true,
@@ -99,6 +101,7 @@ function runStreamRecoveryStress() {
     scenarios.push({
       name: scenario.name,
       script: scenario.script,
+      args: scenario.args,
       samples: samples.length,
       recovered,
       recovery_rate: recovered / samples.length,
@@ -116,7 +119,8 @@ function runStreamRecoveryStress() {
     scope: 'isolated local recovery fixtures; no live MCP/Tunnel or ChatGPT account',
     dimensions: [
       'real HTTP response loss with ten duplicate retries and oversized output',
-      'source-dead relay takeover with epoch fencing and same Goal',
+      'retired Relay compatibility migration preserves evidence and fences ambiguous deliveries',
+      'operation restart and unknown outcomes never replay side effects',
       'turn acceptance/completion/ambiguity fences',
       'persistent SSE Last-Event-ID replay',
     ],
@@ -188,6 +192,12 @@ async function localLatencyBenchmark() {
 
 function sha256(file) {
   return createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+}
+
+// Reject drift back into explicitly retired suites before running any build or fixture.
+for (const script of [...cases.map(entry => entry.args[0]), ...stressScenarios.map(entry => entry.script)]) {
+  if (historicalTests.includes(script)) throw new Error(`Benchmark references a historical test: ${script}`);
+  if (!fs.existsSync(path.join(root, script))) throw new Error(`Benchmark test is missing: ${script}`);
 }
 
 await fsp.mkdir(diagnosticsDir, { recursive: true });

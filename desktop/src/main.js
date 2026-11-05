@@ -16,12 +16,16 @@ const { createNotificationSound } = require("./notification-sound");
 const { SOUND_CHOICES, SOUND_IDS } = require("./notification-sound");
 const { customPath, importCustomWav } = require("./notification-audio-store");
 const { ensureNotificationShortcut } = require("./notification-identity");
-// Capture the Windows roaming folder before a portable profile changes paths.
-const notificationAppDataDir = app.getPath("appData");
+// Normal launches register in the Windows roaming folder. A marker-validated
+// acceptance fixture must keep notification links inside its private profile.
+let notificationAppDataDir = app.getPath("appData");
 
 const { profile } = require("./app-profile");
 if (profile.isolated) {
-  try { require("./isolated-runtime").initializeIsolatedRuntime(app); }
+  try {
+    const isolated = require("./isolated-runtime").initializeIsolatedRuntime(app);
+    if (isolated?.notificationAppDataDir) notificationAppDataDir = isolated.notificationAppDataDir;
+  }
   catch (error) {
     dialog.showErrorBox("隔离版启动被阻止", error.message);
     app.exit(1);
@@ -42,11 +46,33 @@ const { psQuote, runPowershell } = require("./shell-util");
 const { IdleWatch, IDLE_REMINDER_CHOICES, reminderMinutes } = require("./idle-watch");
 const { ConversationIndex } = require("./conversation-index");
 const { auraUrl, isTrustedIpcSource, installNavigationGuard } = require("./ipc-source");
+const { createRendererMemoryGuard } = require("./renderer-memory-guard");
 const auraFile = path.join(__dirname, "..", "renderer", "v3", "aura", "index.html");
-const expectedAuraUrl = auraUrl(auraFile);
+const normalAuraUrl = auraUrl(auraFile);
+const safeAuraUrl = normalAuraUrl + "&safeGraphics=1";
+let expectedAuraUrl = normalAuraUrl;
+const rendererSafeMarkerPath = () => path.join(app.getPath("userData"), "renderer-safe-graphics.json");
+function hasPersistedRendererSafeMode() {
+  try {
+    const state = JSON.parse(fs.readFileSync(rendererSafeMarkerPath(), "utf8"));
+    return state && state.schema === 1 && state.enabled === true;
+  } catch (_) { return false; }
+}
 
 const APP_NAME = profile.displayName;
 let mainWindow = null;
+let rendererMemoryTimer = null;
+// A renderer exceeding the hard bound must not silently reenable WebGL on
+// the next cold start. A reviewed repair can clear this local marker.
+let rendererGraphicsSafe = hasPersistedRendererSafeMode();
+let rendererRecoveryInProgress = false;
+const rendererCrashHistory = [];
+const rendererMemoryGuard = createRendererMemoryGuard();
+// GPU process private bytes can grow independently of Renderer private bytes.
+// Observe the Electron GPU process, but never kill it or any Node/MCP process.
+const gpuMemoryGuard = createRendererMemoryGuard({
+  warningMiB: 1024, criticalMiB: 1536, hardMiB: 2048, consecutive: 2,
+});
 let tray = null;
 let quitting = false;
 let statusTimer = null;
@@ -57,6 +83,20 @@ const accounts = new AccountManager({ app });
 const conversationIndex = new ConversationIndex({ rootFor: id => accounts.scope(id).dataDir });
 const services = accounts.services;
 const feeds = accounts.feeds;
+function persistRendererSafeMode(reason) {
+  rendererGraphicsSafe = true;
+  try {
+    const file = rendererSafeMarkerPath();
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    if (!fs.existsSync(file)) {
+      fs.writeFileSync(file, JSON.stringify({
+        schema: 1, enabled: true, reason, at: new Date().toISOString(),
+      }) + "\n", { flag: "wx", mode: 0o600 });
+    }
+  } catch (error) {
+    services.note("[renderer-guard] Could not persist safe graphics across restart: " + error.message);
+  }
+}
 // 每个账户、每个 ChatGPT 对话各自计时：开始调用工具后静默满设定时间，提醒一次。
 const idleWatch = new IdleWatch({
   minutesFor: (id) => reminderMinutes(accounts.readConfig(id)),
@@ -139,6 +179,7 @@ if (!app.requestSingleInstanceLock()) {
 }
 
 function createWindow() {
+  expectedAuraUrl = rendererGraphicsSafe ? safeAuraUrl : normalAuraUrl;
   const icon = iconPath();
   mainWindow = new BrowserWindow({
     width: 1120,
@@ -161,9 +202,34 @@ function createWindow() {
   });
   if (app.isPackaged) applyTaskbarIdentity(mainWindow, { appId: taskbarAppId, displayName: APP_NAME });
   mainWindow.setMenuBarVisibility(false);
-  installNavigationGuard(mainWindow.webContents, expectedAuraUrl);
+  installNavigationGuard(mainWindow.webContents, () => expectedAuraUrl);
   mainWindow.loadFile(auraFile, {
-    query: { desktop: "1" },
+    query: rendererGraphicsSafe ? { desktop: "1", safeGraphics: "1" } : { desktop: "1" },
+  });
+  const contents = mainWindow.webContents;
+  contents.on("render-process-gone", (_event, details) => {
+    if (quitting || !mainWindow || mainWindow.isDestroyed() || mainWindow.webContents !== contents) return;
+    rendererRecoveryInProgress = false;
+    rendererMemoryGuard.reset();
+    persistRendererSafeMode("render-process-gone");
+    expectedAuraUrl = safeAuraUrl;
+    const now = Date.now();
+    rendererCrashHistory.push(now);
+    while (rendererCrashHistory.length && rendererCrashHistory[0] < now - 300_000) rendererCrashHistory.shift();
+    const reason = String(details?.reason || "unknown");
+    services.note("[renderer-guard] Aura renderer stopped (" + reason + "); backend and tunnel remain untouched.");
+    if (rendererCrashHistory.length > 3) {
+      // Stop a crash/relaunch storm without stopping the protected MCP/tunnel.
+      dialog.showMessageBox(mainWindow, {
+        type: "error", title: "Web Harness 界面已进入保护状态",
+        message: "界面在五分钟内多次异常退出，已停止自动重启以保护系统内存。",
+        detail: "后台 MCP 和安全隧道保持运行。请保留诊断日志，确认问题后再重新打开程序。",
+        buttons: ["知道了"],
+      }).catch(() => {});
+      return;
+    }
+    contents.loadFile(auraFile, { query: { desktop: "1", safeGraphics: "1" } })
+      .catch(error => services.note("[renderer-guard] Static UI reload failed: " + error.message));
   });
   mainWindow.show();
   mainWindow.on("close", (event) => {
@@ -190,6 +256,52 @@ function createWindow() {
     if (/^https?:\/\//i.test(url)) shell.openExternal(url);
     return { action: "deny" };
   });
+}
+
+// The main process can still sample memory when the Chromium renderer hangs.
+// Only the exact current Aura OS PID is eligible; MCP/tunnel are never killed.
+function inspectRendererMemory() {
+  if (quitting || rendererRecoveryInProgress || !mainWindow || mainWindow.isDestroyed()) return;
+  const contents = mainWindow.webContents;
+  if (contents.isDestroyed()) return;
+  try {
+    const rendererPid = contents.getOSProcessId();
+    if (!Number.isSafeInteger(rendererPid) || rendererPid <= 0) return;
+    const metrics = app.getAppMetrics();
+    const observed = rendererMemoryGuard.sample(rendererPid, metrics);
+    const gpu = metrics.filter(m => m?.type === "GPU" && Number.isSafeInteger(m.pid))
+      .sort((a, b) => (b.memory?.privateBytes || 0) - (a.memory?.privateBytes || 0))[0];
+    const gpuObserved = gpu ? gpuMemoryGuard.sample(gpu.pid, metrics) : null;
+    if (rendererPid !== contents.getOSProcessId()) return;
+    const criticalRenderer = observed?.action === "recycle-renderer";
+    const criticalGpu = gpuObserved?.action === "recycle-renderer";
+    const warningRenderer = observed?.action === "reduce-gpu-load";
+    const warningGpu = gpuObserved?.action === "reduce-gpu-load";
+    if (!(criticalRenderer || criticalGpu || warningRenderer || warningGpu)) return;
+    // The static safety UI must not be crash-looped by GPU allocations cached
+    // after a previous WebGL context has already been released.
+    if (rendererGraphicsSafe && !criticalRenderer) return;
+    const source = criticalRenderer ? "renderer" : criticalGpu ? "GPU" : warningRenderer ? "renderer" : "GPU";
+    const pressure = criticalRenderer ? observed : criticalGpu ? gpuObserved : warningRenderer ? observed : gpuObserved;
+    const size = Math.round(pressure.privateMiB);
+    if (!criticalRenderer && !criticalGpu) {
+      services.note("[renderer-guard] Aura " + source + " PID " + pressure.pid + " private " + size +
+        " MiB: reducing dynamic WebGL load while preserving the orb and curtain.");
+      contents.executeJavaScript("window.AuraMemoryGuard?.reduceLoad()", true).catch(error => {
+        services.note("[renderer-guard] Dynamic GPU load reduction failed: " + error.message);
+      });
+      return;
+    }
+    rendererRecoveryInProgress = true;
+    persistRendererSafeMode("renderer-memory-emergency");
+    services.note("[renderer-guard] Aura " + source + " PID " + pressure.pid + " private " + size +
+      " MiB: recycling only the renderer; GPU/Node/MCP/tunnel processes are untouched.");
+    contents.forcefullyCrashRenderer();
+  } catch (error) {
+    rendererRecoveryInProgress = false;
+    rendererMemoryGuard.reset();
+    services.note("[renderer-guard] Memory observation/recovery failed: " + error.message);
+  }
 }
 
 function createTray() {
@@ -401,7 +513,7 @@ feeds.on("lines", ({ name, lines, accountId }) => {
 feeds.on("activity", entry => {
   if (!idleWatch.observeIdentity(entry.accountId,entry)) return;
   try {
-    conversationIndex.observe(entry.accountId,entry.conversationId,{hint:entry.hint,tool:entry.tool,at:entry.at});
+    conversationIndex.observe(entry.accountId,entry.conversationId,{hint:entry.hint,tool:entry.tool,at:entry.at,identitySource:entry.identitySource,identityVersion:entry.identityVersion});
   } catch (error) {
     try { accounts.run(entry.accountId,()=>services.note("[提醒] 会话名称索引暂不可写：" + error.message)); } catch {}
   }
@@ -461,6 +573,8 @@ async function bootstrap() {
   createTray();
   registerIpc();
   registerPowerRecovery();
+  rendererMemoryTimer = setInterval(inspectRendererMemory, 3_000);
+  rendererMemoryTimer.unref?.();
 
   statusTimer = setInterval(() => {
     accounts.refreshAll().catch(() => {});
@@ -650,7 +764,8 @@ function registerIpc() {
   }));
 
   ipcMain.handle("setup:run", wrap(async (payload) => {
-    accounts.assertStopped();
+    // Permit read-only polling; withBusy reserves the lifecycle operation.
+    accounts.assertStopped(accounts.currentId, { allowStatusRefresh: true });
     return services.withBusy(() => runSetup(payload || {}));
   }));
 
@@ -903,6 +1018,7 @@ async function runSetup(payload) {
 
 app.on("before-quit", () => {
   quitting = true;
+  if (rendererMemoryTimer) clearInterval(rendererMemoryTimer);
   idleNotifier.dispose();
   reminderSound.dispose();
   if (statusTimer) clearInterval(statusTimer);

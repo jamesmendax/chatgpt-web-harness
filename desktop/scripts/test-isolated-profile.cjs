@@ -223,6 +223,29 @@ test("early initialization replaces ambient runtime and fixes sessionData as wel
   assert.equal(f.env.CLC_RUNTIME_DIR, selected.runtime);
   assert.equal(f.env.ADMIN_TOKEN, undefined);
   assert.equal(f.env.DOTENV_CONFIG_PATH, undefined);
+  assert.equal(selected.notificationAppDataDir, undefined, "normal launches keep Windows notification registration");
+});
+
+test("real main routes fixture notification writes away from the native Windows Known Folder", () => {
+  const mainFile = path.join(__dirname, "../src/main.js");
+  const source = fs.readFileSync(mainFile, "utf8");
+  const boundary = source.indexOf("const taskbarAppId =");
+  assert.ok(boundary > 0);
+  const nativeAppData = path.join(root, ".validation", "host-known-folder-must-not-write");
+  const fixtureAppData = path.join(root, ".validation", "private-notification-fixture");
+  const run = initialized => {
+    const app = { getPath: name => { assert.equal(name, "appData"); return nativeAppData; } };
+    const loader = name => name === "electron" ? { app }
+      : name === "./app-profile" ? { profile: { isolated: true } }
+      : name === "./isolated-runtime" ? { initializeIsolatedRuntime: () => initialized }
+      : name.startsWith("./") ? {} : require(name);
+    const wrapper = vm.runInNewContext("(function(require,__dirname){" + source.slice(0, boundary) + "\nreturn notificationAppDataDir;})", {
+      process: { argv: ["electron", mainFile] }, console,
+    });
+    return wrapper(loader, path.dirname(mainFile));
+  };
+  assert.equal(run({ userData: "ordinary-profile" }), nativeAppData);
+  assert.equal(run({ userData: "fixture-profile", notificationAppDataDir: fixtureAppData }), fixtureAppData);
 });
 
 test("invalid CLI root and junction ancestors fail before any data creation", () => {
@@ -299,6 +322,7 @@ test("packaged clean-host fixture is marker-gated and scrubs its bootstrap secre
     const accepted = makeFixture();
     const selected = initializeIsolatedRuntime(accepted.app, { env: accepted.env });
     assert.equal(selected.userData, requested);
+    assert.equal(selected.notificationAppDataDir, fixtureAppData, "only a verified fixture receives private notification routing");
     assert.equal(accepted.paths.appData, fixtureAppData);
     assert.equal(accepted.paths.userData, requested);
     assert.equal(accepted.paths.sessionData, requested);
@@ -333,6 +357,10 @@ function runMainUntilLock(f) {
     if (name === "./services") return { Services: class { constructor() { f.events.push("services"); } } };
     if (name === "./feeds") return { ActivityFeeds: class {} };
     if (name === "./ipc-source") return realRequire(name);
+    // The main process constructs its real, pure memory guards before the
+    // single-instance lock. The isolation boundary fixture must supply that
+    // module rather than hiding it behind the catch-all empty stub.
+    if (name === "./renderer-memory-guard") return realRequire(name);
     if (name.startsWith("./") && name !== "./app-profile" && name !== "./taskbar-identity" && name !== "./idle-watch") return {};
     return realRequire(name);
   };

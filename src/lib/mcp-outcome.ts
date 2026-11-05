@@ -1,8 +1,9 @@
 import type { CallToolResult, RequestId } from "@modelcontextprotocol/sdk/types.js";
 import { toolFailureDiagnostic, type ToolFailureDiagnostic } from "./tool-diagnostics.js";
+import { getMcpRequestIdentity } from "./mcp-request-identity.js";
 
 export type McpRpcResultStatus = "success" | "error" | "unobserved";
-export type McpToolResultStatus = "success" | "error" | "unobserved";
+export type McpToolResultStatus = "success" | "error" | "running" | "unknown" | "unobserved";
 
 export interface McpOutcomeObservation {
   readonly rpc_result_status: McpRpcResultStatus;
@@ -11,6 +12,8 @@ export interface McpOutcomeObservation {
   readonly invocation_id?: string;
   readonly observed_at?: string;
   readonly failure?: ToolFailureDiagnostic;
+  readonly request_instance_id?: string;
+  readonly runtime_instance_id?: string;
 }
 
 interface StoredObservation {
@@ -30,9 +33,13 @@ const OUTCOME_TTL_MS = Number.isFinite(parsedTtl)
 const observations = new Map<string, StoredObservation[]>();
 let observationCount = 0;
 
-function observationKey(requestId: RequestId | undefined, tool: string): string | undefined {
+function observationKey(requestId: RequestId | undefined, tool: string, requestInstanceId?: string): string | undefined {
   if (requestId === undefined || requestId === null || !tool) return undefined;
-  return `${typeof requestId}:${String(requestId)}:${tool}`;
+  // RPC ids are only local to one request/transport. Never consume another
+  // request's observation just because its RPC id and tool name are identical.
+  const owner = requestInstanceId ?? getMcpRequestIdentity()?.requestInstanceId;
+  if (!owner) return undefined;
+  return JSON.stringify([owner, typeof requestId, requestId, tool]);
 }
 
 function prune(now = Date.now()): void {
@@ -62,12 +69,21 @@ function store(requestId: RequestId | undefined, tool: string, outcome: McpOutco
   const now = Date.now();
   prune(now);
   const queue = observations.get(key) ?? [];
-  queue.push({ outcome, stored_at_ms: now });
+  const identity = getMcpRequestIdentity();
+  queue.push({ outcome: { ...outcome,
+    request_instance_id: identity?.requestInstanceId,
+    runtime_instance_id: identity?.runtimeInstanceId,
+  }, stored_at_ms: now });
   observations.set(key, queue);
   observationCount++;
 }
 
 function classifyToolResult(result: CallToolResult): McpToolResultStatus {
+  const payload = result.structuredContent?.data;
+  if (payload && typeof payload === "object") {
+    const kind = (payload as Record<string, unknown>).outcome_kind;
+    if (kind === "running" || kind === "unknown") return kind;
+  }
   if (result.isError === true) return "error";
   if (result.structuredContent && typeof result.structuredContent === "object") {
     const ok = (result.structuredContent as Record<string, unknown>).ok;
@@ -111,10 +127,11 @@ export function observeMcpInvocationFailure(opts: {
 
 export function consumeMcpOutcome(
   requestId: RequestId | undefined,
-  tool: string | undefined
+  tool: string | undefined,
+  requestInstanceId?: string
 ): McpOutcomeObservation | undefined {
   if (!tool) return undefined;
-  const key = observationKey(requestId, tool);
+  const key = observationKey(requestId, tool, requestInstanceId);
   if (!key) return undefined;
   prune();
   const queue = observations.get(key);

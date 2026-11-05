@@ -1,4 +1,4 @@
-import fs from "fs/promises";
+import { physicalPromises as fs } from "./physical-fs.js";
 import path from "path";
 
 const DIRECTORY_INSTRUCTION_FILES = ["AGENTS.md", "CLAUDE.md", "CLAUDE.local.md"] as const;

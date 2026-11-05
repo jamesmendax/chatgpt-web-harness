@@ -1,0 +1,176 @@
+﻿From 37e36c7371da238518bf2128960958f533c692c7 Mon Sep 17 00:00:00 2001
+From: ChatGPT Web Harness Build <build@localhost>
+Date: Sat, 12 Sep 2026 02:33:19 +0800
+Subject: [PATCH] Extend terminal response retry window
+
+---
+ pkg/controlplane/internal/retry_after_test.go |  7 ++
+ .../internal/tunnel_service_client.go         | 74 +++++++++++++++----
+ .../internal/tunnel_service_client_test.go    |  4 +
+ 3 files changed, 70 insertions(+), 15 deletions(-)
+
+diff --git a/pkg/controlplane/internal/retry_after_test.go b/pkg/controlplane/internal/retry_after_test.go
+index 6e891d3..13a166d 100644
+--- a/pkg/controlplane/internal/retry_after_test.go
++++ b/pkg/controlplane/internal/retry_after_test.go
+@@ -623,6 +623,13 @@ func newResponseRetryTestClient(t *testing.T) *TunnelServiceClient {
+ 	return client
+ }
+ 
++func TestHarnessTerminalResponseRetryBudgetCoversProlongedNetworkOutage(t *testing.T) {
++	t.Parallel()
++	require.Equal(t, 3, defaultResponseRetryAttempts, "upstream notification budget must remain unchanged")
++	require.Equal(t, 256, defaultTerminalResponseRetryAttempts)
++	require.Equal(t, 15*time.Minute, defaultTerminalResponseRetryWindow)
++}
++
+ func deterministicResponseBackoff() *backoff.Backoff {
+ 	return &backoff.Backoff{
+ 		Min:    defaultBackoffMin,
+diff --git a/pkg/controlplane/internal/tunnel_service_client.go b/pkg/controlplane/internal/tunnel_service_client.go
+index 2af7102..997e93c 100644
+--- a/pkg/controlplane/internal/tunnel_service_client.go
++++ b/pkg/controlplane/internal/tunnel_service_client.go
+@@ -36,13 +36,23 @@ import (
+ )
+ 
+ const (
+-	pollPathFormat                        = "/v1/tunnels/%s/poll"
+-	responsePathFormat                    = "/v1/tunnels/%s/response"
+-	metadataPathFormat                    = "/v1/tunnels/%s"
+-	managedCloudflarePathFormat           = "/v1/tunnels/%s/cloudflare/runtime"
+-	maxControlPlaneErrorBodySize          = 64 * 1024
+-	tunnelIntegrationSocketEnv            = "TUNNEL_INTEGRATION_TUNNEL_SERVICE_SOCKET_PATH"
+-	defaultResponseRetryAttempts          = 3
++	pollPathFormat               = "/v1/tunnels/%s/poll"
++	responsePathFormat           = "/v1/tunnels/%s/response"
++	metadataPathFormat           = "/v1/tunnels/%s"
++	managedCloudflarePathFormat  = "/v1/tunnels/%s/cloudflare/runtime"
++	maxControlPlaneErrorBodySize = 64 * 1024
++	tunnelIntegrationSocketEnv   = "TUNNEL_INTEGRATION_TUNNEL_SERVICE_SOCKET_PATH"
++	defaultResponseRetryAttempts = 3
++	// Harness resilience patch: terminal JSON-RPC responses are idempotent at
++	// the tunnel-service boundary (404 is already treated as fulfilled), while
++	// transient 408/429/5xx and pre-response transport failures are retryable.
++	// Keep the upstream notification ambiguity guards unchanged, but give
++	// terminal result delivery enough bounded budget to ride through a prolonged
++	// control-plane outage without losing a tool result that already executed.
++	// The retry loop resends only the already-built response body; it never
++	// re-enters MCP dispatch or tool execution.
++	defaultTerminalResponseRetryAttempts  = 256
++	defaultTerminalResponseRetryWindow    = 15 * time.Minute
+ 	defaultManagedCloudflareRetryAttempts = 3
+ 	// The default tunnel-service route clamps requested poll waits below five
+ 	// seconds, so a learned proxy cutoff cannot safely reduce the wire timeout
+@@ -77,6 +87,8 @@ type TunnelServiceClient struct {
+ 	now                            func() time.Time
+ 	pollElapsedSince               func(time.Time) time.Duration
+ 	responseRetryAttempts          int
++	terminalResponseRetryAttempts  int
++	terminalResponseRetryWindow    time.Duration
+ 	newResponseBackoff             func() *backoff.Backoff
+ 	managedCloudflareRetryAttempts int
+ 	newManagedCloudflareBackoff    func() *backoff.Backoff
+@@ -154,6 +166,8 @@ func NewTunnelServiceClient(ctx context.Context, cfg *runtimeconfig.ControlPlane
+ 		now:                            time.Now,
+ 		pollElapsedSince:               time.Since,
+ 		responseRetryAttempts:          defaultResponseRetryAttempts,
++		terminalResponseRetryAttempts:  defaultTerminalResponseRetryAttempts,
++		terminalResponseRetryWindow:    defaultTerminalResponseRetryWindow,
+ 		newResponseBackoff:             newControlPlaneBackoff,
+ 		managedCloudflareRetryAttempts: defaultManagedCloudflareRetryAttempts,
+ 		newManagedCloudflareBackoff:    newControlPlaneBackoff,
+@@ -631,7 +645,19 @@ func (c *TunnelServiceClient) PostResponse(ctx context.Context, requestID types.
+ 		return "", fmt.Errorf("controlplane responder: marshal payload: %w", err)
+ 	}
+ 
+-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.responseEndpoint.String(), bytes.NewReader(body))
++	isNotification := response.Type() == types.ResponseTypeJSONRPCNotification
++	postCtx := ctx
++	postCancel := func() {}
++	if !isNotification {
++		window := c.terminalResponseRetryWindow
++		if window <= 0 {
++			window = defaultTerminalResponseRetryWindow
++		}
++		postCtx, postCancel = context.WithTimeout(ctx, window)
++	}
++	defer postCancel()
++
++	req, err := http.NewRequestWithContext(postCtx, http.MethodPost, c.responseEndpoint.String(), bytes.NewReader(body))
+ 	if err != nil {
+ 		return "", fmt.Errorf("controlplane responder: build request: %w", err)
+ 	}
+@@ -650,11 +676,17 @@ func (c *TunnelServiceClient) PostResponse(ctx context.Context, requestID types.
+ 	ctx = tunnelctx.ContextWithRequestID(ctx, requestID.String())
+ 	logger := tclog.LoggerWithContextIdentifiers(ctx, c.logger)
+ 
+-	attempts := c.responseRetryAttempts
++	attempts := c.terminalResponseRetryAttempts
++	if isNotification {
++		attempts = c.responseRetryAttempts
++	}
+ 	if attempts <= 0 {
+-		attempts = defaultResponseRetryAttempts
++		if isNotification {
++			attempts = defaultResponseRetryAttempts
++		} else {
++			attempts = defaultTerminalResponseRetryAttempts
++		}
+ 	}
+-	isNotification := response.Type() == types.ResponseTypeJSONRPCNotification
+ 	responseBackoff := c.responseBackoff()
+ 	for attempt := 1; attempt <= attempts; attempt++ {
+ 		attemptReq, err := cloneRequestWithBody(req)
+@@ -678,8 +710,14 @@ func (c *TunnelServiceClient) PostResponse(ctx context.Context, requestID types.
+ 			if attempt == attempts || (isNotification && requestWritten.Load()) {
+ 				return tunnelServiceRequestID, fmt.Errorf("controlplane responder: post response: %w", err)
+ 			}
+-			if !c.waitForRetry(ctx, responseBackoff.Duration()) {
+-				return tunnelServiceRequestID, retryWaitError(ctx)
++			if !c.waitForRetry(postCtx, responseBackoff.Duration()) {
++				if ctx.Err() != nil {
++					return tunnelServiceRequestID, retryWaitError(ctx)
++				}
++				if !isNotification {
++					return tunnelServiceRequestID, fmt.Errorf("controlplane responder: post response: %w", err)
++				}
++				return tunnelServiceRequestID, retryWaitError(postCtx)
+ 			}
+ 			continue
+ 		}
+@@ -708,8 +746,14 @@ func (c *TunnelServiceClient) PostResponse(ctx context.Context, requestID types.
+ 			}
+ 			retryAfter, hasRetryAfter := statusErr.RetryAfter()
+ 			delay := retryDelay(responseBackoff.Duration(), retryAfter, hasRetryAfter)
+-			if !c.waitForRetry(ctx, delay) {
+-				return tunnelServiceRequestID, retryWaitError(ctx)
++			if !c.waitForRetry(postCtx, delay) {
++				if ctx.Err() != nil {
++					return tunnelServiceRequestID, retryWaitError(ctx)
++				}
++				if !isNotification {
++					return tunnelServiceRequestID, statusErr
++				}
++				return tunnelServiceRequestID, retryWaitError(postCtx)
+ 			}
+ 		}
+ 	}
+diff --git a/pkg/controlplane/internal/tunnel_service_client_test.go b/pkg/controlplane/internal/tunnel_service_client_test.go
+index 359358f..b0ef543 100644
+--- a/pkg/controlplane/internal/tunnel_service_client_test.go
++++ b/pkg/controlplane/internal/tunnel_service_client_test.go
+@@ -1498,6 +1498,10 @@ func TestTunnelServiceClientPostResponseSurfacingNonSuccess(t *testing.T) {
+ 	if !assert.NoError(t, err, "NewTunnelServiceClient failed") {
+ 		return
+ 	}
++	// This case verifies surfacing a final 502 rather than the retry policy.
++	// The harness variant gives terminal responses a longer bounded retry
++	// window, so pin this assertion to one attempt.
++	client.terminalResponseRetryAttempts = 1
+ 
+ 	ctx := tunnelctx.ContextWithShardToken(context.Background(), "shard-502")
+ 	ctx = tunnelctx.ContextWithChannel(ctx, types.DefaultChannel)
+-- 
+2.54.0.windows.1
+

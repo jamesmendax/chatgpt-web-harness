@@ -1,6 +1,6 @@
 export const MCP_QUICKSTART = `
 ## Tool workflow (when agent_status is called)
-1. Requirement readiness applies to every task. Read-only discovery is allowed before READY; side effects require _intent with RRS >= 95 and zero blocking ambiguities.
+1. Use the connected tools directly with the parameters needed for the operation. Goal, Task, Skill and review records are optional work aids.
 2. Project memory + git state are already in MCP instructions from WORKSPACE_PATH.
 3. For another repo, call project_context(path, query) to receive only task-relevant instructions; call mode=full only when exact full documents are needed.
 4. Explore with glob (file names) and grep (content), then read_text_file.
@@ -18,13 +18,13 @@ All tools return JSON: { ok, tool, summary, data }
 - save_chatgpt_file: preferred path for ChatGPT conversation attachments; streams original bytes directly to disk
 - read_file_base64 / write_file_base64: binary transfer; prefer small chunks in ChatGPT web
 - apply_patch: single-file @@ hunks OR multi-file *** Begin Patch format
-- run_command: persistent shell (cd persists); full profile also exposes shell_status for explicit session inspection
+- run_command: PowerShell on Windows (write the script directly); executable + args[] launches exact arguments without another shell; full profile also exposes shell_status
 - start_process: long-running commands; follow with process_status / process_output / process_input / stop_process
 - visual_review: universal review for image/SVG/web/PDF/PPTX/DOCX with focus crops, diagnostics, comparison, and freshness tracking
 - task_state: compact long-task checkpoint; tool calls automatically add failures, checks, and changed files while active
 - full profile also contains experimental visual/browser/task tools; they stay hidden from ChatGPT web slim unless explicitly enabled
 - git_status / git_diff: structured inspection; use run_command for commit, restore, branch, and other Git mutations
-- rewind: action=list|preview|restore|status — undo file edits via automatic checkpoints
+- rewind: action=list|preview|restore|status — inspect best-effort checkpoints and their skipped/failed entries before restoring
 - enabled upstream MCP tools are exposed directly as <server>__<tool> (for example chrome-devtools__list_pages, linear__get_user); prefer direct tools
 - full profile keeps legacy convenience, browser, task-detail, and upstream-diagnostic tools; slim intentionally exposes one preferred path per operation
 
@@ -47,16 +47,11 @@ Path access follows the runtime policy. Relative paths resolve from default cwd;
 `.trim();
 
 export const REQUIREMENT_ASSURANCE_INSTRUCTIONS = `
-## Requirement readiness gate
-This gate applies to every user task. Before any side-effecting tool call, first establish a Requirement Model with at least 95% execution readiness and zero blocking ambiguities. Do not turn this into a fixed quality rubric: irrelevant fields are N/A, and only unknowns that materially change execution, outcome, risk, or completion criteria count against readiness. Use read-only discovery freely to close uncertainty before asking the user.
-
-Normal clarification is bounded: ask at most 5 high-value questions per round and at most 2 normal rounds. After round 2, do not keep asking normal questions; enter Resolution Stage using a low-risk recorded assumption, a user-delegated noncritical decision, a small forced choice, safe-prefix work, or a hard blocker only for key irreplaceable ambiguity whose wrong choice could be major/irreversible. "Do it directly" may delegate noncritical choices but never overrides a major irreversible blocker.
-
-Side-effecting tools expose a reserved _intent string. Send compact JSON with this shape before the first side effect and keep the same intent_revision while the requirement meaning is unchanged:
-{"intent_revision":1,"objective":"...","scope":["..."],"out_of_scope":[],"deliverables":[],"success_criteria":["..."],"constraints":[],"protected_resources":[],"known_facts":[],"assumptions":[],"delegated_decisions":[],"remaining_nonblocking_uncertainties":[],"closure_items":[],"ambiguities":[],"clarification_round":0,"questions_in_round":0,"resolution_mode":"none"}
-closure_items, when needed: {"id":"...","status":"closed|open|na","materiality":"low|medium|high|critical","basis":"..."}. ambiguities: {"id":"...","question":"...","materiality":"low|medium|high|critical","reversible":true|false,"blocking":true|false,"delegated":true|false}. The runtime computes RRS; never pass merely by claiming a confidence percentage. If the user changes objective, scope, protection boundary, or completion criteria, increment intent_revision before any further side effect.
-
-When available, the first result after full admission provides an accepted _intent reference and original expiry. Send its exact JSON string {"reference":{"intent_revision":1,"requirement_hash":"<full 64-character hash>"}} on subsequent side effects in the same account, workspace, session and Goal. The reference never extends expiry. If unavailable, expired, rejected, or the requirement changes, send the full current model again; do not rely on a shortened context hash.
+## Direct local execution
+Connection authentication, account boundaries and concrete resource checks apply. Call tools with execution parameters; work records and model evaluations do not authorize or block operations. Legacy product approval inputs and settings have no authorization meaning.
+Goal and Task records distinguish model declarations from checks that actually ran. Keep unmet checks visible. Visual records describe the actual images inspected and artifact version; scores and review order are optional information.
+Each operation returns its observed outcome. Preserve an uncertain operation receipt and inspect it before retrying that same operation ID; a new unrelated operation can proceed. Read checkpoint summaries because skipped files and failed snapshots cannot guarantee restoration.
+Conversation continuity is trusted only when the request includes supported conversation metadata. Transport sessions and titles are not conversation identities. Without trusted metadata, basic tools remain usable and continuity is unknown.
 `.trim();
 
 export function buildServerInstructions(

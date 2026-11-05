@@ -47,8 +47,8 @@ try {
     broker.appendHarnessRuntimeContextToResult(WS, baseResult(), { toolName: "fixture" })
   );
   assert.ok(
-    JSON.stringify(aResult.content).includes("MUST_CONTINUE_TO_TOOL"),
-    "owning session must receive the continuation tail"
+    JSON.stringify(aResult.content).includes("GOAL RECORD"),
+    "owning session must receive the Goal record"
   );
 
   // 2. Session B is completely unaffected: no tail, no snapshot goal.
@@ -56,8 +56,8 @@ try {
     broker.appendHarnessRuntimeContextToResult(WS, baseResult(), { toolName: "fixture" })
   );
   assert.ok(
-    !JSON.stringify(bResult.content).includes("MUST_CONTINUE_TO_TOOL"),
-    "other windows must not receive the continuation tail"
+    !JSON.stringify(bResult.content).includes("GOAL RECORD"),
+    "other windows must not receive the Goal record"
   );
   const bContext = await asSession("session-B", () => broker.buildHarnessRuntimeContext(WS, undefined));
   assert.ok(!bContext.goal, "other windows must not see the goal in harness context");
@@ -74,13 +74,13 @@ try {
   const aTask = await asSession("session-A", () =>
     tasks.createDurableTask(WS, { goal: "A's task", blocking_checks: [{ name: "a", passed: false }] })
   );
-  await assert.rejects(() => asSession("session-A", () => tasks.completeDurableTask(WS, aTask.id)),
-    /blocking check/, "the Task's own unmet check must still gate completion");
   await assert.rejects(() => asSession("session-B", () => tasks.completeDurableTask(WS, aTask.id)),
     /different ChatGPT window|TASK_.*OWNER|owner|session/i, "another session must not complete A's Task");
-  await asSession("session-A", () => tasks.updateDurableTask(WS, aTask.id, { blocking_checks: [{ name: "a", passed: true }] }));
   const aCompleted = await asSession("session-A", () => tasks.completeDurableTask(WS, aTask.id));
   assert.equal(aCompleted.status, "completed");
+  assert.equal(aCompleted.completion_basis.verification, "model_declared");
+  assert.equal(aCompleted.blocking_checks[0].passed, false);
+  assert.equal(aCompleted.completion_basis.unmet_checks[0].name, "a");
   const aGoalAfterTask = await asSession("session-A", () => goals.getGoal(WS));
   assert.equal(aGoalAfterTask.id, goal.id);
   assert.equal(aGoalAfterTask.revision, goal.revision);
@@ -128,8 +128,8 @@ try {
     broker.appendHarnessRuntimeContextToResult(WS, baseResult(), { toolName: "fixture" })
   );
   assert.ok(
-    JSON.stringify(cAfterBind.content).includes("MUST_CONTINUE_TO_TOOL"),
-    "after bind, the adopting window must receive the continuation tail"
+    JSON.stringify(cAfterBind.content).includes("GOAL RECORD"),
+    "after bind, the adopting window must receive the Goal record"
   );
   // A's independent shard goal is untouched by C's bind and still active.
   const aAfterBind = await asSession("session-A", () => goals.getGoal(WS));
@@ -138,8 +138,8 @@ try {
     broker.appendHarnessRuntimeContextToResult(WS, baseResult(), { toolName: "fixture" })
   );
   assert.ok(
-    JSON.stringify(aResultAfterBind.content).includes("MUST_CONTINUE_TO_TOOL"),
-    "A must still receive its own goal tail because its shard is independent"
+    JSON.stringify(aResultAfterBind.content).includes("GOAL RECORD"),
+    "A must still receive its own Goal record because its shard is independent"
   );
   // B's shard has been adopted by C, so B no longer sees an active goal.
   const bAfterBind = await asSession("session-B", () => goals.getGoal(WS));
@@ -148,7 +148,7 @@ try {
     broker.appendHarnessRuntimeContextToResult(WS, baseResult(), { toolName: "fixture" })
   );
   assert.ok(
-    !JSON.stringify(bResultAfterBind.content).includes("MUST_CONTINUE_TO_TOOL"),
+    !JSON.stringify(bResultAfterBind.content).includes("GOAL RECORD"),
     "B must not receive a tail after its goal is adopted by C"
   );
 

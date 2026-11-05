@@ -131,6 +131,7 @@ try {
   await assert.rejects(() => provider.status(), /outside the packaged layout/);
   process.env.HARNESS_BROWSER_USE_RUNTIME_LOCK = runtimeLock;
 
+  console.log("browser-use-provider: browser_exec start");
   const execResult = await provider.call("browser_exec", {
     code: [
       `new_tab(${JSON.stringify(url)})`,
@@ -145,7 +146,9 @@ try {
   assert.match(output, /Harness Browser Smoke/);
   assert.match(output, new RegExp(secretMarker));
 
+  console.log("browser-use-provider: browser_exec complete; browser_screenshot start");
   const screenshot = await provider.call("browser_screenshot", { full: false, max_dim: 1200 });
+  console.log("browser-use-provider: browser_screenshot complete");
   assert.notEqual(screenshot.isError, true, textContent(screenshot));
   const image = (screenshot.content ?? []).find((item) => item.type === "image");
   assert.ok(image?.data && Buffer.from(image.data, "base64").subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10])));
@@ -176,6 +179,19 @@ try {
   assert.match(audit, /"redacted":true/);
   assert.match(audit, /"browser_use_screenshot"/);
   console.log("browser-use-provider: pinned runtime, local navigation, stateful exec, screenshot, redacted audit, and exact owned-process teardown PASS");
+} catch (error) {
+  // Keep this fixture's startup diagnostics in the test log before its private
+  // profile is removed. Diagnostic errors must not replace the original error.
+  try {
+    const names = (await fs.readdir(dataDir)).filter(name => /^chrome-startup-[a-f0-9-]+\.json$/i.test(name));
+    for (const name of names) {
+      try { console.error("browser-use-provider startup diagnostic " + name + "\n" + await fs.readFile(path.join(dataDir, name), "utf8")); }
+      catch (diagnosticError) { console.error("browser-use-provider startup diagnostic read failed: " + String(diagnosticError)); }
+    }
+  } catch (diagnosticError) {
+    if (diagnosticError?.code !== "ENOENT") console.error("browser-use-provider startup diagnostic listing failed: " + String(diagnosticError));
+  }
+  throw error;
 } finally {
   if (provider) await provider.close().catch(() => undefined);
   await new Promise((resolve) => server.close(resolve));

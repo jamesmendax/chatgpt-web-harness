@@ -228,7 +228,7 @@ async function assertSessionBrokerIsolation() {
   );
   await withScope(workspace, "session-A", () => ensureGoalRunAuthority(workspace, goal));
 
-  let checkpoint;
+  let repeatedObservation;
   for (let index = 0; index < 40; index += 1) {
     const result = await withScope(workspace, "session-A", () =>
       appendHarnessRuntimeContextToResult(
@@ -238,9 +238,12 @@ async function assertSessionBrokerIsolation() {
       )
     );
     assert.doesNotMatch(resultText(result), /GOAL_NO_PROGRESS_BLOCKER/, "fast identical results inferred a timed blocker");
-    if (resultText(result).includes("GOAL_CHECKPOINT_DUE")) checkpoint = result;
+    if (resultText(result).includes("Matching work fingerprint:")) repeatedObservation = result;
   }
-  assert.ok(checkpoint, "fast repeated work lost its non-terminal checkpoint reminder");
+  assert.ok(repeatedObservation, "fast repeated work lost its factual observation");
+  assert.match(resultText(repeatedObservation), /repeats=\d+, observation_window_ms=\d+/);
+  assert.match(resultText(repeatedObservation), /does not prove a stall/);
+  assert.doesNotMatch(resultText(repeatedObservation), /GOAL_CHECKPOINT_DUE|GOAL_NO_PROGRESS_BLOCKER|MUST_CONTINUE_TO_TOOL/);
   const otherSessionResult = await withScope(workspace, "session-B", () =>
     appendHarnessRuntimeContextToResult(
       workspace,
@@ -248,7 +251,7 @@ async function assertSessionBrokerIsolation() {
       { toolName: "list_directory", rawArgs: { path: workspace } }
     )
   );
-  assert.doesNotMatch(resultText(otherSessionResult), /GOAL_NO_PROGRESS_BLOCKER|MUST_CONTINUE_TO_TOOL/, "one session's blocker leaked into another session");
+  assert.doesNotMatch(resultText(otherSessionResult), /Matching work fingerprint:|GOAL_NO_PROGRESS_BLOCKER|MUST_CONTINUE_TO_TOOL/, "one session's observation leaked into another session");
 }
 
 async function assertDistinctMcpWorkStaysRunning() {
@@ -296,7 +299,7 @@ async function assertDistinctMcpWorkStaysRunning() {
   });
 }
 
-async function assertRepeatedMcpReadBlocksAfterThirtyMinutes() {
+async function assertRepeatedMcpReadIsReportedAfterThirtyMinutes() {
   const workspace = path.join(tmpRoot, "repeated-work");
   await withServer(workspace, "repeated-session", async (client) => {
     const created = await client.callTool({
@@ -310,7 +313,7 @@ async function assertRepeatedMcpReadBlocksAfterThirtyMinutes() {
     data(created);
     const realDateNow = Date.now;
     let clock = realDateNow();
-    let blocker;
+    let lastObservation;
     try {
       Date.now = () => clock;
       for (let index = 0; index < 5; index += 1) {
@@ -319,20 +322,20 @@ async function assertRepeatedMcpReadBlocksAfterThirtyMinutes() {
           arguments: { path: workspace },
         });
         data(result);
-        const hasBlocker = resultText(result).includes("GOAL_NO_PROGRESS_BLOCKER");
-        if (index < 4) {
-          assert.equal(hasBlocker, false, "repeated empty-directory read blocked before thirty minutes");
-          clock += 10 * 60_000;
-        } else {
-          assert.equal(hasBlocker, true, "continuous exact repeats lasting thirty minutes did not block");
-          blocker = result;
-        }
+        assert.doesNotMatch(resultText(result), /GOAL_NO_PROGRESS_BLOCKER|GOAL_CHECKPOINT_DUE|MUST_CONTINUE_TO_TOOL/, "observations must not impose a blocker or continuation requirement");
+        if (index < 4) clock += 10 * 60_000;
+        else lastObservation = result;
       }
     } finally {
       Date.now = realDateNow;
     }
-    assert.ok(blocker, "repeated-result blocker result was not retained");
-    assert.doesNotMatch(resultText(blocker), /MUST_CONTINUE_TO_TOOL/, "blocker tail retained an unconditional continue lock");
+    assert.ok(lastObservation, "repeated-result observation was not retained");
+    const match = /Matching work fingerprint: repeats=(\d+), observation_window_ms=(\d+)/.exec(resultText(lastObservation));
+    assert.ok(match, "the final result omitted the observed repeat count and window");
+    assert.ok(Number(match[1]) >= 3 && Number(match[2]) >= GOAL_NO_PROGRESS_REPEAT_WINDOW_MS, "the observed count or window was incorrect");
+    assert.match(resultText(lastObservation), /does not prove a stall/);
+    const status = data(await client.callTool({name:"goal",arguments:{action:"status"}}));
+    assert.equal(status.goal.status, "active", "repeat observations must not pause the Goal");
   });
 }
 
@@ -340,8 +343,8 @@ try {
   await assertObservationSemantics();
   await assertSessionBrokerIsolation();
   await assertDistinctMcpWorkStaysRunning();
-  await assertRepeatedMcpReadBlocksAfterThirtyMinutes();
-  console.log("goal-work-progress: stable fingerprints, failed/control handling, process poll volatility, session isolation, varied-work continuity, saturation safety, and thirty-minute exact-repeat blocker PASS");
+  await assertRepeatedMcpReadIsReportedAfterThirtyMinutes();
+  console.log("goal-work-progress: stable fingerprints, failed/control handling, process poll volatility, session isolation, varied work, and timed repeat observations PASS");
 } finally {
   await fs.rm(tmpRoot, { recursive: true, force: true });
   for (const [key, value] of Object.entries(previous)) {

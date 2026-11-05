@@ -41,36 +41,42 @@ try {
   const ready = () => ({goal:"Deliver a bounded subtask", blocking_checks:[{name:"isolated regression",passed:true}],advisory_checks:[{name:"future work",passed:false}]});
 
   const failed = await owner(() => createDurableTask(workspace, {...ready(), blocking_checks:[{name:"unfinished test", passed:false}]}));
-  await assert.rejects(() => owner(() => completeDurableTask(workspace, failed.id)), /blocking check/i);
-  assert.equal((await owner(() => getDurableTask(workspace,failed.id))).status, "active");
-  await owner(() => updateDurableTask(workspace,failed.id,{blocking_checks:[{name:"now verified",passed:true}]}));
-  const done = await call("task_complete", {task_id:failed.id,note:"Isolated subtask done, parent still open"});
-  assert.equal(done.isError,undefined,"bounded subtask should close after local check passes");
+  const declared = await owner(() => completeDurableTask(workspace, failed.id, "Declared with unfinished test"));
+  assert.equal(declared.status, "completed");
+  assert.equal(declared.completion_basis.verification, "model_declared");
+  assert.equal(declared.completion_basis.unmet_checks[0]?.name, "unfinished test");
+  assert.equal(declared.completion_basis.unmet_checks[0]?.passed, false);
+  const passed = await owner(() => createDurableTask(workspace, ready()));
+  const done = await call("task_complete", {task_id:passed.id,note:"Isolated subtask done, parent still open"});
+  assert.equal(done.isError,undefined,"bounded subtask should close");
   assert.equal(done.structuredContent?.data?.task?.status,"completed",JSON.stringify(done.structuredContent));
   assert.equal(done.structuredContent?.data?.goal_still_active,true);
-  assert.equal(done.structuredContent?.data?.continue_execution,true);
-  assert.equal(done.structuredContent?.data?.deliverable_ready,true,"task readiness remains available");
+  assert.equal(done.structuredContent?.data?.completion_status,"model_declared");
+  assert.equal(done.structuredContent?.data?.deliverable_ready,false,"declaration alone does not verify deliverable quality");
   assert.doesNotMatch(done.structuredContent?.summary||"",/GOAL_DELIVERABLE_READY/);
   assert.equal((await owner(() => getGoal(workspace))).status,"active");
   assert.equal((await owner(() => getGoal(workspace))).revision,goal.revision);
   assert.notEqual((await readGoalRun(workspace,"owner-A"))?.run.state,"COMPLETED");
-  checks.push("task_complete closes passed Task but keeps Goal active and signals continuing work");
+  checks.push("task completion records unverified checks and preserves the active Goal");
 
   const next = await owner(() => createDurableTask(workspace, ready()));
   const second = await call("task_state", {action:"complete",task_id:next.id,note:"Only Task 2 is finished"});
   assert.equal(second.isError,undefined);
   assert.equal(second.structuredContent?.data?.handoff?.status,"completed");
   assert.equal(second.structuredContent?.data?.goal_still_active,true);
-  assert.equal(second.structuredContent?.data?.continue_execution,true);
+  assert.equal(second.structuredContent?.data?.completion_status,"model_declared");
   assert.equal(await owner(() => getActiveTaskId(workspace,"owner-A")),null);
-  checks.push("task_state completion emits Goal continuation and clears active Task pointer");
+  checks.push("task_state records declaration and clears the active Task pointer");
 
   const stale = await owner(() => createDurableTask(workspace, ready()));
   const stalePath = path.join(durableTaskDir(workspace),stale.id+".json");
   await fs.writeFile(stalePath,JSON.stringify({...JSON.parse(await fs.readFile(stalePath,"utf8")),goal_id:randomUUID()},null,2)+"\n");
-  await assert.rejects(() => owner(() => completeDurableTask(workspace,stale.id)),/TASK_GOAL_MISMATCH|TASK_GOAL_STALE/);
-  assert.equal((await owner(() => getDurableTask(workspace,stale.id))).status,"active");
-  checks.push("task whose recorded Goal ID is stale cannot be completed under current Goal");
+  const staleCompleted = await owner(() => completeDurableTask(workspace,stale.id));
+  assert.equal(staleCompleted.status,"completed");
+  assert.equal(staleCompleted.completion_basis.verification,"model_declared");
+  assert.equal((await owner(() => getGoal(workspace))).id,goal.id);
+  assert.equal((await owner(() => getGoal(workspace))).revision,goal.revision);
+  checks.push("stale Goal association does not block a Task declaration or change the current Goal");
 
   const foreign = await owner(() => createDurableTask(workspace, ready()));
   await assert.rejects(() => session("foreign-B",()=>completeDurableTask(workspace,foreign.id)),/different ChatGPT window|TASK_.*OWNER|owner|session/i);

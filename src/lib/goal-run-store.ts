@@ -14,6 +14,7 @@ import {
   type GoalRunWaitCondition,
 } from "./goal-run-state.js";
 import { getRuntimeScope } from "./runtime-scope.js";
+import { accountProjectDir } from "./account-project-scope.js";
 import { assertGoalCreationIdle, type DurableGoal, type GoalStatus } from "./goal-state-store.js";
 import { notifyStateInvalidated } from "./state-invalidate.js";
 import { withCanonicalFileLock } from "./safe-text-write.js";
@@ -491,7 +492,7 @@ function goalRunSessionSegment(sessionId: string | undefined): string | undefine
 export function goalRunPath(workspaceRoot: string, sessionId?: string): string {
   const normalizedRoot = normalizeWorkspaceRoot(workspaceRoot);
   const base = process.env.CODEX_HOME || path.join(os.homedir(), ".codex");
-  const projectDir = path.join(base, "projects", projectSlug(normalizedRoot));
+  const projectDir = accountProjectDir(path.join(base, "projects", projectSlug(normalizedRoot)));
   const seg = goalRunSessionSegment(sessionId ?? getRuntimeScope()?.mcpSessionId);
   return seg
     ? path.join(projectDir, "sessions", seg, GOAL_RUN_STORE_FILE_NAME)
@@ -517,7 +518,7 @@ async function withWorkspaceLock<T>(workspaceRoot: string, operation: () => Prom
   await previous.catch(() => undefined);
   try {
     const base = process.env.CODEX_HOME || path.join(os.homedir(), ".codex");
-    const target = path.join(base, "projects", projectSlug(workspaceRoot), ".goal-run-workspace");
+    const target = path.join(accountProjectDir(path.join(base, "projects", projectSlug(workspaceRoot))), ".goal-run-workspace");
     return await withCanonicalFileLock(target, operation);
   } finally {
     release();
@@ -1351,7 +1352,7 @@ export function importLegacyGoal(legacy: LegacyGoalInput): GoalRunEnvelope {
 
   const typedEvidence: GoalRunEvidence[] = [];
   const criteria = rows.map((row) => {
-    const confirmed = status === "completed" || row.passed;
+    const confirmed = row.passed;
     if (!confirmed) {
       return {
         id: goalRunCriterionId(row.name, row.index),
@@ -1390,6 +1391,14 @@ export function importLegacyGoal(legacy: LegacyGoalInput): GoalRunEnvelope {
     state: status === "completed" ? "COMPLETED" : status === "active" ? "RUNNING" : "INTERRUPTED",
     criteria,
     typedEvidence,
+    ...(status === "completed" && criteria.some(criterion => !criterion.confirmed) ? {
+      completionBasis: {
+        verification: "legacy_record" as const,
+        declaration: "Imported completed legacy Goal; unchecked criteria remain unverified",
+        declaredAt: completedAt!,
+        unverifiedCriterionIds: criteria.filter(criterion => !criterion.confirmed).map(criterion => criterion.id),
+      },
+    } : {}),
     nextAction: status === "completed" || status === "cancelled" ? null : base.nextAction,
     stopReason: status === "paused" || status === "cancelled"
       ? {

@@ -1,6 +1,7 @@
-import fs from "fs/promises";
+import { physicalPromises as fs } from "./physical-fs.js";
 import path from "path";
 import { randomUUID, createHash } from "node:crypto";
+import { withCanonicalFileLock } from "./safe-text-write.js";
 
 export interface CheckpointFileSnapshot {
   path: string;
@@ -11,6 +12,8 @@ export interface CheckpointFileSnapshot {
   children?: CheckpointFileSnapshot[];
   skipped?: boolean;
   skip_reason?: string;
+  blob?: string;
+  checkpoint_id?: string;
 }
 
 export interface CheckpointSummary {
@@ -20,10 +23,12 @@ export interface CheckpointSummary {
   summary: string;
   files: string[];
   file_count: number;
+  complete?: boolean;
+  skipped?: Array<{ path: string; reason: string }>;
 }
 
 interface CheckpointManifest {
-  version: 1;
+  version: 1 | 2;
   id: string;
   created_at: string;
   tool: string;
@@ -103,13 +108,27 @@ async function readIndex(): Promise<CheckpointIndex> {
 async function writeIndex(index: CheckpointIndex): Promise<void> {
   const root = getStoreRoot();
   await fs.mkdir(root, { recursive: true });
-  await fs.writeFile(indexPath(), JSON.stringify(index, null, 2), "utf-8");
+  const temp = path.join(root, `.index-${randomUUID()}.tmp`);
+  try {
+    await fs.writeFile(temp, JSON.stringify(index, null, 2), "utf-8");
+    await fs.rename(temp, indexPath());
+  } finally { await fs.rm(temp, { force: true }).catch(() => undefined); }
+}
+
+async function withIndexLock<T>(operation: () => Promise<T>): Promise<T> {
+  await fs.mkdir(getStoreRoot(), { recursive: true });
+  return withCanonicalFileLock(path.join(getStoreRoot(), ".checkpoint-index-lock"), operation);
 }
 
 async function readManifest(id: string): Promise<CheckpointManifest | null> {
   try {
     const raw = await fs.readFile(manifestPath(id), "utf-8");
-    return JSON.parse(raw) as CheckpointManifest;
+    const parsed = JSON.parse(raw) as CheckpointManifest;
+    if (parsed.version === 2) {
+      const lines = await fs.readFile(path.join(checkpointDir(id), "entries.jsonl"), "utf8");
+      parsed.files = lines.split("\n").filter(Boolean).map(line => ({ ...JSON.parse(line), checkpoint_id: id }));
+    }
+    return parsed;
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
     throw err;
@@ -200,6 +219,10 @@ async function restoreSnapshot(snapshot: CheckpointFileSnapshot): Promise<void> 
   }
 
   await fs.mkdir(path.dirname(target), { recursive: true });
+  if (snapshot.blob && snapshot.checkpoint_id) {
+    await fs.copyFile(path.join(checkpointDir(snapshot.checkpoint_id), snapshot.blob), target);
+    return;
+  }
   const buffer =
     snapshot.encoding === "base64"
       ? Buffer.from(snapshot.content || "", "base64")
@@ -262,46 +285,73 @@ export function getCheckpointConfig(): Record<string, unknown> {
   };
 }
 
-export async function checkpointBefore(
-  tool: string,
-  paths: string[],
-  options?: { summary?: string; dry_run?: boolean }
-): Promise<string | null> {
-  if (!isEnabled() || options?.dry_run) return null;
-
-  const uniquePaths = [...new Set(paths.map((p) => path.resolve(p)))];
-  if (uniquePaths.length === 0) return null;
-
-  const snapshots: CheckpointFileSnapshot[] = [];
-  for (const filePath of uniquePaths) {
-    snapshots.push(await snapshotFile(filePath));
-  }
-
+export interface CheckpointAttempt { id: string | null; complete: boolean; skipped: Array<{ path: string; reason: string }>; error?: string }
+export async function checkpointBeforeDetailed(
+  tool: string, paths: string[], options?: { summary?: string; dry_run?: boolean }
+): Promise<CheckpointAttempt> {
+  if (!isEnabled() || options?.dry_run || !paths.length) return { id: null, complete: true, skipped: [] };
+  const uniquePaths = [...new Set(paths.map(p => path.resolve(p)))];
+  const store = path.resolve(getStoreRoot());
+  const overlaps = uniquePaths.find(item => {
+    const relative = path.relative(item, store);
+    const reverse = path.relative(store, item);
+    const inside = (value: string) => value === "" || (!value.startsWith(".."+path.sep) && value !== ".." && !path.isAbsolute(value));
+    return inside(relative) || inside(reverse);
+  });
+  if (overlaps) return { id: null, complete: false, skipped: [{ path: overlaps, reason: "checkpoint store overlaps target" }], error: "Checkpoint store overlaps target; snapshot was not created" };
   const id = `cp_${randomUUID().replace(/-/g, "").slice(0, 12)}`;
-  const createdAt = new Date().toISOString();
-  const summary =
-    options?.summary ||
-    `${tool}: ${uniquePaths.length} path(s) — ${uniquePaths.map((p) => path.basename(p)).join(", ")}`;
-
-  const manifest: CheckpointManifest = {
-    version: INDEX_VERSION,
-    id,
-    created_at: createdAt,
-    tool,
-    summary,
-    files: snapshots,
-  };
-
   const dir = checkpointDir(id);
-  await fs.mkdir(dir, { recursive: true });
-  await fs.writeFile(manifestPath(id), JSON.stringify(manifest, null, 2), "utf-8");
-
-  const index = await readIndex();
-  index.checkpoints.push(buildSummary(manifest));
-  const pruned = await pruneCheckpoints(index);
-  await writeIndex(pruned);
-
-  return id;
+  const skipped: Array<{ path: string; reason: string }> = [];
+  let entries: Awaited<ReturnType<typeof fs.open>> | undefined;
+  try {
+    await fs.mkdir(path.join(dir, "blobs"), { recursive: true });
+    entries = await fs.open(path.join(dir, "entries.jsonl"), "wx");
+    let sequence = 0;
+    const record = async (entry: CheckpointFileSnapshot) => {
+      if (entry.skipped) skipped.push({ path: entry.path, reason: entry.skip_reason || "unknown" });
+      await entries!.writeFile(JSON.stringify(entry) + "\n");
+    };
+    const walk = async (filePath: string, depth: number): Promise<void> => {
+      let stat: Awaited<ReturnType<typeof fs.lstat>>;
+      try { stat = await fs.lstat(filePath); }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return record({ path: filePath, existed: false });
+        return record({ path: filePath, existed: true, skipped: true, skip_reason: String(error) });
+      }
+      if (stat.isSymbolicLink()) return record({ path: filePath, existed: true, skipped: true, skip_reason: "symbolic link not captured" });
+      if (stat.isDirectory()) {
+        if (depth > MAX_DIRECTORY_DEPTH) return record({ path: filePath, existed: true, is_directory: true, skipped: true, skip_reason: `directory depth exceeds ${MAX_DIRECTORY_DEPTH}` });
+        await record({ path: filePath, existed: true, is_directory: true });
+        try { const dirHandle = await fs.opendir(filePath); for await (const entry of dirHandle) await walk(path.join(filePath, entry.name), depth + 1); }
+        catch (error) { await record({ path: filePath, existed: true, skipped: true, skip_reason: `directory enumeration: ${String(error)}` }); }
+        return;
+      }
+      if (!stat.isFile() || stat.size > getMaxFileBytes()) return record({ path: filePath, existed: true, skipped: true,
+        skip_reason: stat.isFile() ? `file exceeds CHECKPOINT_MAX_FILE_BYTES (${stat.size} bytes)` : "unsupported file type" });
+      const blob = `blobs/${sequence++}`;
+      try { await fs.copyFile(filePath, path.join(dir, blob)); await record({ path: filePath, existed: true, blob }); }
+      catch (error) { await record({ path: filePath, existed: true, skipped: true, skip_reason: String(error) }); }
+    };
+    for (const item of uniquePaths) await walk(item, 0);
+    await entries.close(); entries = undefined;
+    const manifest: CheckpointManifest = { version: 2, id, created_at: new Date().toISOString(), tool,
+      summary: options?.summary || `${tool}: ${uniquePaths.length} path(s)`, files: uniquePaths.map(p => ({ path: p, existed: true })) };
+    await fs.writeFile(manifestPath(id), JSON.stringify(manifest), "utf8");
+    await withIndexLock(async () => {
+      const index = await readIndex();
+      index.checkpoints.push({ ...buildSummary(manifest), complete: skipped.length === 0, skipped });
+      await writeIndex(await pruneCheckpoints(index));
+    });
+    return { id, complete: skipped.length === 0, skipped };
+  } catch (error) {
+    await entries?.close().catch(() => undefined);
+    return { id: null, complete: false, skipped, error: String(error) };
+  }
+}
+export async function checkpointBefore(tool: string, paths: string[], options?: { summary?: string; dry_run?: boolean }): Promise<string | null> {
+  const attempt = await checkpointBeforeDetailed(tool, paths, options);
+  if (attempt.error) console.warn(`[checkpoint] ${tool}: ${attempt.error}`);
+  return attempt.id;
 }
 
 export async function listCheckpoints(limit = 50): Promise<CheckpointSummary[]> {
@@ -334,15 +384,23 @@ async function collectRestorePlan(targetId: string): Promise<{
   const files = new Map<string, CheckpointFileSnapshot>();
   const skipped: CheckpointFileSnapshot[] = [];
 
-  for (let i = 0; i < affected.length; i++) {
-    const manifest = await readManifest(affected[i].id);
-    if (!manifest) continue;
-    for (const snapshot of manifest.files) {
-      if (!files.has(snapshot.path)) {
-        files.set(snapshot.path, snapshot);
-        if (snapshot.skipped) skipped.push(snapshot);
-      }
+  const add = (snapshot: CheckpointFileSnapshot) => {
+    if (snapshot.skipped) {
+      skipped.push(snapshot);
+      // Preserve an enumeration error even when the directory entry preceded it.
+      if (!files.has(snapshot.path) || files.get(snapshot.path)?.is_directory) files.set(snapshot.path, snapshot);
+    } else if (!files.has(snapshot.path)) {
+      files.set(snapshot.path, { ...snapshot, children: undefined });
     }
+    for (const child of snapshot.children || []) add(child);
+  };
+  for (const checkpoint of affected) {
+    const manifest = await readManifest(checkpoint.id);
+    if (!manifest) {
+      const missing = { path: `[checkpoint ${checkpoint.id}]`, existed: true, skipped: true, skip_reason: "manifest or entries missing" };
+      skipped.push(missing); files.set(missing.path, missing); continue;
+    }
+    for (const snapshot of manifest.files) add(snapshot);
   }
 
   return { target, files, skipped };
@@ -432,35 +490,37 @@ export async function restoreToCheckpoint(targetId: string): Promise<{
         await fs.rm(filePath, { recursive: true, force: true });
         deleted.push(filePath);
       } catch (err) {
-        if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+        if ((err as NodeJS.ErrnoException).code !== "ENOENT") skipped.push({ path: filePath, reason: String(err) });
       }
       continue;
     }
 
-    await restoreSnapshot(snapshot);
-    restored.push(filePath);
+    try { await restoreSnapshot(snapshot); restored.push(filePath); }
+    catch (error) { skipped.push({ path: filePath, reason: String(error) }); }
   }
 
   // Remove checkpoints after the restore point (they are now stale).
-  const index = await readIndex();
-  const targetIndex = findCheckpointIndex(index.checkpoints, targetId);
-  const removed = index.checkpoints.splice(targetIndex);
-  for (const cp of removed) {
-    await removeCheckpointData(cp.id);
-  }
-  await writeIndex(index);
+  if (skipped.length) return { checkpoint: target, restored, deleted, skipped };
+  await withIndexLock(async () => {
+    const index = await readIndex();
+    const targetIndex = findCheckpointIndex(index.checkpoints, targetId);
+    if (targetIndex < 0) return;
+    const removed = index.checkpoints.splice(targetIndex);
+    for (const cp of removed) await removeCheckpointData(cp.id);
+    await writeIndex(index);
+  });
 
   return { checkpoint: target, restored, deleted, skipped };
 }
 
 export async function clearCheckpoints(): Promise<number> {
-  const index = await readIndex();
-  const count = index.checkpoints.length;
-  for (const cp of index.checkpoints) {
-    await removeCheckpointData(cp.id);
-  }
-  await writeIndex({ version: INDEX_VERSION, checkpoints: [] });
-  return count;
+  return withIndexLock(async () => {
+    const index = await readIndex();
+    const count = index.checkpoints.length;
+    for (const cp of index.checkpoints) await removeCheckpointData(cp.id);
+    await writeIndex({ version: INDEX_VERSION, checkpoints: [] });
+    return count;
+  });
 }
 
 export function checkpointFingerprint(paths: string[]): string {

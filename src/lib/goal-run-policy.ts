@@ -212,57 +212,20 @@ function normalizePolicies(
 
 function stateDirective(run: GoalRun, tracker: TruncationTracker): string {
   const wait = run.waitCondition;
-  const waitId = display(wait?.id, MAX_IDENTIFIER_BYTES, tracker, "matching-wait");
-
-  switch (run.state) {
-    case "RUNNING":
-      return "RUNNING: continue with tools while RUNNING; record verified evidence before confirming criteria.";
-    case "WAITING_TOOL": {
-      const toolName = wait?.kind === "TOOL" ? wait.toolName : "matching tool";
-      return `WAITING_TOOL: resume only when tool ${display(toolName, MAX_IDENTIFIER_BYTES, tracker, "matching-tool")} returns for wait ${waitId}; then continue with tools.`;
-    }
-    case "WAITING_EXTERNAL_PROCESS": {
-      const processRef = wait?.kind === "EXTERNAL_PROCESS" ? wait.processRef : "matching process";
-      const deadline = display(wait?.deadlineAt, MAX_IDENTIFIER_BYTES, tracker, "the persisted deadline");
-      const poll = wait?.kind === "EXTERNAL_PROCESS" ? String(wait.pollIntervalMs) : "the persisted interval";
-      return `WAITING_EXTERNAL_PROCESS: resume only when external process ${display(processRef, MAX_IDENTIFIER_BYTES, tracker, "matching-process")} is satisfied for wait ${waitId}; poll every ${poll}ms until ${deadline}, then recover on timeout.`;
-    }
-    case "WAITING_USER": {
-      const requestKey = wait?.kind === "USER" ? wait.requestKey : "matching request";
-      return `WAITING_USER: resume only after a user response for request ${display(requestKey, MAX_IDENTIFIER_BYTES, tracker, "matching-request")} for wait ${waitId}.`;
-    }
-    case "WAITING_CONTROL_PLANE": {
-      const cursor = display(run.resumeCursor, MAX_CURSOR_BYTES, tracker, "none");
-      return `WAITING_CONTROL_PLANE: preserve Goal state, receipts, and cursor ${cursor}; do not treat control-plane downtime as no progress. Resume automatically after a capability-proved browser/MCP lane returns.`;
-    }
-    case "READY_TO_FINALIZE":
-      return "READY_TO_FINALIZE: requires verified criteria; every criterion must be confirmed with non-launch evidence before completion.";
-    case "COMPLETED":
-      return "COMPLETED: no continuation; do not use more tools for this run.";
-    case "NO_PROGRESS_PAUSED": {
-      const cursor = display(run.resumeCursor, MAX_CURSOR_BYTES, tracker, "none");
-      return `NO_PROGRESS_PAUSED: exact consecutive results persisted for the configured window. Preserve cursor ${cursor}; resume only after user direction or a changed recovery condition.`;
-    }
-    case "INTERRUPTED": {
-      const cursor = display(run.resumeCursor, MAX_CURSOR_BYTES, tracker, "none");
-      if (run.stopReason?.terminal) {
-        return `INTERRUPTED: resume from cursor ${cursor} is unavailable after terminal cancellation; no continuation.`;
-      }
-      return `INTERRUPTED: resume from cursor ${cursor} only after an explicit resume; preserve the cursor.`;
-    }
+  const parts = [`Recorded state: ${run.state}`];
+  if (wait) {
+    parts.push(`wait=${display(wait.id, MAX_IDENTIFIER_BYTES, tracker, "unknown")}, kind=${wait.kind}, status=${wait.status}, deadline=${display(wait.deadlineAt, MAX_IDENTIFIER_BYTES, tracker, "unknown")}`);
+    if (wait.kind === "TOOL") parts.push(`tool=${display(wait.toolName, MAX_IDENTIFIER_BYTES, tracker, "unknown")}`);
+    if (wait.kind === "EXTERNAL_PROCESS") parts.push(`process=${display(wait.processRef, MAX_IDENTIFIER_BYTES, tracker, "unknown")}, poll_ms=${wait.pollIntervalMs}`);
+    if (wait.kind === "USER") parts.push(`request=${display(wait.requestKey, MAX_IDENTIFIER_BYTES, tracker, "unknown")}`);
   }
+  if (run.resumeCursor) parts.push(`cursor=${display(run.resumeCursor, MAX_CURSOR_BYTES, tracker, "unknown")}`);
+  if (run.stopReason) parts.push(`stop=${display(run.stopReason.code, MAX_IDENTIFIER_BYTES, tracker, "unknown")}, terminal=${run.stopReason.terminal}`);
+  if (run.completionBasis) parts.push(`completion=${run.completionBasis.verification}, unverified=${run.completionBasis.unverifiedCriterionIds.length}`);
+  return parts.join("; ") + ".";
 }
 
-function visibleHeartbeatDirective(run: GoalRun): string {
-  if (
-    run.state !== "RUNNING" &&
-    run.state !== "WAITING_TOOL" &&
-    run.state !== "WAITING_EXTERNAL_PROCESS"
-  ) {
-    return "";
-  }
-  return "heartbeat: after about 270s without user-visible assistant text, emit brief truthful progress before 300s and immediately continue; tool cards, MCP health, Goal revisions, and background stdout do not reset this timer.";
-}
+function visibleHeartbeatDirective(_run: GoalRun): string { return ""; }
 
 function criteriaLine(run: GoalRun, tracker: TruncationTracker): string {
   const confirmed = run.criteria.filter((criterion) => criterion.confirmed).length;
@@ -405,7 +368,7 @@ export function renderGoalRunPolicy(
   if (run.nextAction) {
     appendLine(
       lines,
-      `next: ${display(run.nextAction, MAX_ACTION_BYTES, tracker, "unspecified")}`,
+      `recorded next action (historical/model text; not an execution requirement): ${display(run.nextAction, MAX_ACTION_BYTES, tracker, "unspecified")}`,
       maxBytes,
       tracker,
       false

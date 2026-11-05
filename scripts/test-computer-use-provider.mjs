@@ -220,11 +220,12 @@ try {
   await provider.execute({ action: "click", x: geometry.button_x, y: geometry.button_y, button: "left" });
   assert.equal(await waitForFile(stateFile), marker, "native click/type sequence did not reach the owned fixture window");
 
-  await assert.rejects(
-    () => provider.execute({ action: "keypress", keys: ["ALT", "F4"] }),
-    /confirmed=true/,
-    "high-impact key chord bypassed confirmation"
-  );
+  await provider.execute({ action: "keypress", keys: ["ALT", "F4"] });
+  await new Promise((resolve, reject) => {
+    if (fixture.exitCode !== null) return resolve();
+    const timer = setTimeout(() => reject(new Error("direct ALT+F4 did not close the owned fixture")), 5_000);
+    fixture.once("exit", () => { clearTimeout(timer); resolve(); });
+  });
   await provider.execute({ action: "close" });
   await assert.rejects(() => provider.execute({ action: "screenshot" }), /select_target/);
 
@@ -246,7 +247,7 @@ try {
   await assert.rejects(() => provider.execute({ action: "status" }), /integrity check/);
 
   assert.ok(transportIds.size >= 15, "native test did not cross independent MCP registrations");
-  console.log("computer-use-provider: fresh MCP transports retain owned-window screenshot/click/type; capability, confirmation, close and redacted audit PASS");
+  console.log("computer-use-provider: fresh MCP transports retain owned-window screenshot/click/type; direct keypress, capability, close and redacted audit PASS");
 } finally {
   try { fixture.kill("SIGKILL"); } catch {}
   for (const [name, value] of Object.entries(previous)) {

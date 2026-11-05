@@ -1,0 +1,166 @@
+{
+  "schema_version": 1,
+  "title": "Web Harness 3.2.0 真实网页能力与恢复验收",
+  "status": "NOT_RUN",
+  "purpose": "冻结前验收计划；本清单不证明任何模型执行或候选验收。",
+  "prerequisites": [
+    "构建并冻结独立 3.2.0 候选；绑定完整源码、运行时、桌面资源、Portable/Setup EXE 的 SHA-256。",
+    "建立可核查的真实 ChatGPT 网页到该独立候选的连接；保持在用服务、账号和全局 apps 设置。",
+    "为每个场景使用合成账号、独立工作区与预先冻结的输入；记录实际宿主会话和工具调用。",
+    "若连接、宿主元数据、能力或测试环境不可用，标记 NOT_RUN 或 NOT_COVERED，并记录具体原因。"
+  ],
+  "binding": {
+    "source_sha256": null,
+    "runtime_manifest_sha256": null,
+    "desktop_resources_sha256": null,
+    "portable_exe_sha256": null,
+    "setup_exe_sha256": null,
+    "candidate_connection_evidence": null
+  },
+  "evaluation_rule": "机械检查仅证明对应事实；视觉、交互效果由人实际查看并记录。不得把模型声明、文件哈希、离线 fixture 或现有 alpha.1 的调用作为新候选真实网页验收。",
+  "cases": [
+    {
+      "id": "skill-frontend-design",
+      "skill": "anthropic.frontend-design",
+      "prompt": "在隔离工作区用现有技术栈制作一个有清晰层级、响应式布局和可操作状态的活动报名页面，运行并检查实际页面，交付源码和截图。",
+      "expected": [
+        "在完整目录中发现并加载适用技能，保留选择和读取证据；用户或项目同名覆盖时如实记录实际解析结果",
+        "页面在目标尺寸实际运行，填写和提交的合成流程可操作；记录浏览器、截图和未测部分",
+        "人工查看截图和页面，评审层级、可读性及交互状态"
+      ],
+      "evidence": [
+        "宿主会话与技能调用回执",
+        "正文和参考资源哈希与读取范围",
+        "源码及截图路径与哈希",
+        "实际浏览器观察和人工评审"
+      ],
+      "execution_status": "NOT_RUN",
+      "result": null
+    },
+    {
+      "id": "skill-webapp-testing",
+      "skill": "anthropic.webapp-testing",
+      "prompt": "检查隔离工作区里的计数器网页：连续点击 Add 两次应显示 2，Reset 后应显示 0；实际在浏览器验证并报告控制台错误和观察证据。",
+      "expected": [
+        "加载适用的网页测试技能",
+        "记录实际浏览器、两次点击、重置和控制台观察；缺少实际运行时标为未验证"
+      ],
+      "evidence": [
+        "宿主会话与技能调用回执",
+        "实际浏览器交互结果、控制台和截图",
+        "技能正文/引用哈希"
+      ],
+      "execution_status": "NOT_RUN",
+      "result": null
+    },
+    {
+      "id": "skill-web-artifacts-builder",
+      "skill": "anthropic.web-artifacts-builder",
+      "prompt": "在隔离工作区创建一个原生 HTML、CSS 和 JavaScript 的交互式预算计算小工具：输入项目和金额后计算合计，支持删除项目。实际运行并检查交互。",
+      "expected": [
+        "加载适用技能，使用任务允许的原生实现，不强制引入框架",
+        "用合成数据验证新增、合计和删除；检查响应式与可访问状态",
+        "人工查看实际产物，记录未覆盖的浏览器和视觉问题"
+      ],
+      "evidence": [
+        "宿主会话与技能调用回执",
+        "文件路径和哈希",
+        "交互结果、截图及人工评审"
+      ],
+      "execution_status": "NOT_RUN",
+      "result": null
+    },
+    {
+      "id": "skill-creator",
+      "skill": "anthropic.skill-creator",
+      "prompt": "在隔离工作区创建一个名为 release-note-helper 的技能，指导根据提供的合成变更记录生成准确发布说明。用发现、加载和引用读取机制验证，并验证不得虚构变更。",
+      "expected": [
+        "加载适用技能并只在测试目录创建技能",
+        "列表/精确 ID 加载/直接资源读取以及正负样例得到真实验证",
+        "输出文件哈希和实际检查结果，区别模型声明和独立验证"
+      ],
+      "evidence": [
+        "宿主会话与技能调用回执",
+        "技能和引用文件路径及哈希",
+        "目录/加载/资源读取及正负样例结果"
+      ],
+      "execution_status": "NOT_RUN",
+      "result": null
+    },
+    {
+      "id": "conversation-reconnect",
+      "prompt": "在一个真实 ChatGPT 聊天中使用独立候选记录一个带随机标记的合成 Goal 和 Task；按宿主支持的方法重连后继续查询并记录结果。",
+      "expected": [
+        "宿主可信会话身份和账户命名空间一致时记录保持连续",
+        "记录重连前后传输标识和状态；缺少宿主证据时标未知而非推定"
+      ],
+      "evidence": [
+        "独立候选连接和宿主会话证据",
+        "前后可信身份来源、状态记录及调用回执"
+      ],
+      "execution_status": "NOT_RUN",
+      "result": null
+    },
+    {
+      "id": "conversation-parallel",
+      "prompt": "打开两个独立真实 ChatGPT 聊天，分别在隔离候选下创建不同的合成 Goal/Task 和标记，交错读取与更新。",
+      "expected": [
+        "两个真实聊天的可信身份不同，各自状态和证据不互串",
+        "任何失败保留原始调用和结果，不用模型自报代替宿主身份"
+      ],
+      "evidence": [
+        "两个宿主会话证据",
+        "交错调用、身份和隔离结果",
+        "候选日志中关联的调用实例"
+      ],
+      "execution_status": "NOT_RUN",
+      "result": null
+    },
+    {
+      "id": "conversation-no-trusted-id",
+      "prompt": "在受支持的独立测试入口中构造缺失可信聊天元数据的请求，执行只读测试并查询状态；若真实网页宿主不能提供该条件，标记未覆盖。",
+      "expected": [
+        "基本调用可用且连续性明确 unknown；不得凭未经验证的 header 或传输 ID 创建正式聊天身份",
+        "保留实际宿主或测试入口的请求元数据证据，不伪称真实网页产生了该条件"
+      ],
+      "evidence": [
+        "可核查请求元数据来源及响应",
+        "调用身份/连续性字段和状态记录"
+      ],
+      "execution_status": "NOT_RUN",
+      "result": null
+    },
+    {
+      "id": "tool-error-and-dedup",
+      "prompt": "在隔离测试工作区触发一个可预测的文件或命令错误；随后用受支持的同一操作 ID 重试一个可计数的合成写入，并分别发起一个新操作。",
+      "expected": [
+        "记录真实失败阶段、错误码、退出码或超时及关联调用",
+        "同操作 ID 重试只发生一次副作用，新操作独立执行；无法控制宿主重试时标未覆盖",
+        "同一次错误的多层观察不重复计数，不同调用不误合并"
+      ],
+      "evidence": [
+        "真实网页宿主调用记录和操作 ID",
+        "目标文件计数、哈希和时间",
+        "相关请求、诊断与重试回执"
+      ],
+      "execution_status": "NOT_RUN",
+      "result": null
+    },
+    {
+      "id": "synthetic-account-upgrade",
+      "prompt": "使用隔离旧版合成账号，包含测试 Skills、MCP 注册、会话显示记录和通知偏好；按支持的升级流程迁移至独立 3.2.0 候选，重启并核验。",
+      "expected": [
+        "记录旧版和候选的 EXE、运行时哈希及迁移前后合成配置",
+        "核对允许迁移的各项及重启保持情况；缺项或回退限制如实报告",
+        "不触及真实账号、旧数据、在用实例或全局连接设置"
+      ],
+      "evidence": [
+        "合成数据的前后清单与哈希",
+        "独立实际候选运行与重启记录",
+        "升级、故障恢复及回退结果"
+      ],
+      "execution_status": "NOT_RUN",
+      "result": null
+    }
+  ]
+}

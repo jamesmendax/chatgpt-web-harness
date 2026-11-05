@@ -71,7 +71,7 @@ test("authenticated Admin activity forwards complete identity and task label wit
   feed.on("activity",e=>observed.push(e));
   feed.configure({adminPort:3457,tunnelPort:0,adminToken:"",mcpOnStdout:true});
   const id="oai_conv_eeeeffff"+"1".repeat(24);
-  entries=[{...entry("safe-task-label","task_create"),conversation_id:id,details:{conversation_label_hint:"SVG 动画制作"}}];
+  entries=[{...entry("safe-task-label","task_create"),conversation_id:id,details:{conversation_label_hint:"SVG 动画制作",conversation_continuity:"trusted",conversation_source:"openai/session"}}];
   await feed.pollMcpActivity();
   assert.deepEqual(observed.map(x=>[x.conversationId,x.hint,x.tool]),[[id,"SVG 动画制作","task_create"]]);
   await feed.pollMcpActivity();
@@ -79,6 +79,10 @@ test("authenticated Admin activity forwards complete identity and task label wit
   entries.push({...entry("short-only","task_state"),conversation_id:"oai_conv_eeeeffff"});
   await feed.pollMcpActivity();
   assert.equal(observed.length,1,"unverified short identity not forwarded");
+  entries.push({...entry("legacy-header","task_state"),conversation_id:id});
+  entries.push({...entry("conflicting-source","task_state"),conversation_id:id,details:{conversation_continuity:"conflict",conversation_source:"conflict"}});
+  await feed.pollMcpActivity();
+  assert.equal(observed.length,1,"missing or conflicting identity provenance never creates a formal label");
 });
 
 
@@ -131,7 +135,7 @@ test("a listener that reconfigures during activity delivery stops the old respon
   feed.configure({ adminPort: 1, tunnelPort: 0, adminToken: "" });
   feed.on("activity", () => feed.configure({ adminPort: 2, tunnelPort: 0, adminToken: "" }));
   feed.on("lines", value => lines.push(value));
-  entries = [{ ...entry("old", "read"), conversation_id: "oai_conv_" + "b".repeat(32) }];
+  entries = [{ ...entry("old", "read"), conversation_id: "oai_conv_" + "b".repeat(32), details:{conversation_continuity:"trusted",conversation_source:"openai/session"} }];
   await feed.pollMcpActivity();
   assert.deepEqual(lines, []);
   assert.equal(feed.lastActivityId, null);

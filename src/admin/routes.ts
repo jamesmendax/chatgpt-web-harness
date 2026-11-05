@@ -24,17 +24,6 @@ import {
   type ActivityEntry,
 } from "../lib/activity-log.js";
 
-// RI strict mode cannot be enabled safely after the main server has already
-// initialized its HTTP routes and background workers. Operator-side control
-// inputs also must not be rebound by the same generic Admin env writer.
-const RECOVERY_IMMUTABLE_ENV_KEYS = new Set([
-  "HARNESS_RECOVERY_SCOPE_MODE",
-  "HARNESS_RECOVERY_ISOLATED",
-  "HARNESS_RECOVERY_HMAC_KEY",
-  "HARNESS_RECOVERY_GRANT_FILE",
-  "HARNESS_RECOVERY_HEAD_PATH",
-  "HARNESS_RECOVERY_ATTESTATION_FILE",
-]);
 
 function parseDotEnv(text: string): Record<string, string> {
   const out: Record<string, string> = {};
@@ -137,16 +126,6 @@ export function createAdminRouter(manager: McpUpstreamManager, options: {
       const values = req.body?.values as Record<string, string>;
       if (!values || typeof values !== "object") {
         res.status(400).json({ ok: false, error: "values object required" });
-        return;
-      }
-      // On Windows process.env is case-insensitive. Reject mixed-case aliases
-      // as well, and reject the entire transaction before any file/env write.
-      if (Object.keys(values).some((key) => RECOVERY_IMMUTABLE_ENV_KEYS.has(key.toUpperCase()))) {
-        res.status(409).json({
-          ok: false,
-          error: "RI_CONTROL_PLANE_IMMUTABLE",
-          detail: "Recovery Integrity mode and operator authority controls are startup-only; configure them out of band and restart under verified launch policy.",
-        });
         return;
       }
       let original = "";

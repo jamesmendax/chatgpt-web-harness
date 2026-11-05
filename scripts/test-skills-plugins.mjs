@@ -140,8 +140,25 @@ try {
   serverTransport.sessionId = "skills-plugin-test-session";
 
   try {
-    const listed = await client.callTool({ name: "list_skills", arguments: {} });
-    const skills = listed.structuredContent?.data?.skills ?? [];
+    // The compact catalog is byte-budgeted. Enumerate every page before
+    // asserting presence or absence; built-ins can fill the first page.
+    async function listAllSkills() {
+      const all = [];
+      let offset = 0;
+      do {
+        const listed = await client.callTool({ name: "list_skills", arguments: { offset } });
+        assert.equal(listed.structuredContent?.ok, true);
+        const page = listed.structuredContent.data;
+        assert.ok(Array.isArray(page.skills));
+        assert.ok(!page.skipped?.length, "fixture metadata must fit the catalog page");
+        all.push(...page.skills);
+        assert.ok(page.next_offset === null || page.next_offset > offset, "catalog pagination must advance");
+        offset = page.next_offset;
+        if (offset === null) assert.equal(all.length, page.total, "complete catalog must contain every entry");
+      } while (offset !== null);
+      return all;
+    }
+    const skills = await listAllSkills();
     const projectSkill = skills.find((skill) => skill.name === "project-fixture");
     const externalSkill = skills.find((skill) => skill.name === "open-source-fixture");
     const installedSkill = skills.find((skill) => skill.name === "presentation");
@@ -175,12 +192,12 @@ try {
     await fs.writeFile(path.join(installSource, "SKILL.md"), "---\nname: new-alias\ndescription: new skill\n---\n# new\n");
     const installedByTool = await client.callTool({ name: "install_skill", arguments: { source: installSource, id: "new-skill", _intent: TEST_INTENT } });
     assert.equal(installedByTool.structuredContent?.ok, true);
-    const afterInstall = await client.callTool({ name: "list_skills", arguments: {} });
-    assert.ok((afterInstall.structuredContent?.data?.skills ?? []).some((skill) => skill.name === "new-skill"));
+    const afterInstall = await listAllSkills();
+    assert.ok(afterInstall.some((skill) => skill.name === "new-skill"));
     const disabledByTool = await client.callTool({ name: "set_skill_enabled", arguments: { id: "new-skill", enabled: false, _intent: TEST_INTENT } });
     assert.equal(disabledByTool.structuredContent?.ok, true);
-    const hidden = await client.callTool({ name: "list_skills", arguments: {} });
-    assert.ok(!(hidden.structuredContent?.data?.skills ?? []).some((skill) => skill.name === "new-skill"));
+    const hidden = await listAllSkills();
+    assert.ok(!hidden.some((skill) => skill.name === "new-skill"));
     const removedByTool = await client.callTool({ name: "uninstall_skill", arguments: { id: "new-skill", _intent: TEST_INTENT } });
     assert.equal(removedByTool.structuredContent?.ok, true);
     assert.equal(await fs.stat(path.join(installedDir, "new-skill")).then(() => true).catch(() => false), false);

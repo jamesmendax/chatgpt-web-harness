@@ -61,7 +61,7 @@ try {
   const b = await inSession('session-B', () => createGoal(workspace, {
     objective: 'Goal B', success_criteria: [{ name: 'B work', passed: false }],
   }));
-  assert.equal((await getWorkspaceGoalProjection(workspace)).id, b.id, 'fixture must expose B as latest global projection');
+  assert.equal((await inSession('session-B', () => getWorkspaceGoalProjection(workspace))).id, b.id, 'fixture must expose B as latest account-local projection');
 
   const firstA = await invoke('session-A', { label: 'A first', _intent: intent('A') }, 'first');
   assert.equal(firstA.goal, a.id);
@@ -69,53 +69,43 @@ try {
   const firstB = await invoke('session-B', { label: 'B first', _intent: intent('B') }, 'first');
   assert.equal(firstB.goal, b.id);
   assert.equal(firstB.owner, 'session-B');
-  const aContract = await readAcceptedExecutionContractState(workspace, 'session-A', a.id);
-  const bAccepted = await readAcceptedExecutionContractState(workspace, 'session-B', b.id);
-  const reference = contract => JSON.stringify({ reference: {
-    intent_revision: contract.intent_revision, requirement_hash: contract.requirement_hash,
-  } });
-
   // The gateway enters before its own AsyncLocal scope. Explicit host session A
   // must win even when a caller happens to have B in an outer asynchronous chain.
   const nestedA = await inSession('session-B', () => invoke('session-A', {
-    label: 'A scoped reference', goal_id: b.id, _intent: reference(aContract),
+    label: 'A ignores spoofed goal', goal_id: b.id, _intent: '{invalid',
   }, 'inherited-A'));
   assert.equal(nestedA.goal, a.id);
   assert.equal(nestedA.session, 'session-A');
-  assert.equal((await invoke('session-B', { label: 'B scoped reference', _intent: reference(bAccepted) }, 'inherited-B')).goal, b.id);
+  assert.equal((await invoke('session-B', { label: 'B ignores legacy intent', _intent: '{invalid' }, 'inherited-B')).goal, b.id);
 
   const before = calls.length;
-  const denied = await gateway.invoke('write_file', [{
+  const unrelated = await gateway.invoke('write_file', [{
     label: 'C cannot borrow A', goal_id: a.id,
   }, extra('session-C', 'foreign')]);
-  assert.equal(denied.isError, true);
-  assert.equal(calls.length, before, 'foreign session executed without its own accepted requirement');
-  assert.equal((await getGoal(workspace, 'session-A')).id, a.id);
-  assert.equal((await getGoal(workspace, 'session-B')).id, b.id);
+  assert.notEqual(unrelated.isError, true);
+  assert.equal(calls.length, before + 1, 'unrelated session executes without inherited Goal');
+  assert.equal(unrelated.structuredContent.goal, undefined);
+  assert.equal((await inSession('session-A', () => getGoal(workspace, 'session-A'))).id, a.id);
+  assert.equal((await inSession('session-B', () => getGoal(workspace, 'session-B'))).id, b.id);
   assert.equal(await readDriverLease(workspace, a.id), null);
   assert.equal(await readDriverLease(workspace, b.id), null);
   const aReceipts = await listOperationInspections(workspace, 256, a.id);
   const bReceipts = await listOperationInspections(workspace, 256, b.id);
-  assert.equal(aReceipts.length, 2);
-  assert.equal(bReceipts.length, 2);
-  assert.ok(aReceipts.every(receipt => receipt.goal_id === a.id));
-  assert.ok(bReceipts.every(receipt => receipt.goal_id === b.id));
+  assert.equal(aReceipts.filter(receipt => receipt.goal_id === a.id).length, 2);
+  assert.equal(bReceipts.filter(receipt => receipt.goal_id === b.id).length, 2);
+  assert.ok(aReceipts.every(receipt => !receipt.goal_id || receipt.goal_id === a.id));
+  assert.ok(bReceipts.every(receipt => !receipt.goal_id || receipt.goal_id === b.id));
   const replacement = await inSession('session-A', () => createGoal(workspace, {
     objective: 'Goal A replacement', success_criteria: [{ name: 'new work', passed: false }],
   }));
   const callsBeforeReplacement = calls.length;
-  const staleContract = await gateway.invoke('write_file', [{ label: 'must not inherit old Goal', _intent: reference(aContract) }, extra('session-A', 'replacement-stale-reference')]);
-  assert.equal(staleContract.isError, true);
-  assert.match(JSON.stringify(staleContract), /INTENT_REFERENCE/);
-  assert.equal(calls.length, callsBeforeReplacement);
+  const staleContract = await gateway.invoke('write_file', [{ label: 'must not inherit old Goal', _intent: '{invalid' }, extra('session-A', 'replacement-stale-reference')]);
+  assert.notEqual(staleContract.isError, true);
+  assert.equal(staleContract.structuredContent.goal, replacement.id);
+  assert.equal(calls.length, callsBeforeReplacement + 1);
   assert.equal((await invoke('session-A', { label: 'replacement fresh intent', _intent: intent('replacement') }, 'replacement-ready')).goal, replacement.id);
-  assert.equal(await readAcceptedExecutionContractState(workspace, 'session-A', a.id), null);
-  const bContract = await readAcceptedExecutionContractState(workspace, 'session-B', b.id);
-  assert.equal(bContract.goal_id, b.id);
-  await assert.rejects(inheritAcceptedExecutionContractState(workspace, 'session-B', 'standby',
-    bContract.requirement_hash, bContract.intent_revision, replacement.id), /RELAY_EXECUTION_CONTRACT_MISMATCH/);
-  assert.equal((await invoke('session-B', { label: 'B after A replacement', _intent: reference(bAccepted) }, 'B-still-owned')).goal, b.id);
-  console.log('Gateway Goal isolation: explicit session authority, scoped intent references, ambient-scope mismatch, spoof rejection, scoped receipts and replacement contract fencing passed');
+  assert.equal((await invoke('session-B', { label: 'B after A replacement' }, 'B-still-owned')).goal, b.id);
+  console.log('Gateway Goal isolation: session ownership, spoof resistance, direct execution and scoped receipts passed');
 } finally {
   for (const [key, value] of saved) {
     if (value === undefined) delete process.env[key]; else process.env[key] = value;

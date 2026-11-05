@@ -2,6 +2,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import * as crypto from "node:crypto";
 import type { RequestId } from "@modelcontextprotocol/sdk/types.js";
 import type { GoalEffectLease } from "./goal-effect-scope.js";
+import { getMcpRequestIdentity, resolveMcpConversationIdentity, MCP_RUNTIME_INSTANCE_ID } from "./mcp-request-identity.js";
 
 /** Trusted, process-side values used to build one invocation scope. */
 export interface RuntimeScopeSeed {
@@ -16,6 +17,7 @@ export interface RuntimeScopeSeed {
 
 /** The request metadata that is safe and useful at the tool callback boundary. */
 export interface RequestContext {
+  readonly _meta?: unknown;
   readonly sessionId?: string;
   readonly signal?: AbortSignal;
   readonly requestId?: RequestId;
@@ -24,6 +26,10 @@ export interface RequestContext {
 /** Per-invocation state shared through the asynchronous call chain. */
 export interface RuntimeScope {
   invocationId: string;
+  requestInstanceId?: string;
+  runtimeInstanceId?: string;
+  conversationSessionId?: string;
+  conversationContinuity?: "trusted" | "unknown" | "conflict";
   mcpSessionId?: string;
   /** Captured from this session's authoritative Goal, never from tool arguments. */
   goalId?: string;
@@ -78,9 +84,17 @@ export function createRuntimeScope(
   seed: RuntimeScopeSeed,
   requestContext?: RequestContext
 ): RuntimeScope {
+  const identity = getMcpRequestIdentity();
+  const conversation = resolveMcpConversationIdentity(requestContext?._meta);
+  const invocationId = crypto.randomUUID();
   return {
-    invocationId: crypto.randomUUID(),
-    mcpSessionId: requestContext?.sessionId ?? seed.fallbackSessionId,
+    invocationId,
+    requestInstanceId: identity?.requestInstanceId,
+    runtimeInstanceId: identity?.runtimeInstanceId ?? MCP_RUNTIME_INSTANCE_ID,
+    conversationSessionId: conversation.conversationSessionId,
+    conversationContinuity: conversation.continuity,
+    mcpSessionId: conversation.conversationSessionId ?? (conversation.continuity === "conflict"
+      ? `unattributed_${invocationId}` : requestContext?.sessionId ?? seed.fallbackSessionId),
     tunnelProfile: seed.tunnelProfile,
     principalId: seed.principalId,
     workspaceRoot: seed.workspaceRoot,

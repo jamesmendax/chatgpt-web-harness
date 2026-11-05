@@ -156,7 +156,10 @@ function unusedOperations() {
   const evidenceError = new Error("required evidence persistence failed");
   const pipeline = new WebHarnessResultPipeline({ ...unusedOperations(),
     appendGoalRunEvidenceToResult() { throw evidenceError; } });
-  await assert.rejects(pipeline.processSuccess(context, toolResult("effect already returned")), error => error === evidenceError);
+  const degraded = await pipeline.processSuccess(context, toolResult("effect already returned"));
+  assert.equal(degraded.isError, undefined);
+  assert.deepEqual(degraded.content, toolResult("effect already returned").content);
+  assert.equal(degraded._meta["harness/postprocessing_warnings"][0].stage, "goal_evidence");
 }
 
 {

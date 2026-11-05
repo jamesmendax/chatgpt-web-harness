@@ -1,53 +1,46 @@
 import fs from "node:fs";
-import { chromium } from "playwright-core";
+import { chromium, type Browser } from "playwright-core";
+import { verifiedOfflineBrowserPath } from "./browser-use-provider.js";
 
-/** Shared browser executable discovery used by both visual rendering and the
- * persistent browser tools. Keep platform detection in lib so tool adapters do
- * not depend on each other. */
 export function browserCandidates(): string[] {
-  const envPath = process.env.CHATGPT_BROWSER_PATH?.trim();
+  const explicit = process.env.CHATGPT_BROWSER_PATH?.trim();
+  if (explicit) return [explicit];
   const candidates: string[] = [];
-  if (envPath) candidates.push(envPath);
-
-  // playwright-core is protocol-coupled to its downloaded Chromium revision.
-  // Prefer that exact binary when it is installed; a newer system Edge/Chrome
-  // can accept the process launch but exit before the CDP pipe is established.
-  // CHATGPT_BROWSER_PATH remains the explicit operator override.
-  try {
-    const bundled = chromium.executablePath();
-    if (bundled) candidates.push(bundled);
-  } catch {}
-
-  if (process.platform === "win32") {
-    candidates.push(
-      "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
-      "C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe",
-      "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
-      "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe"
-    );
-  } else if (process.platform === "darwin") {
-    candidates.push(
-      "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-      "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
-      "/Applications/Chromium.app/Contents/MacOS/Chromium"
-    );
-  } else {
-    candidates.push(
-      "/usr/bin/google-chrome",
-      "/usr/bin/google-chrome-stable",
-      "/usr/bin/chromium",
-      "/usr/bin/chromium-browser",
-      "/usr/bin/microsoft-edge"
-    );
+  if (process.env.HARNESS_BROWSER_USE_RUNTIME_ROOT && process.env.HARNESS_BROWSER_USE_RUNTIME_LOCK) {
+    try { candidates.push(verifiedOfflineBrowserPath()); } catch { /* invalid runtime falls back to system browsers */ }
   }
-  return [...new Set(candidates)];
+  if (process.platform === "win32") candidates.push(
+    "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
+    "C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe",
+    "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+    "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe");
+  else if (process.platform === "darwin") candidates.push(
+    "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome");
+  else candidates.push("/usr/bin/microsoft-edge", "/usr/bin/google-chrome", "/usr/bin/google-chrome-stable", "/usr/bin/chromium", "/usr/bin/chromium-browser");
+  try { candidates.push(chromium.executablePath()); } catch {}
+  return [...new Set(candidates.filter(Boolean))];
 }
-
+function isFile(candidate: string): boolean { try { return fs.statSync(candidate).isFile(); } catch { return false; } }
 export function findBrowserExecutable(): string | null {
-  for (const candidate of browserCandidates()) {
+  const explicit = process.env.CHATGPT_BROWSER_PATH?.trim();
+  if (explicit && !isFile(explicit)) throw new Error(`Explicit browser path is invalid: ${explicit}`);
+  return browserCandidates().find(isFile) ?? null;
+}
+export async function launchBrowser(timeoutMs = 30000): Promise<{ browser: Browser; executablePath: string }> {
+  const explicit = process.env.CHATGPT_BROWSER_PATH?.trim();
+  if (explicit && !isFile(explicit)) throw new Error(`Explicit browser path is invalid: ${explicit}`);
+  const errors: string[] = [];
+  const deadline = Date.now() + timeoutMs;
+  for (const executablePath of browserCandidates()) {
+    if (!isFile(executablePath)) continue;
     try {
-      if (candidate && fs.statSync(candidate).isFile()) return candidate;
-    } catch {}
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) throw new Error("browser launch deadline exceeded");
+      const browser = await chromium.launch({ executablePath, headless: true, timeout: remaining,
+        args: ["--disable-gpu", "--no-first-run", "--disable-extensions"] });
+      return { browser, executablePath };
+    } catch (error) { errors.push(`${executablePath}: ${String(error)}`); if (explicit) break; }
   }
-  return null;
+  throw new Error(`Browser launch failed: ${errors.join("; ") || "no supported browser found"}`);
 }

@@ -8,7 +8,7 @@ import { createRuntimeScope, getRuntimeScope, runWithRuntimeScope } from "./runt
 import { readGoalRun, type GoalRunEnvelope, type GoalRunProjectionParity } from "./goal-run-store.js";
 import { renderGoalRunPolicyText } from "./goal-run-policy.js";
 import { advanceGoalWorkHistory, goalWorkHistoryIsStalled, goalWorkObservation, type GoalWorkHistory, type GoalWorkObservation } from "./goal-work-progress.js";
-import { readAcceptedExecutionContractState } from "./execution-contract.js";
+
 
 export interface BrokerEvidenceSummary {
   seq: number;
@@ -19,15 +19,13 @@ export interface BrokerEvidenceSummary {
 }
 
 export interface HarnessRuntimeContext {
-  project_root?: string;
-  intent_assurance?: {
-    state: "UNDERSTANDING" | "READY";
-    intent_revision?: number;
-    readiness_score?: number;
-    requirement_hash?: string;
-    accepted_at?: string;
-    issue?: string;
+  conversation?: {
+    identity_version: 2;
+    continuity: "trusted" | "unknown" | "conflict";
+    source: "openai/session" | "none" | "conflict";
+    id?: string;
   };
+  project_root?: string;
   goal?: GoalSummary;
   goal_run?: {
     run_id: string;
@@ -99,8 +97,6 @@ const SKIP_TEXT_FOR: ReadonlySet<string> = new Set([
   "remember",
 ]);
 
-const TAIL_ESCALATION_AFTER = 12;
-
 interface ContinuationTailOptions {
   toolName?: string;
   toolAction?: string;
@@ -110,120 +106,28 @@ interface ContinuationTailOptions {
   repeatedWorkStalled?: boolean;
 }
 
-function taskNeedsCompletion(context: HarnessRuntimeContext): boolean {
-  return Boolean(context.task?.goal_id && context.task.goal_id === context.goal?.goal_id &&
-    context.task.goal_id === context.goal_run?.run_id &&
-    (context.task.status === "active" || context.task.status === "blocked"));
-}
-
-function finishChain(context: HarnessRuntimeContext): string {
-  return taskNeedsCompletion(context)
-    ? "call goal(action=complete) now, then task_state(action=complete)."
-    : "call goal(action=complete) now. No task_state completion call is required because no active durable task bound to this Goal is visible.";
-}
-
+/** A progress record, never an instruction to authorize actions or prolong a turn. */
 function continuationTail(
   context: HarnessRuntimeContext,
-  streak: number,
+  _streak: number,
   options: ContinuationTailOptions = {}
 ): string {
   const goal = context.goal!;
-  const issue = context.goal_run_issue;
-  if (issue) {
-    const failedPreflight =
-      issue.recovery === "status_once" &&
-      options.toolName === "goal" &&
-      (options.toolAction === "status" || options.toolAction === "reconcile") &&
-      options.resultFailed;
-    if (issue.recovery === "stop" || failedPreflight) {
-      return (
-        `GOALRUN_BLOCKER [${issue.code}]: ${truncateForSnapshot(issue.message, 260)} ` +
-        "STOP_AUTONOMOUS_TOOL_CALLS. Preserve the active Goal, send one concise blocker reply, and retry only after the runtime/schema issue is repaired."
-      );
-    }
-    return (
-      `GOALRUN_PREFLIGHT_REQUIRED [${issue.code}]: ${truncateForSnapshot(issue.message, 240)} ` +
-      "Read goal(action=status) to inspect ownership and stored_goal_revision without side effects. If reconciliation_required is true, explicitly call goal(action=reconcile) with that stored revision before production work. If either call fails, preserve state and report the concrete blocker; do not loop or switch tools to bypass it."
-    );
-  }
-
   const run = context.goal_run;
-  if (!run) {
-    return (
-      "GOALRUN_PREFLIGHT_REQUIRED [GOAL_RUN_AUTHORITY_MISSING]: authoritative GoalRun state is unavailable. " +
-      "Read goal(action=status). Status is observational; if it reports reconciliation_required, use goal(action=reconcile, expected_revision=stored_goal_revision). If either call fails, preserve state and report the blocker; do not loop."
-    );
+  const issue = context.goal_run_issue;
+  const verified = run?.criteria_confirmed ?? goal.criteria_passed;
+  const total = run?.criteria_total ?? goal.criteria_total;
+  const status = run?.state ?? goal.status;
+  const remaining = run?.remaining_criteria ?? goal.remaining_criteria;
+  const parts = [`GOAL RECORD ${verified}/${total} verified; status=${status}.`];
+  if (remaining?.length) parts.push(`Unmet checks: ${remaining.slice(0, 3).map(item => truncateForSnapshot(item, 110)).join("; ")}.`);
+  if (issue) parts.push(`Record issue [${issue.code}]: ${truncateForSnapshot(issue.message, 220)}.`);
+  if (context.task) parts.push(`Task record: ${context.task.status}.`);
+  if ((options.repeatedResults ?? 0) > 0) {
+    parts.push(`Matching work fingerprint: repeats=${options.repeatedResults}, observation_window_ms=${options.repeatedForMs ?? 0}; this observation does not prove a stall.`);
   }
-
-  const remaining = run.remaining_criteria;
-  const counter = `GOAL ${run.criteria_confirmed}/${run.criteria_total} — ${remaining.length ? "NOT DONE." : "ALL CRITERIA CONFIRMED."}`;
-
-  switch (run.state) {
-    case "WAITING_USER":
-      return `${counter} GOAL_WAITING_USER: stop tool calls and send the single concise user request described by the persisted GoalRun wait. YIELD_TO_USER until the matching response arrives; do not retry or call unrelated tools.`;
-    case "WAITING_TOOL":
-      if (streak >= TAIL_ESCALATION_AFTER) {
-        return `${counter} GOAL_WAITING_TOOL_BLOCKER: ${streak} results arrived without the persisted matching tool result. STOP_AUTONOMOUS_TOOL_CALLS, preserve the wait, and report one concise recoverable blocker; do not poll or call unrelated tools.`;
-      }
-      return `${counter} GOAL_WAITING_TOOL: only the matching persisted tool result may resume this run. Do not call unrelated tools; if that result is still pending, yield instead of polling or narrating progress.`;
-    case "WAITING_EXTERNAL_PROCESS":
-      if (streak >= TAIL_ESCALATION_AFTER) {
-        return `${counter} GOAL_EXTERNAL_WAIT_POLL_LIMIT: ${streak} results arrived without satisfying the bounded external wait. STOP_AUTONOMOUS_TOOL_CALLS, preserve the wait, and report one concise recoverable blocker; do not poll again until the process or recovery condition changes.`;
-      }
-      return `${counter} GOAL_WAITING_EXTERNAL_PROCESS: follow only wait ${run.wait?.id ?? "unknown"} for process ${run.wait?.process_ref ?? "unknown"}, poll no faster than ${run.wait?.poll_interval_ms ?? "the persisted interval"}ms, and stop at ${run.wait?.deadline_at ?? "the persisted deadline"}. Do not call unrelated tools; yield between due polls and recover once on timeout instead of looping.`;
-    case "WAITING_CONTROL_PLANE":
-      return `${counter} GOAL_WAITING_CONTROL_PLANE: preserve the Goal, receipts, and resume cursor while browser/MCP capability is unavailable. Do not count this state as semantic no-progress; resume automatically after a capability-proved lane returns.`;
-    case "NO_PROGRESS_PAUSED":
-      return `${counter} GOAL_NO_PROGRESS_PAUSED: exact consecutive results lasted at least 30 minutes. Preserve the Goal and resume cursor; continue only after user direction or a changed recovery condition.`;
-    case "INTERRUPTED":
-      return `${counter} GOAL_INTERRUPTED: STOP_AUTONOMOUS_TOOL_CALLS and preserve the resume cursor. Continue only after an explicit goal(action=resume); a terminal cancellation cannot resume.`;
-    case "COMPLETED":
-      if (taskNeedsCompletion(context)) {
-        if (options.toolName === "task_state" && options.toolAction === "complete" && options.resultFailed) {
-          return "GOAL_COMPLETED_TASK_BLOCKER: task_state(action=complete) failed once after Goal completion. STOP_AUTONOMOUS_TOOL_CALLS and report the task completion blocker; do not retry in a loop.";
-        }
-        return "GOAL_COMPLETED_TASK_PENDING: the GoalRun is complete but its visible durable task is still active/blocked. Call task_state(action=complete) once now; do not end the turn before that call succeeds or returns a verified blocker.";
-      }
-      return "GOAL_COMPLETED: no continuation and no further Goal tools are required for this run.";
-    case "READY_TO_FINALIZE":
-      return `${counter} DELIVERABLE_READY pending finish chain — ${finishChain(context)} Do not narrate before the applicable finish chain completes.`;
-    case "RUNNING":
-      break;
-  }
-
-  // All-confirmed limbo: evidence gates passed but explicit finalization has not.
-  if (remaining.length === 0) {
-    return `${counter} DELIVERABLE_READY pending finish chain — ${finishChain(context)} Do not end the turn before the applicable finish chain completes.`;
-  }
-
-  const next = truncateForSnapshot(remaining[0], 120);
-  if (streak >= TAIL_ESCALATION_AFTER || options.repeatedWorkStalled) {
-    if (options.toolName === "goal" && options.toolAction === "pause" && options.resultFailed) {
-      return (
-        `GOAL_NO_PROGRESS_PAUSE_FAILED: the single bounded pause attempt failed while "${next}" remains unmet. ` +
-        "STOP_AUTONOMOUS_TOOL_CALLS and report one concise recoverable blocker; do not retry pause or the stalled tool loop."
-      );
-    }
-    if (!options.repeatedWorkStalled) {
-      return (
-        `GOAL_CHECKPOINT_DUE: "${next}" is still unconfirmed. Record the useful findings and next step at a natural boundary, then continue the authorized work. ` +
-        "An unchanged criterion count does not establish a blocker. Do not pause or confirm a criterion merely to reset this reminder; confirmation still requires matching evidence."
-      );
-    }
-    return (
-      `GOAL_NO_PROGRESS_BLOCKER: ${options.repeatedResults} exact consecutive repeats persisted for ${Math.floor((options.repeatedForMs ?? 0) / 60_000)} minutes without Goal/Task progress while "${next}" remains unmet. ` +
-      "STOP_AUTONOMOUS_TOOL_CALLS. Call goal(action=pause, pause_kind=no_progress, current_phase=\"Blocked: no semantic progress\") once, then yield one concise blocker reply with the last useful evidence. Resume only after user direction or a changed recovery condition; do not retry the loop."
-    );
-  }
-  return (
-    `${counter} MUST_CONTINUE_TO_TOOL. Expect no user reply until DELIVERABLE_READY or a verified blocker; this goal supersedes any "report progress every N calls" rule (progress = checkpoints). ` +
-    `Your next action must be a tool call advancing: ${next}. ` +
-    `Progress updates, plans, and "shall I continue?" are forbidden turn endings. ` +
-    `Confirm it only with goal(action=confirm, evidence_ids=[...]). ` +
-    (context.task
-      ? "Genuinely blocked? checkpoint task_state with blocked_reason, pause the Goal, then yield — otherwise continue."
-      : "Genuinely blocked? pause the Goal with a concrete blocker, then yield — otherwise continue.")
-  );
+  parts.push("Completion declarations do not verify unmet checks. These records do not block tool use or delivery.");
+  return parts.join(" ");
 }
 
 interface CoreState {
@@ -245,6 +149,11 @@ function isProjectionParity(value: GoalRunEnvelope["parity"]): value is GoalRunP
 
 function workspaceKey(workspaceRoot: string): string {
   return path.resolve(workspaceRoot).toLowerCase();
+}
+
+function scopeCacheKey(workspaceRoot: string, sessionId?: string): string {
+  const scope = getRuntimeScope();
+  return `${workspaceKey(workspaceRoot)}::${JSON.stringify([scope?.principalId ?? "local", scope?.tunnelProfile ?? "default", sessionId ?? "legacy"])}`;
 }
 
 function scopesOverlap(left: string[], right: string[]): boolean {
@@ -326,7 +235,7 @@ onStateInvalidated((workspaceRoot) => {
 });
 
 function getCachedCoreState(workspaceRoot: string, sessionId?: string): Promise<CoreState> {
-  const key = `${workspaceKey(workspaceRoot)}::${sessionId ?? "legacy"}`;
+  const key = scopeCacheKey(workspaceRoot, sessionId);
   const now = Date.now();
   const cached = coreStateCache.get(key);
   if (cached && cached.expires > now) return cached.promise;
@@ -350,7 +259,7 @@ interface EvidenceWindow {
 const evidenceWindows = new Map<string, EvidenceWindow>();
 
 async function refreshEvidenceWindow(workspaceRoot: string, sessionId?: string): Promise<EvidenceWindowItem[]> {
-  const key = `${workspaceKey(workspaceRoot)}::${sessionId ?? "legacy"}`;
+  const key = scopeCacheKey(workspaceRoot, sessionId);
   const generation = harnessRepairCount(workspaceRoot);
   const win = evidenceWindows.get(key) ?? { items: [], offset: 0, repairs: generation };
   if (win.repairs !== generation) {
@@ -389,29 +298,10 @@ export async function buildHarnessRuntimeContext(
   projectRoot?: string,
   sessionId?: string
 ): Promise<HarnessRuntimeContext> {
-  const effectiveSessionId = sessionId ?? getRuntimeScope()?.mcpSessionId;
+  const currentScope = getRuntimeScope();
+  const effectiveSessionId = sessionId ?? currentScope?.mcpSessionId;
   const resolvedProject = projectRoot ? path.resolve(projectRoot) : undefined;
   const core = await getCachedCoreState(workspaceRoot, effectiveSessionId);
-
-  let intentAssurance: HarnessRuntimeContext["intent_assurance"];
-  try {
-    const accepted = await readAcceptedExecutionContractState(workspaceRoot, effectiveSessionId,
-      core.goal && goalVisibleToSession(core.goal, effectiveSessionId) ? core.goal.id : undefined);
-    intentAssurance = accepted
-      ? {
-          state: "READY",
-          intent_revision: accepted.intent_revision,
-          readiness_score: accepted.readiness_score,
-          requirement_hash: accepted.requirement_hash,
-          accepted_at: accepted.accepted_at,
-        }
-      : { state: "UNDERSTANDING" };
-  } catch (error) {
-    intentAssurance = {
-      state: "UNDERSTANDING",
-      issue: truncateForSnapshot(error instanceof Error ? error.message : String(error), 240),
-    };
-  }
 
   let taskContext: HarnessRuntimeContext["task"];
   let taskId: string | undefined;
@@ -520,8 +410,14 @@ export async function buildHarnessRuntimeContext(
     : [];
 
   return {
+    ...(currentScope ? { conversation: {
+      identity_version: 2 as const,
+      continuity: currentScope.conversationContinuity ?? "unknown",
+      source: currentScope.conversationContinuity === "trusted" ? "openai/session" as const
+        : currentScope.conversationContinuity === "conflict" ? "conflict" as const : "none" as const,
+      ...(currentScope.conversationSessionId ? { id: currentScope.conversationSessionId } : {}),
+    } } : {}),
     ...(resolvedProject ? { project_root: resolvedProject } : {}),
-    intent_assurance: intentAssurance,
     ...(goalContext ? { goal: goalContext } : {}),
     ...(goalRunContext ? { goal_run: goalRunContext } : {}),
     ...(goalRunIssue ? { goal_run_issue: goalRunIssue } : {}),
@@ -545,22 +441,11 @@ const RENDER_LADDER: RenderLimits[] = [
 
 function renderSnapshot(context: HarnessRuntimeContext, limits: RenderLimits): string {
   const lines: string[] = [];
-  if (context.intent_assurance?.state === "READY") {
-    lines.push(
-      `Requirement gate: READY | intent_revision=${context.intent_assurance.intent_revision ?? "?"} | RRS=${context.intent_assurance.readiness_score ?? "?"} | contract=${(context.intent_assurance.requirement_hash ?? "unknown").slice(0, 12)}`
-    );
-  } else if (context.intent_assurance) {
-    lines.push(
-      context.intent_assurance.issue
-        ? `Requirement gate: UNDERSTANDING | state issue: ${truncateForSnapshot(context.intent_assurance.issue, 220)}`
-        : "Requirement gate: UNDERSTANDING | read-only discovery is allowed; side effects require _intent with RRS >= 95 and zero blocking ambiguities."
-    );
-  }
   // Goal block renders BEFORE the task block: head-preserving truncation must
   // never be able to cut the continuation contract or the goal state away.
   if (context.goal) {
     if (context.goal.status === "active") {
-      lines.push(`GOAL CONTINUATION CONTRACT: ${context.goal_run?.policy ?? GOAL_CONTINUATION_SNAPSHOT}`);
+      lines.push("GOAL WORK RECORD: optional progress/evidence; unmet criteria remain recorded and do not block tools.");
     }
     lines.push(`ACTIVE GOAL: ${truncateForSnapshot(context.goal.objective, 300)}`);
     lines.push(`Phase: ${truncateForSnapshot(context.goal.current_phase, 200)} | status: ${context.goal.status}`);
@@ -620,12 +505,9 @@ function hardTruncate(text: string, budget: number): string {
 }
 
 export function formatHarnessRuntimeContext(context: HarnessRuntimeContext): string {
-  // UNDERSTANDING is the default pre-execution posture already present in the
-  // server instructions; do not append a Harness context block to every
-  // ordinary read result just to restate that default. READY is durable state
-  // worth projecting because it carries an accepted contract revision/hash.
+  // Only actual work records contribute a retained runtime snapshot.
   const hasState = Boolean(
-    context.intent_assurance?.state === "READY" || context.goal || context.task || context.recent_evidence.length
+    context.goal || context.task || context.recent_evidence.length
   );
   if (!hasState) return CLEARED_TEXT;
   const body = ["HARNESS CONTEXT"];
@@ -716,7 +598,7 @@ function nextContinuationStreak(
  * goal for up to the refresh interval.
  */
 export function resetHarnessSnapshotRetention(workspaceRoot: string, sessionId?: string): void {
-  retainedByWorkspace.delete(`${workspaceKey(workspaceRoot)}::${sessionId ?? "legacy"}`);
+  retainedByWorkspace.delete(scopeCacheKey(workspaceRoot, sessionId));
 }
 
 function withStructuredHarnessContext(result: unknown, context: HarnessRuntimeContext): unknown {
@@ -777,26 +659,18 @@ export async function appendHarnessRuntimeContextToResult(
     return result;
   }
 
-  const key = `${workspaceKey(workspaceRoot)}::${sessionId ?? "legacy"}`;
-  // An active goal ALWAYS needs a signal: unmet criteria → "advance X" tail;
-  // all-passed limbo → "run the finish chain" tail. Zero-signal gaps here are
-  // how goals end up active forever.
+  const key = scopeCacheKey(workspaceRoot, sessionId);
+  // Keep visible active records concise; completed Goals do not make Task
+  // completion or any additional tool call a delivery prerequisite.
   const activeNeedsWork = Boolean(
     context.goal?.status === "active" ||
-    context.goal_run_issue?.code === "GOAL_RUN_PROJECTION_REPAIR_PENDING" ||
-    (context.goal_run?.state === "COMPLETED" && taskNeedsCompletion(context))
+    context.goal_run_issue?.code === "GOAL_RUN_PROJECTION_REPAIR_PENDING"
   );
 
   if (skipSnapshot) {
     const withStructured = hasStructuredData ? withStructuredHarnessContext(result, context) : result;
-    // Skip tools skip the SNAPSHOT, not the continuation signal: ChatGPT's
-    // turn-start preflight calls (agent_status/remember/…) and any turn ENDING
-    // on one of them previously had no signal at the stop-decision point.
-    // Even goal/task_state get the tail. Their in-band continue_execution /
-    // execution_hint fields are useful state, but a real Web reproduction
-    // showed that the model can still stop immediately after goal(create).
-    // The imperative tail must therefore remain the LAST model-visible text
-    // entry on every active-Goal result, including the state tools themselves.
+    // State tools already carry their details; add only the short work record.
+    // It describes verification facts without requiring another tool call.
     if (!activeNeedsWork || !canCarryText) {
       if (!activeNeedsWork) {
         const retained = retainedByWorkspace.get(key);

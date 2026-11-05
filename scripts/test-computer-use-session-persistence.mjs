@@ -199,7 +199,7 @@ try {
   const { subscribeActivity } = await import(pathToFileURL(path.join(distRoot, "lib", "activity-log.js")).href);
   const { consumeMcpOutcome } = await import(pathToFileURL(path.join(distRoot, "lib", "mcp-outcome.js")).href);
   ({ getComputerUseProvider } = await import(pathToFileURL(path.join(distRoot, "lib", "computer-use-registry.js")).href));
-  const { conversationSessionIdFromMeta } =
+  const { conversationSessionIdFromMeta, runWithMcpRequestIdentity, runtimePrincipalId } =
     await import(pathToFileURL(path.join(distRoot, "lib", "mcp-request-identity.js")).href);
   const { ComputerUseProvider } =
     await import(pathToFileURL(path.join(distRoot, "lib", "computer-use-provider.js")).href);
@@ -290,27 +290,27 @@ try {
   }));
   mark("different trusted sessions isolate targets even within one registration");
 
-  const beforeConfirmation = helperEvents.length;
-  assertToolError(await call(second, conversationB, { action: "keypress", keys: ["ALT", "F4"] }), /confirmed=true/);
-  assert.equal(helperEvents.length, beforeConfirmation, "unconfirmed high-impact chord reached native helper");
+  const beforeDirectKey = helperEvents.length;
+  assert.equal(data(await call(second, conversationB, { action: "keypress", keys: ["ALT", "F4"] })).selected_target.hwnd, "202");
+  assert.equal(helperEvents.length, beforeDirectKey + 2, "direct keypress must dispatch once to the selected fixture");
   assert.equal(data(await call(second, conversationB, {
     action: "keypress", keys: ["ALT", "F4"], confirmed: true,
   })).selected_target.hwnd, "202");
   assertToolError(await call(second, conversationB, selection("999")), /fixture window is unavailable/);
   assertToolError(await call(second, conversationB, shot));
   data(await call(second, conversationB, selection("202")));
-  mark("high-impact confirmation remains enforced and a failed retarget clears the old window");
+  mark("keypress accepts execution parameters and legacy confirmed; failed retarget clears the old window");
 
   const aliasHelperCount = helperEvents.length;
   for (const keys of [
     ["CONTROL", "W"], ["CONTROL", "SHIFT", "W"], ["CONTROL", "ALT", "DELETE"],
     [" control ", "w"],
   ]) {
-    assertToolError(await call(second, conversationB, { action: "keypress", keys }), /confirmed=true/);
+    assert.equal(data(await call(second, conversationB, { action: "keypress", keys, confirmed: false })).selected_target.hwnd, "202");
   }
-  assertToolError(await call(second, conversationB, { action: "keypress", key: "CONTROL+W" }), /confirmed=true/);
-  assert.equal(helperEvents.length, aliasHelperCount, "CONTROL alias escaped the confirmation gate");
-  mark("CONTROL aliases and key-chord strings cannot bypass high-impact confirmation");
+  assert.equal(data(await call(second, conversationB, { action: "keypress", key: "CONTROL+W" })).selected_target.hwnd, "202");
+  assert.equal(helperEvents.length, aliasHelperCount + 10, "each alias must dispatch exactly once");
+  mark("CONTROL aliases and chord strings use the selected target without a product approval field");
 
   const differentWorkspace = await connect("other-workspace", otherWorkspace);
   assertToolError(await call(differentWorkspace, conversationA, shot));
@@ -512,8 +512,8 @@ try {
     const cancelledGoal = data(await call(second, cancelConversation, { action: "cancel" }, "goal")).goal;
     assert.equal(cancelledGoal.id, cancellationGoal.id);
     assert.equal(cancelledGoal.status, "cancelled");
-    // The SDK request itself was not cancelled. The trusted Goal dispatch fence
-    // must reject this queued operation from current authority, not a fake signal.
+    // Cancelling a work record does not cancel an already queued SDK request.
+    // Explicit request aborts were checked above and still prevent dispatch.
     assert.equal(queuedScope.signal.aborted, false);
   } finally {
     goalCancelGate.released.resolve();
@@ -522,9 +522,9 @@ try {
   const settledGoalCalls = await bounded(goalQueuedOutcomes, "old-Goal queue drained after cancellation");
   assert.equal(settledGoalCalls[0].status, "fulfilled");
   assert.equal(settledGoalCalls[1].status, "fulfilled");
-  assertToolError(settledGoalCalls[1].value, /GOAL_SCOPE_CHANGED|GOAL_(AUTHORITY|STATE|STATUS)_CHANGED|cancelled|DRIVER_(NOT_ACTIVE|LEASE_LOST)/i);
-  assert.equal(helperEvents.slice(beforeGoalCancelEvents).some(event => event.action === "type"), false,
-    "old-Goal queued input dispatched after real goal(cancel) returned");
+  assert.equal(data(settledGoalCalls[1].value).selected_target.hwnd, "807");
+  assert.equal(helperEvents.slice(beforeGoalCancelEvents).filter(event => event.phase === "start" && event.action === "type").length, 1,
+    "queued input must dispatch exactly once independently of Goal record state");
   const beforeFreshCancelledInput = helperEvents.length;
   assertToolError(await call(second, cancelConversation, { action: "type", text: "AFTER-CANCEL-BEFORE-SELECT" }));
   assert.equal(helperEvents.length, beforeFreshCancelledInput, "new cancelled-state request inherited an old target");
@@ -538,7 +538,7 @@ try {
   assert.equal((await direct({ ...stateScope, status: "paused" }, shot)).data.selected_target.hwnd, "810");
   await assert.rejects(direct({ ...stateScope, status: "cancelled" }, shot), noSelection);
   await assert.rejects(direct(stateScope, shot), noSelection);
-  mark("real MCP Goal cancellation fences queued input and Goal status changes require a fresh target");
+  mark("Goal record cancellation does not gate queued input; later scope changes require a fresh target");
 
   const nativeFailureConversation = "native-helper-failure-" + crypto.randomUUID();
   const nativeFailureGoal = data(await call(second, nativeFailureConversation,
@@ -547,11 +547,11 @@ try {
   const beforeNativeFailure = helperEvents.length;
   assertToolError(await call(second, nativeFailureConversation, { action: "type", text: nativeFailureText }), /after helper dispatch/);
   assert.ok(helperEvents.slice(beforeNativeFailure).some(event => event.phase === "start" && event.action === "type"));
-  assert.equal((await inspectGoalAdmission(workspace, nativeFailureGoal.id)).length, 1);
+  assert.deepEqual(await inspectGoalAdmission(workspace, nativeFailureGoal.id), []);
   const afterNativeFailure = helperEvents.length;
-  assertToolError(await call(second, nativeFailureConversation, selection("912")), /GOAL_EFFECT_RECONCILIATION_REQUIRED/);
-  assert.equal(helperEvents.length, afterNativeFailure, "uncertain native failure allowed another dispatch");
-  mark("native helper failures remain uncertain even when an error claims operation_started=false");
+  assert.equal(data(await call(second, nativeFailureConversation, selection("912"))).selected_target.hwnd, "912");
+  assert.equal(helperEvents.length, afterNativeFailure + 2, "an unrelated selection dispatches once");
+  mark("native helper failures stay observable without a global Goal gate on unrelated actions");
 
   let originalProofError;
   let originalProofScope;
@@ -574,7 +574,7 @@ try {
     registry.register(options.source ? { ...definition, source: options.source } : definition);
     const traces = [];
     let failureCalls = 0;
-    const gateway = new InvocationGateway(registry, { workspaceRoot: workspace, projectRoots: [workspace] }, {
+    const gateway = new InvocationGateway(registry, { workspaceRoot: workspace, projectRoots: [workspace], principalId: runtimePrincipalId(workspace) }, {
       onFailure: async (context, error) => {
         failureCalls += 1;
         await options.onFailure?.(context, error);
@@ -592,11 +592,15 @@ try {
     let result;
     let failure;
     const requestId = "cu-proof-" + crypto.randomUUID();
-    const extra = { sessionId: session, requestId, signal: new AbortController().signal };
-    try { result = await gateway.invoke(toolName, [{ ...shot, _intent: intent }, extra]); }
-    catch (error) { failure = error; }
-    finally { unsubscribe(); }
-    const outcome = consumeMcpOutcome(requestId, toolName);
+    const extra = { sessionId: session, requestId, signal: new AbortController().signal, _meta: {"openai/session":conversation} };
+    let outcome;
+    await runWithMcpRequestIdentity(undefined, session, async () => {
+      try { result = await gateway.invoke(toolName, [{ ...shot, _intent: intent }, extra]); }
+      catch (error) { failure = error; }
+      finally { unsubscribe(); }
+      outcome = consumeMcpOutcome(requestId, toolName);
+      assert.equal(consumeMcpOutcome(requestId, toolName), undefined, label + ": duplicate MCP outcome");
+    }, {params:{_meta:extra._meta}});
     assert.ok(outcome, label + ": missing consumable MCP outcome");
     assert.equal(consumeMcpOutcome(requestId, toolName), undefined, label + ": duplicate MCP outcome");
     assert.equal(outcome.invocation_id, invocationId);
@@ -623,7 +627,7 @@ try {
       assert.ok(failure, label + ": failure unexpectedly succeeded");
       if (options.expectedError) assert.equal(failure, options.expectedError);
       assert.equal(trace.reconciliationNeeded, true);
-      assert.equal(reservations.length, 1, label + ": uncertain reservation was removed");
+      assert.deepEqual(reservations, [], label + ": obsolete Goal reservations must not return");
       assert.equal(outcome.rpc_result_status, "error");
       assert.notEqual(outcome.failure.operation_started, false);
       assert.notEqual(activityEvents.at(-1).details.operation_started, false,

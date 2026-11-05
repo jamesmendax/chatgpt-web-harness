@@ -232,12 +232,11 @@ function assertSchemaAndAnnotationsPreserved(slimListed, fullListed) {
   assert.equal(readTool.annotations.openWorldHint, false);
 
   const writeTool = findTool(slimListed, "write_file");
-  assert.deepEqual(Object.keys(writeTool.inputSchema.properties).sort(), ["_intent", "content", "create_only", "expected_sha256", "path"]);
+  assert.deepEqual(Object.keys(writeTool.inputSchema.properties).sort(), ["content", "create_only", "expected_sha256", "path"]);
   assert.deepEqual([...writeTool.inputSchema.required].sort(), ["content", "path"]);
   assert.equal(writeTool.inputSchema.properties.expected_sha256.type, "string");
   assert.equal(writeTool.inputSchema.properties.create_only.type, "boolean");
-  assert.equal(writeTool.inputSchema.properties._intent.type, "string");
-  assert.equal(writeTool.inputSchema.required.includes("_intent"), false, "requirement metadata must remain optional for SDK schema compatibility");
+  assert.equal(writeTool.inputSchema.properties._intent, undefined, "retired requirement metadata must not be advertised");
   assert.equal(writeTool.annotations.readOnlyHint, false);
   assert.equal(writeTool.annotations.destructiveHint, true);
   assert.equal(writeTool.annotations.idempotentHint, false);
@@ -271,7 +270,8 @@ function textEntries(result) {
 function assertNoActiveGoalTail(result, label) {
   const texts = textEntries(result);
   assert.ok(texts.length > 0, `${label} has no text entries`);
-  assert.equal(texts.at(-1).text.includes("MUST_CONTINUE_TO_TOOL"), false, `${label} retained an active-Goal tail`);
+  const text = texts.map(entry => entry.text).join("\n");
+  assert.doesNotMatch(text, /MUST_CONTINUE_TO_TOOL|STOP_AUTONOMOUS_TOOL_CALLS|Your next action must be a tool call/, `${label} imposed a retired execution gate`);
 }
 
 function assertActiveGoalTail(result, label) {
@@ -279,8 +279,8 @@ function assertActiveGoalTail(result, label) {
   assert.ok(texts.length > 0, `${label} has no text entries`);
   const last = texts.at(-1);
   assert.equal(result.content.at(-1), last, `${label} active-Goal tail is not the final content entry`);
-  assert.match(last.text, /^GOAL \d+\/\d+ — /, `${label} tail lost the stable Goal marker`);
-  assert.equal(last.text.includes("MUST_CONTINUE_TO_TOOL"), true, `${label} missing continuation marker`);
+  assert.match(last.text, /^GOAL RECORD\b/, `${label} missing Goal record`);
+  assertNoActiveGoalTail(result, label);
 }
 
 function assertGoalFinishTail(result, label) {
@@ -288,9 +288,8 @@ function assertGoalFinishTail(result, label) {
   assert.ok(texts.length > 0, `${label} has no text entries`);
   const last = texts.at(-1);
   assert.equal(result.content.at(-1), last, `${label} finish tail is not the final content entry`);
-  assert.match(last.text, /^GOAL \d+\/\d+ — ALL CRITERIA CONFIRMED\./, `${label} lost the confirmed marker`);
-  assert.equal(last.text.includes("goal(action=complete)"), true, `${label} missing explicit finalization`);
-  assert.equal(last.text.includes("MUST_CONTINUE_TO_TOOL"), false, `${label} retained the work-phase continue lock`);
+  assert.match(last.text, /^GOAL RECORD\b/, `${label} missing Goal record`);
+  assertNoActiveGoalTail(result, label);
 }
 
 function resultPayload(result) {
@@ -362,9 +361,17 @@ async function main(createMcpServer, McpUpstreamManager, refreshProxiedTools, st
     const missingReviewDirectory = visualReviewDir(catalogWorkspace);
     const workspaceBeforeMissingReview = (await fs.readdir(catalogWorkspace)).sort();
     await assert.rejects(fs.stat(missingReviewDirectory), { code: "ENOENT" });
-    const businessError = await slim.client.callTool({
+    const emptyReview = await slim.client.callTool({
       name: "visual_review",
       arguments: { action: "status" },
+    });
+    assert.equal(emptyReview.isError, undefined);
+    assert.equal(emptyReview.structuredContent?.ok, true);
+    assert.equal(emptyReview.structuredContent?.data?.action, "status");
+    assert.equal(emptyReview.structuredContent?.data?.review, null);
+    const businessError = await slim.client.callTool({
+      name: "visual_review",
+      arguments: { action: "withdraw" },
     });
     assert.equal(businessError.isError, true, "business failures must carry the MCP error signal");
     assert.deepEqual(Object.keys(businessError).sort(), ["content", "isError", "structuredContent"]);
@@ -386,7 +393,7 @@ async function main(createMcpServer, McpUpstreamManager, refreshProxiedTools, st
     assert.deepEqual(businessPayload.data.missing_or_invalid_fields, ["review_id"]);
     assert.deepEqual(businessPayload.data.next_action, {
       tool: "visual_review",
-      arguments: { action: "status" },
+      arguments: { action: "withdraw" },
       required_fields: ["review_id"],
     });
     assert.deepEqual(businessError.structuredContent, businessPayload, "business error structured payload changed");

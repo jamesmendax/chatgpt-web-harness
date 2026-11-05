@@ -134,9 +134,13 @@ class ActivityFeeds extends EventEmitter {
       if (e.action === "tools/call" &&
           typeof e.conversation_id === "string" &&
           /^oai_conv_[a-f0-9]{32}$/.test(e.conversation_id) &&
-          typeof e.tool === "string") {
+          typeof e.tool === "string" &&
+          e.details?.conversation_continuity === "trusted" &&
+          e.details?.conversation_source === "openai/session") {
         this.emit("activity", {
           conversationId: e.conversation_id,
+          identitySource: "openai/session",
+          identityVersion: 2,
           at: Date.parse(e.time),
           tool: e.tool,
           hint: typeof e.details?.conversation_label_hint === "string" ? e.details.conversation_label_hint : "",
@@ -188,11 +192,14 @@ function formatActivity(e) {
   if (e.duration_ms != null) parts.push(`${e.duration_ms}ms`);
   // Keep outcome semantics as bounded machine tokens, separate from visible summary.
   const d = e.details;
-  if (["needs_input", "review_rejected", "blocked", "execution_error"].includes(d?.outcome_kind)) {
+  if (["needs_input", "review_rejected", "blocked", "execution_error", "unknown", "running"].includes(d?.outcome_kind)) {
     parts.push(`outcome=${d.outcome_kind}`);
     if (typeof d.error_code === "string" && /^[A-Z][A-Z0-9_]{1,79}$/.test(d.error_code)) parts.push(`code=${d.error_code}`);
     if (["admission", "validation", "execution", "postprocessing"].includes(d.failure_phase)) parts.push(`phase=${d.failure_phase}`);
     if (typeof d.operation_started === "boolean") parts.push(`started=${d.operation_started}`);
+    if (Number.isInteger(d.exit_code)) parts.push(`exit=${d.exit_code}`);
+    if (typeof d.timed_out === "boolean") parts.push(`timeout=${d.timed_out}`);
+    if (typeof d.may_have_partially_completed === "boolean") parts.push(`partial=${d.may_have_partially_completed}`);
     if (["retry_with_changed_args", "refresh_state", "inspect_original_result", "repair_then_review", "none"].includes(d.retry_policy)) parts.push(`retry=${d.retry_policy}`);
   }
   if (typeof e.details?.invocation_id === "string" && /^[A-Za-z0-9_.:-]+$/.test(e.details.invocation_id)) parts.push(`call=${e.details.invocation_id}`);

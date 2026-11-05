@@ -3,7 +3,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { spawn } from "node:child_process";
-import { StringDecoder } from "node:string_decoder";
 import { writeTextFileCas } from "./lib/safe-text-write.js";
 import type { ProcessHostSpec, ProcessHostState } from "./lib/process-control.js";
 import { readProcessStartIdentity } from "./lib/process-journal.js";
@@ -44,6 +43,9 @@ let state: ProcessHostState = {
   signal: null,
   stdout_bytes: 0,
   stderr_bytes: 0,
+  output_encoding: spec.output_encoding ?? "utf-8",
+  execution_mode: spec.execution_mode ?? "shell",
+  decode_anomaly: false,
   stdin_open: true,
   started_at: startedAt,
   updated_at: startedAt,
@@ -92,8 +94,8 @@ async function terminateChild(force: boolean): Promise<void> {
   }
 }
 
-const stdoutDecoder = new StringDecoder("utf8");
-const stderrDecoder = new StringDecoder("utf8");
+const stdoutDecoder = new TextDecoder(spec.output_encoding ?? "utf-8");
+const stderrDecoder = new TextDecoder(spec.output_encoding ?? "utf-8");
 let writeChain = Promise.resolve();
 function queueWrite(stream: "stdout" | "stderr", chunk: Buffer): void {
   if (!chunk.length) return;
@@ -101,15 +103,17 @@ function queueWrite(stream: "stdout" | "stderr", chunk: Buffer): void {
     if (stream === "stdout") {
       state = { ...state, stdout_bytes: state.stdout_bytes + chunk.length };
       await stdoutFile.write(chunk);
-      const text = stdoutDecoder.write(chunk);
+      const text = stdoutDecoder.decode(chunk, { stream: true });
+      if (text.includes("\uFFFD")) state = { ...state, decode_anomaly: true };
       if (text) await full.write(`[stdout]\n${text}`);
     } else {
       state = { ...state, stderr_bytes: state.stderr_bytes + chunk.length };
       await stderrFile.write(chunk);
-      const text = stderrDecoder.write(chunk);
+      const text = stderrDecoder.decode(chunk, { stream: true });
+      if (text.includes("\uFFFD")) state = { ...state, decode_anomaly: true };
       if (text) await full.write(`[stderr]\n${text}`);
     }
-  }).catch(() => undefined);
+  }).catch(error => { state = { ...state, log_error: String(error) }; });
 }
 child.stdout.on("data", (chunk: Buffer) => queueWrite("stdout", chunk));
 child.stderr.on("data", (chunk: Buffer) => queueWrite("stderr", chunk));
@@ -165,8 +169,9 @@ try {
     const { code, signal } = await childClosed;
     clearInterval(timer);
     await writeChain;
-    const outTail = stdoutDecoder.end();
-    const errTail = stderrDecoder.end();
+    const outTail = stdoutDecoder.decode();
+    const errTail = stderrDecoder.decode();
+    if (outTail.includes("\uFFFD") || errTail.includes("\uFFFD")) state = { ...state, decode_anomaly: true };
     if (outTail) await full.write(`[stdout]\n${outTail}`);
     if (errTail) await full.write(`[stderr]\n${errTail}`);
     state = {

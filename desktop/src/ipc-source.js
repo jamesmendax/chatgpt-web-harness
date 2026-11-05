@@ -21,7 +21,10 @@ function isTrustedIpcSource(event, window, expectedUrl) {
 function installNavigationGuard(contents, expectedUrl) {
   const guard = (event, legacyUrl) => {
     const url = typeof event.url === "string" ? event.url : legacyUrl;
-    if (url !== expectedUrl) event.preventDefault();
+    // The main process may switch to its exact safe-graphics Aura URL after
+    // renderer memory pressure; this does not allow arbitrary file navigation.
+    const allowedUrl = typeof expectedUrl === "function" ? expectedUrl() : expectedUrl;
+    if (url !== allowedUrl) event.preventDefault();
   };
   contents.on("will-navigate", guard);
   contents.on("will-redirect", guard);

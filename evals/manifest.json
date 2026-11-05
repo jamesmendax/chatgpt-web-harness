@@ -1,0 +1,42 @@
+[
+  {
+    "id": "code-fix",
+    "title": "单文件逻辑修复",
+    "category": "coding",
+    "machine_points": 100,
+    "manual_points": 0,
+    "prompt": "修复这个小型计费项目。calculateInvoice 必须先计算折扣后的应税金额，再计算税额；所有金额都使用整数分。数量必须是正整数，折扣率和税率必须在 0 到 100 之间，且函数不得修改输入。运行测试并只修改完成任务所需的文件。"
+  },
+  {
+    "id": "cross-file-change",
+    "title": "跨文件一致性修改",
+    "category": "coding",
+    "machine_points": 100,
+    "manual_points": 0,
+    "prompt": "统一 API 和 CLI 的标签规范化逻辑。标签需要去除首尾空白、转为小写、把连续空白折叠成单个连字符，并拒绝空结果。两处入口必须复用同一个 normalizeTag 实现，同时更新 README 中的行为说明。运行测试并保持现有公共导出兼容。"
+  },
+  {
+    "id": "web-debug",
+    "title": "网页运行时调试",
+    "category": "web",
+    "machine_points": 100,
+    "manual_points": 0,
+    "prompt": "修复这个本地计数器网页。连续点击 Add 两次后数值必须为 2，Reset 必须恢复为 0，页面运行期间不得产生 console error 或 page error。请实际在浏览器中验证交互，不要只阅读代码。"
+  },
+  {
+    "id": "docs-generation",
+    "title": "基于事实生成运维文档",
+    "category": "docs",
+    "machine_points": 100,
+    "manual_points": 0,
+    "prompt": "根据 service.json 和 OPERATIONS_NOTES.md 创建 RUNBOOK.md。必须包含 Overview、Start、Health Check、Logs、Recovery、Safety 六个章节，使用来源文件中的准确命令和路径，不得虚构云平台、公开 URL、凭据或可用性承诺。"
+  },
+  {
+    "id": "visual-svg",
+    "title": "纯 SVG 骑行插画",
+    "category": "visual",
+    "machine_points": 60,
+    "manual_points": 40,
+    "prompt": "创建 pelican-bicycle.svg：一只鹈鹕正在骑自行车。必须是纯 SVG，不得嵌入栅格图片或 foreignObject；两个车轮大小一致；脚接近踏板；一只翅膀接触车把；画面完整位于 viewBox 内。请为 rear-wheel、front-wheel、rider-body、left-foot、right-foot、handlebar 添加元素 id，实际渲染并检查。视觉质量最终由用户人工评分。"
+  }
+]

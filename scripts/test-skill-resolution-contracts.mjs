@@ -81,7 +81,9 @@ try {
   });
   const visual = selectSkill(actualBuiltin, "visual-qa");
   assert.equal(visual.source, "builtin");
-  assert.match(await fs.readFile(visual.path, "utf8"), /Visual QA loop/, "real builtin-name content must switch to the builtin file");
+  const builtinVisualPath = path.join(root, "skills", "visual-qa", "SKILL.md");
+  assert.equal(path.resolve(visual.path), path.resolve(builtinVisualPath), "real builtin-name content must resolve to the builtin file");
+  assert.match(await fs.readFile(visual.path, "utf8"), /# Visual review/, "load the current visual guidance");
   const switchWorkspace = path.join(tmp, "builtin-switch-workspace");
   const switchInstalled = path.join(tmp, "builtin-switch-installed");
   await skill(path.join(switchWorkspace, ".claude", "skills", "visual-qa"), "visual-qa", "# project visual layer");
@@ -95,7 +97,8 @@ try {
   await fs.rm(path.join(switchInstalled, "visual-qa"), { recursive: true, force: true });
   switched = await resolveSkills({ workspaceRoot: switchWorkspace, codeRoot: root, installedDir: switchInstalled, registry: { ...switchRegistry, skills: [] }, codexHome: path.join(tmp, "none"), platform: "win32" });
   assert.equal(selectSkill(switched, "visual-qa").source, "builtin");
-  assert.match(await fs.readFile(selectSkill(switched, "visual-qa").path, "utf8"), /Visual QA loop/);
+  assert.equal(path.resolve(selectSkill(switched, "visual-qa").path), path.resolve(builtinVisualPath));
+  assert.match(await fs.readFile(selectSkill(switched, "visual-qa").path, "utf8"), /# Visual review/);
 
   const aliasWorkspace = path.join(tmp, "alias-workspace");
   const aliasCode = path.join(tmp, "alias-code");

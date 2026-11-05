@@ -15,6 +15,7 @@ import { appendAutoMemory } from "./auto-memory.js";
 import { inferProjectScope } from "./project-scope.js";
 import { notifyStateInvalidated } from "./state-invalidate.js";
 import { getRuntimeScope } from "./runtime-scope.js";
+import { accountProjectDir } from "./account-project-scope.js";
 import { requireVerifiedHostUserConfirmation } from "./host-user-confirmation.js";
 import { normalizeGoalVerification, type GoalVerification } from "./goal-verification.js";
 import { withCanonicalFileLock } from "./safe-text-write.js";
@@ -123,16 +124,16 @@ export const GOAL_GROUNDING_NOTE =
   "Grounding: report only what tool results and verified evidence actually establish; mark anything unverified as unverified.";
 
 export const GOAL_WATCHDOG_POLICY =
-  "Goal watchdog = goal-scoped fallback alerting, not the execution loop. Active goal turns it on; pause/complete/cancel/no-goal turns it off; MCP exit terminates it. It never grants permission to stop and it does not auto-resume ChatGPT Web. During normal Goal execution, do not manually run watchdog scripts; use goal actions. Operator scripts are only for explicit user-requested control or debugging.";
+  "The Goal watchdog provides goal-scoped fallback alerts and does not auto-resume ChatGPT Web.";
 
 export const GOAL_VISIBLE_PROGRESS_HEARTBEAT =
-  "Visible progress heartbeat: during active long work, if about 270 seconds pass without user-visible assistant text, emit a brief truthful progress message before 300 seconds and immediately continue the same Goal. Tool-call cards, MCP health, Goal revisions, and background stdout do not count as visible text.";
+  "Visible progress messages record updates for the user.";
 
 export const GOAL_CONTINUATION_CONTRACT =
-  `GoalRun controls continuous execution. Progress is a checkpoint, not a stop condition. Visible-heartbeat messages are checkpoints too and never end execution. ${GOAL_VISIBLE_PROGRESS_HEARTBEAT} Follow the current state policy: continue tools while RUNNING, wait only for an explicit bounded wait or verified user-only blocker, and finalize only after every criterion is confirmed by typed evidence. launch_ack never verifies completion.`;
+  "Goal and Task status are work records. Report the completion basis and distinguish model declarations from checks supported by evidence. An unverified criterion remains unverified; a launch acknowledgment does not establish completion.";
 
 export const GOAL_CONTINUATION_SNAPSHOT =
-  "Follow the current GoalRun state. Progress is a checkpoint, not a stop condition. Visible-heartbeat messages are checkpoints too and never end execution. During active long work, emit user-visible assistant progress by about 270s and before 300s of text silence, then continue; tool activity alone is not a heartbeat. Continue only while RUNNING; respect bounded waits; finalize only with typed evidence. launch_ack is never completion evidence.";
+  "Goal and Task status record progress and model declarations. Preserve unverified criteria and report the evidence actually available.";
 
 export type GoalMutationOptions = { expectedRevision?: number; expectedGoalId?: string; sourceSessionId?: string };
 
@@ -181,20 +182,7 @@ export interface GoalSummary {
   constraints: string[];
   owner_session?: string;
   intent_provenance: GoalIntentProvenance;
-  execution_mode: "continuous";
   continuation_contract: string;
-  execution_policy: {
-    progress_messages: "checkpoint_and_visible_heartbeat";
-    user_reply: "visible_heartbeat_then_continue_until_DELIVERABLE_READY_or_verified_blocker";
-    visible_heartbeat: {
-      soft_after_ms: 270_000;
-      hard_before_ms: 300_000;
-      counts_as_heartbeat: "user_visible_assistant_text_only";
-      tool_activity_counts_as_heartbeat: false;
-      ends_execution: false;
-    };
-    supersedes_generic_progress_rules: true;
-  };
   watchdog_policy: {
     mode: "goal_scoped";
     lifecycle: "managed_by_goal";
@@ -215,7 +203,7 @@ function projectSlug(workspaceRoot: string): string {
 // projection for session-less clients and cross-turn continuation.
 function goalShardDir(workspaceRoot: string, sessionId?: string): string {
   const base = process.env.CODEX_HOME || path.join(os.homedir(), ".codex");
-  const projectDir = path.join(base, "projects", projectSlug(workspaceRoot));
+  const projectDir = accountProjectDir(path.join(base, "projects", projectSlug(workspaceRoot)));
   return sessionId ? path.join(projectDir, "sessions", sessionId) : projectDir;
 }
 
@@ -622,12 +610,6 @@ export async function updateGoal(
       revision: goal.revision + 1,
       updated_at: new Date().toISOString(),
     };
-    for (const criterion of next.success_criteria) {
-      const previousPassed = goal.success_criteria.find((c) => criterionKey(c.name) === criterionKey(criterion.name))?.passed ?? false;
-      if (criterion.requires_confirmation && criterion.passed && !previousPassed) {
-        throw new Error(`criterion "${criterion.name}" requires explicit user confirmation — use goal action=confirm instead of marking it passed`);
-      }
-    }
     await writeGoalState(workspaceRoot, next);
     notifyStateInvalidated(workspaceRoot);
     await recordGoalChange(workspaceRoot, "update", next);
@@ -715,59 +697,6 @@ export async function completeGoal(workspaceRoot: string, opts?: GoalMutationOpt
   });
 }
 
-/** Legacy user-confirmation path; relayed tool text is NOT Host evidence. */
-export async function confirmGoalCriterion(
-  workspaceRoot: string,
-  input: { criterion: string; detail?: string; expectedRevision?: number }
-): Promise<DurableGoal> {
-  return withGoalLock(workspaceRoot, async () => {
-    const goal = await getGoal(workspaceRoot);
-    if (!goal) throw new Error("No goal exists for this workspace.");
-    if (goal.status !== "active" && goal.status !== "paused") {
-      throw new Error(`Cannot confirm criteria on a ${goal.status} goal.`);
-    }
-    assertExpectedRevision(goal, { expectedRevision: input.expectedRevision });
-    const index = goal.success_criteria.findIndex((c) => criterionKey(c.name) === criterionKey(input.criterion));
-    if (index < 0) throw new Error(`Unknown criterion "${input.criterion}".`);
-    const criterion = goal.success_criteria[index];
-    if (!criterion.requires_confirmation) {
-      throw new Error(`Criterion "${criterion.name}" is not marked requires_confirmation; update it with action=update instead.`);
-    }
-    if (criterion.passed) throw new Error(`Criterion "${criterion.name}" is already confirmed.`);
-    assertGoalAccessibleBySession(goal, currentSessionId());
-    // A genuine Host-issued turn receipt must have been verified by an
-    // internal trusted adapter. Calling this function with arbitrary detail
-    // cannot manufacture user-confirmation evidence.
-    const hostEvidence = requireVerifiedHostUserConfirmation(goal, criterion.name);
-    const detail = cleanString(input.detail, 2000);
-    const next: DurableGoal = {
-      ...goal,
-      success_criteria: goal.success_criteria.map((c, i) =>
-        i === index
-          ? { ...c, passed: true, ...(detail ? { detail } : {}) }
-          : c
-      ),
-      revision: goal.revision + 1,
-      updated_at: new Date().toISOString(),
-    };
-    await writeGoalState(workspaceRoot, next);
-    notifyStateInvalidated(workspaceRoot);
-    await recordGoalChange(workspaceRoot, "confirm", next);
-    const scope = await inferProjectScope(workspaceRoot, [next.objective, next.current_phase, ...next.constraints]);
-    await appendHarnessEventSafe(workspaceRoot, {
-      type: "evidence/recorded",
-      project_roots: scope.roots,
-      goal_id: next.id,
-      evidence_kind: "user_confirmed",
-      data: {
-        criterion: criterion.name, source_tool: "goal",
-        ...hostEvidence, ...(detail ? { summary: detail } : {}),
-      },
-    });
-    return next;
-  });
-}
-
 export function goalSummary(goal: DurableGoal): GoalSummary {
   const remaining = goal.success_criteria.filter((criterion) => !criterion.passed);
   return {
@@ -781,19 +710,6 @@ export function goalSummary(goal: DurableGoal): GoalSummary {
     constraints: goal.constraints,
     owner_session: goal.owner_session,
     intent_provenance: unknownGoalIntentProvenance(goal.intent_provenance),
-    execution_mode: "continuous",
-    execution_policy: {
-      progress_messages: "checkpoint_and_visible_heartbeat",
-      user_reply: "visible_heartbeat_then_continue_until_DELIVERABLE_READY_or_verified_blocker",
-      visible_heartbeat: {
-        soft_after_ms: 270_000,
-        hard_before_ms: 300_000,
-        counts_as_heartbeat: "user_visible_assistant_text_only",
-        tool_activity_counts_as_heartbeat: false,
-        ends_execution: false,
-      },
-      supersedes_generic_progress_rules: true,
-    },
     watchdog_policy: {
       mode: "goal_scoped",
       lifecycle: "managed_by_goal",
@@ -824,7 +740,7 @@ export async function formatActiveGoalForInstructions(workspaceRoot: string): Pr
     "Success criteria:",
     criteria,
     constraints,
-    "Goal rules: keep executing unless the continuation contract permits yielding; normal agent execution must use goal actions rather than watchdog scripts.",
+    GOAL_GROUNDING_NOTE,
   ].filter(Boolean).join("\n");
 }
 

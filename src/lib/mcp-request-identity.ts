@@ -1,15 +1,29 @@
 import { AsyncLocalStorage } from "node:async_hooks";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 export interface McpRequestIdentity {
   readonly conversationSessionId?: string;
   readonly transportSessionId?: string;
+  readonly requestInstanceId: string;
+  readonly runtimeInstanceId: string;
+  readonly originalHeaders: Readonly<HeaderBag>;
+  readonly continuity: "trusted" | "unknown" | "conflict";
+  readonly source: "openai/session" | "none" | "conflict";
 }
 
 type HeaderValue = string | string[] | undefined;
 type HeaderBag = Record<string, HeaderValue>;
 
 const requestIdentityStorage = new AsyncLocalStorage<McpRequestIdentity>();
+export const MCP_RUNTIME_INSTANCE_ID = randomUUID();
+
+/** Account namespace is local launcher configuration, never request metadata. */
+export function runtimePrincipalId(workspaceRoot: string): string {
+  const account = process.env.HARNESS_ACCOUNT_ID?.trim();
+  if (account && /^[A-Za-z0-9_-]{1,128}$/.test(account)) return account;
+  const location = process.env.CHATGPT_PLUGINS_CONFIG || workspaceRoot;
+  return "local_" + createHash("sha256").update(process.platform === "win32" ? location.toLowerCase() : location).digest("hex").slice(0, 32);
+}
 
 /**
  * Resolve a stable ChatGPT conversation identity from trusted host metadata.
@@ -23,32 +37,50 @@ export function conversationSessionIdFromMeta(meta: unknown): string | undefined
   return typeof raw === "string" && raw.trim() ? deriveConversationSessionId(raw) : undefined;
 }
 
-/** Transport fallback for ChatGPT hosts that expose the documented metadata as headers. */
-export function conversationSessionIdFromHeaders(headers: HeaderBag | undefined): string | undefined {
-  if (!headers) return undefined;
-  const openAiSession = headerValue(headers, "x-openai-session");
-  if (openAiSession?.trim()) return deriveConversationSessionId(openAiSession);
-
-  // Compatibility with older OpenAI tunnel dispatch that exposed a stable
-  // workflow id rather than the documented conversation session metadata.
-  for (const name of ["x-client-request-id", "x-request-id"]) {
-    const raw = headerValue(headers, name);
-    if (!raw) continue;
-    const match = raw.trim().match(/^(wfr_[A-Za-z0-9]+)(?:\/[A-Za-z0-9_-]+)?$/);
-    if (match) return match[1];
-  }
+/** Legacy headers have no verified conversation semantics. Keep the API for old callers. */
+export function conversationSessionIdFromHeaders(_headers: HeaderBag | undefined): string | undefined {
   return undefined;
+}
+
+export function resolveMcpConversationIdentity(meta?: unknown): Pick<McpRequestIdentity, "conversationSessionId" | "continuity" | "source"> {
+  const inherited = requestIdentityStorage.getStore();
+  const supplied = conversationSessionIdFromMeta(meta);
+  if (inherited?.continuity === "conflict" ||
+      (supplied && inherited?.conversationSessionId && supplied !== inherited.conversationSessionId)) {
+    return { continuity: "conflict", source: "conflict" };
+  }
+  const conversationSessionId = supplied ?? inherited?.conversationSessionId;
+  return conversationSessionId
+    ? { conversationSessionId, continuity: "trusted", source: "openai/session" }
+    : { continuity: "unknown", source: "none" };
+}
+
+/** Capture protocol headers once, before recovery mutates them; credentials are excluded. */
+export function snapshotMcpRequestHeaders(headers: HeaderBag | undefined): Readonly<HeaderBag> {
+  const snapshot: HeaderBag = {};
+  for (const name of ["accept", "content-type", "mcp-session-id", "mcp-protocol-version"]) {
+    const value = headers && headerValue(headers, name);
+    if (value !== undefined) snapshot[name] = value;
+  }
+  return Object.freeze(snapshot);
 }
 
 export function runWithMcpRequestIdentity<T>(
   headers: HeaderBag | undefined,
   transportSessionId: string | undefined,
-  operation: () => T
+  operation: () => T,
+  body?: unknown
 ): T {
-  const identity: McpRequestIdentity = {
-    conversationSessionId: conversationSessionIdFromHeaders(headers),
+  const inherited = requestIdentityStorage.getStore();
+  const meta = body && typeof body === "object" && !Array.isArray(body)
+    ? (body as { params?: { _meta?: unknown } }).params?._meta : undefined;
+  const identity: McpRequestIdentity = Object.freeze({
+    ...resolveMcpConversationIdentity(meta),
     transportSessionId,
-  };
+    requestInstanceId: inherited?.requestInstanceId ?? randomUUID(),
+    runtimeInstanceId: inherited?.runtimeInstanceId ?? MCP_RUNTIME_INSTANCE_ID,
+    originalHeaders: inherited?.originalHeaders ?? snapshotMcpRequestHeaders(headers),
+  });
   return requestIdentityStorage.run(identity, operation);
 }
 

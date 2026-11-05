@@ -65,7 +65,8 @@ try {
     await assert.rejects(run(() => loadProjectSkill(workspace, "finance-sheet", 32, { mode: "implicit", selection_id: first.selection_id, resource_path })), /RESOURCE_/);
   }
   for (const other of [scope("session-b"), scope("session-a", "account-b"), scope("session-a", "account-a", "goal-b")]) {
-    await assert.rejects(run(() => loadProjectSkill(workspace, "finance-sheet", 32, { mode: "implicit", selection_id: first.selection_id }), other), /SELECTION_INVALID/);
+    const resumed = await run(() => loadProjectSkill(workspace, "finance-sheet", 32, { mode: "implicit", selection_id: first.selection_id }), other);
+    assert.notEqual(resumed.selection_id, first.selection_id, "old correlation cannot grant access or block a fresh selection");
   }
   const outside = path.join(fixture, "outside-dir");
   await fs.mkdir(outside);
@@ -91,13 +92,13 @@ try {
   const substitute = path.join(fixture, "same-content-other-package");
   await fs.mkdir(substitute);
   await fs.writeFile(path.join(substitute, "SKILL.md"), body);
-  await assert.rejects(run(() => selectSkillContent(workspace, { ...originalSkill, dir: substitute, path: path.join(substitute, "SKILL.md") }, "implicit", first.selection_id)), /SELECTION_INVALID/);
+  assert.notEqual((await run(() => selectSkillContent(workspace, { ...originalSkill, dir: substitute, path: path.join(substitute, "SKILL.md") }, "implicit", first.selection_id))).id, first.selection_id);
   const moved = dir + "-moved";
   await fs.rename(dir, moved);
   await fs.mkdir(dir);
   await fs.writeFile(path.join(dir, "SKILL.md"), body);
   try {
-    await assert.rejects(run(() => loadProjectSkill(workspace, "finance-sheet", 32, { mode: "implicit", selection_id: first.selection_id })), /SELECTION_INVALID/);
+    assert.notEqual((await run(() => loadProjectSkill(workspace, "finance-sheet", 32, { mode: "implicit", selection_id: first.selection_id }))).selection_id, first.selection_id);
     const savedSelection = await run(() => selectSkillContent(workspace, { ...originalSkill, dir: moved, path: path.join(moved, "SKILL.md") }, "implicit"));
     await fs.rename(moved, moved + "-again");
     await fs.mkdir(moved);

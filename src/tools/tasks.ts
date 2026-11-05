@@ -15,36 +15,17 @@ import {
   type DurableTaskStatus,
   type TaskBlockedReason,
 } from "../lib/durable-tasks.js";
-import { GOAL_GROUNDING_NOTE, getGoal, type GoalCriterion } from "../lib/goals.js";
+import { GOAL_GROUNDING_NOTE, getGoal } from "../lib/goals.js";
 
-/**
- * Continuation-signal fields for task_state results. A just-recorded blocker
- * takes precedence: the contract's sanctioned yield path must not be
- * countermanded by a "keep executing" hint at the same moment.
- */
+/** Return related work-record facts without imposing an execution gate. */
 function continuationFields(
   goal: Awaited<ReturnType<typeof getGoal>>,
   blocked?: TaskBlockedReason
 ): Record<string, unknown> {
-  if (blocked) {
-    return {
-      blocked_yield: true,
-      execution_hint:
-        "Blocked state recorded — you may yield to the user for this blocker; continue execution once it is resolved.",
-    };
-  }
-  const remaining = goal?.success_criteria.filter((criterion: GoalCriterion) => !criterion.passed).length ?? 0;
-  // An active Goal still needs explicit finalization even after its last
-  // criterion passes; finishing a subtask must never signal a Goal stop.
-  return goal?.status === "active"
-    ? {
-        continue_execution: true,
-        execution_hint:
-          remaining > 0
-            ? "The subtask may be complete but its Goal is still active: continue using tools toward the remaining Goal criteria. Task completion is not Goal completion."
-            : "All Goal criteria may be passed, but Goal completion requires the separate verified goal action=complete. Task completion does not finalize the Goal.",
-      }
-    : {};
+  return {
+    ...(blocked ? { recorded_blocker: blocked } : {}),
+    ...(goal ? { related_goal_status: goal.status, related_goal_unverified_count: goal.success_criteria.filter(criterion => !criterion.passed).length } : {}),
+  };
 }
 
 const checkSchema = z.object({
@@ -88,11 +69,12 @@ export function registerTaskTools(server: McpServer, workspaceRoot: string): voi
           message: z.string().min(1).max(1000),
         }).optional().describe("Structured blocker; cleared by resolved_blockers"),
         note: z.string().max(2000).optional(),
+        completion_basis: z.string().max(4000).optional(),
         limit: z.number().int().min(1).max(30).optional().default(10),
       },
       annotations: toolAnnotations("edit"),
     },
-    async ({ action, task_id, expected_goal_revision, goal, current_step, done, decisions, blockers, resolved_blockers, next_actions, artifacts, notes, blocking_checks, advisory_checks, visual_required, blocked_reason, note, limit }) => {
+    async ({ action, task_id, expected_goal_revision, goal, current_step, done, decisions, blockers, resolved_blockers, next_actions, artifacts, notes, blocking_checks, advisory_checks, visual_required, blocked_reason, note, completion_basis, limit }) => {
       try {
         if (action === "create") {
           if (!goal?.trim()) throw new Error("task_state action=create requires goal");
@@ -119,18 +101,18 @@ export function registerTaskTools(server: McpServer, workspaceRoot: string): voi
                 visual_required,
               })
             : task;
-          const activeGoal = await getGoal(workspaceRoot);
+          const activeGoal = await getGoal(workspaceRoot).catch(() => null);
           return toolResult(
             "task_state",
             { action, handoff: taskHandoff(checkpointed), ...continuationFields(activeGoal) },
-            { summary: `task active: ${task.id} — continue execution` }
+            { summary: `task active: ${task.id}` }
           );
         }
 
         if (action === "resume") {
           const task = await resolveDurableTask(workspaceRoot, task_id);
           const handoff = taskHandoff(task);
-          const activeGoal = await getGoal(workspaceRoot);
+          const activeGoal = await getGoal(workspaceRoot).catch(() => null);
           return toolResult(
             "task_state",
             { action, handoff, ...continuationFields(activeGoal, handoff.blocked) },
@@ -144,7 +126,7 @@ export function registerTaskTools(server: McpServer, workspaceRoot: string): voi
           }
           const current = await resolveDurableTask(workspaceRoot, task_id);
           const rebound = await revalidateDurableTaskGoalDefinition(workspaceRoot, current.id, expected_goal_revision);
-          const parent = await getGoal(workspaceRoot);
+          const parent = await getGoal(workspaceRoot).catch(() => null);
           return toolResult("task_state", {
             action,
             handoff: taskHandoff(rebound),
@@ -152,7 +134,7 @@ export function registerTaskTools(server: McpServer, workspaceRoot: string): voi
             previous_passed_checks_invalidated: true,
             current_goal_revision: parent?.revision ?? null,
             ...continuationFields(parent),
-          }, { summary: `task revalidated against Goal definition; rerun blocking checks before completion: ${rebound.id}` });
+          }, { summary: `task revalidated against Goal definition; prior check results were invalidated: ${rebound.id}` });
         }
         if (action === "checkpoint") {
           const task = await checkpointDurableTask(workspaceRoot, task_id, {
@@ -169,14 +151,10 @@ export function registerTaskTools(server: McpServer, workspaceRoot: string): voi
             visual_required,
             blocked_reason,
           });
-          // A progress checkpoint is the single most likely moment for the model
-          // to end its turn and "report progress" — re-assert the continuation
-          // contract right here, not just on the next broker snapshot. A
-          // just-recorded blocker switches the signal to the sanctioned yield.
           const handoff = taskHandoff(task);
-          const activeGoal = await getGoal(workspaceRoot);
+          const activeGoal = await getGoal(workspaceRoot).catch(() => null);
           const fields = continuationFields(activeGoal, handoff.blocked);
-          const suffix = handoff.blocked ? " — blocked" : fields.continue_execution ? " — continue execution" : "";
+          const suffix = handoff.blocked ? " — blocked" : "";
           return toolResult(
             "task_state",
             {
@@ -190,17 +168,15 @@ export function registerTaskTools(server: McpServer, workspaceRoot: string): voi
 
         if (action === "complete") {
           const task = await resolveDurableTask(workspaceRoot, task_id);
-          const completed = await completeDurableTask(workspaceRoot, task.id, note);
-          const parent = await getGoal(workspaceRoot);
+          const completed = await completeDurableTask(workspaceRoot, task.id, completion_basis ?? note);
+          const parent = await getGoal(workspaceRoot).catch(() => null);
           const goalStillActive = parent?.status === "active";
           return toolResult("task_state", {
-            action, deliverable_ready: true, deliverable_scope: "task",
+            action, deliverable_ready: false, completion_status: "model_declared", completion_basis: completed.completion_basis, unmet_checks: completed.completion_basis?.unmet_checks ?? [], deliverable_scope: "task",
             goal_still_active: goalStillActive, goal_id: parent?.id ?? null,
             grounding: GOAL_GROUNDING_NOTE, handoff: taskHandoff(completed),
             ...continuationFields(parent),
-          }, { summary: goalStillActive
-            ? `TASK_COMPLETED_GOAL_CONTINUES ${task.id}`
-            : `DELIVERABLE_READY ${task.id}` });
+          }, { summary: `TASK_COMPLETION_DECLARED ${task.id}` });
         }
 
         if (action === "cancel") {
@@ -294,7 +270,7 @@ export function registerTaskTools(server: McpServer, workspaceRoot: string): voi
     async ({ task_id, ...patch }) => {
       try {
         if (patch.status === "completed") {
-          throw new Error("Use task_complete to enter completed state; it enforces blocking checks.");
+          throw new Error("Use task_complete to record a model completion declaration.");
         }
         const task = await updateDurableTask(workspaceRoot, task_id, patch);
         return toolResult("task_update", { task_id, task }, { summary: `task_update: ${task_id}` });
@@ -309,24 +285,28 @@ export function registerTaskTools(server: McpServer, workspaceRoot: string): voi
     {
       title: "Complete Durable Task",
       description:
-        "Mark a task DELIVERABLE_READY only when every blocking check passes. Advisory checks may remain incomplete and do not block delivery.",
+        "Record the model’s completion declaration and its basis. Unmet checks remain unverified and visible.",
       inputSchema: {
         task_id: z.string().uuid(),
         note: z.string().max(4000).optional(),
+        completion_basis: z.string().max(4000).optional(),
       },
       annotations: toolAnnotations("edit"),
     },
-    async ({ task_id, note }) => {
+    async ({ task_id, note, completion_basis }) => {
       try {
-        const task = await completeDurableTask(workspaceRoot, task_id, note);
-        const parent = await getGoal(workspaceRoot);
+        const task = await completeDurableTask(workspaceRoot, task_id, completion_basis ?? note);
+        const parent = await getGoal(workspaceRoot).catch(() => null);
         const goalStillActive = parent?.status === "active";
         return toolResult(
           "task_complete",
           {
             task_id,
             task,
-            deliverable_ready: true,
+            deliverable_ready: false,
+            completion_status: "model_declared",
+            completion_basis: task.completion_basis,
+            unmet_checks: task.completion_basis?.unmet_checks ?? [],
             deliverable_scope: "task",
             goal_still_active: goalStillActive,
             goal_id: parent?.id ?? null,
@@ -334,9 +314,7 @@ export function registerTaskTools(server: McpServer, workspaceRoot: string): voi
             advisory_remaining: task.advisory_checks.filter((check) => !check.passed).length,
             ...continuationFields(parent),
           },
-          { summary: goalStillActive
-            ? `task_complete: ${task_id} TASK_COMPLETED_GOAL_CONTINUES`
-            : `task_complete: ${task_id} DELIVERABLE_READY` }
+          { summary: `task_complete: ${task_id} TASK_COMPLETION_DECLARED` }
         );
       } catch (error) {
         return toolError("task_complete", error instanceof Error ? error.message : String(error));

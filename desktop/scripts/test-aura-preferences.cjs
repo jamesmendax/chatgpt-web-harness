@@ -152,7 +152,7 @@ const deadline = setTimeout(() => finish(new Error("Preference regression deadli
     ["needs_input", "REQUIREMENT_CONTRACT_INVALID", "admission", false, "retry_with_changed_args", "参数待修正"],
     ["review_rejected", "VISUAL_REVIEW_REJECTED", "postprocessing", true, "repair_then_review", "评审未通过"],
     ["blocked", "POLICY_DENIED", "admission", false, "none", "未执行"],
-    ["execution_error", "COMMAND_EXIT_NONZERO", "execution", true, "inspect_original_result", "失败"]
+    ["execution_error", "COMMAND_EXIT_NONZERO", "execution", true, "inspect_original_result", "执行失败"]
   ].map(([kind, code, phase, started, retry, label], index) => ({ kind, code, phase, started, retry, label, callId: "prefs-outcome-" + kind, summary: "回归样例 " + (index + 1), ms: index + 2 }));
   preview.append("mcp", outcomes.map(row => "[TOOL] [running] run_command — " + row.summary + " 0ms call=" + row.callId), b);
   await wait("(()=>{const calls=window.__harness.core.snapshot().activity.filter(row=>row.callId?.startsWith('prefs-outcome-'));return calls.length===4&&calls.every(row=>row.phase==='running');})()", "four concurrent calls of the same tool");

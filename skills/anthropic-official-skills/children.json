@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "upstream_commit": "ca45fc4",
+  "children": [
+    "academy-guide",
+    "algorithmic-art",
+    "brand-guidelines",
+    "canvas-design",
+    "claude-api",
+    "discernment-nudge",
+    "frontend-design",
+    "internal-comms",
+    "mcp-builder",
+    "skill-creator",
+    "slack-gif-creator",
+    "theme-factory",
+    "web-artifacts-builder",
+    "webapp-testing"
+  ]
+}

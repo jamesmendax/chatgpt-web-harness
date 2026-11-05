@@ -1,4 +1,5 @@
 import type { SkillSummary } from "./skills-loader.js";
+import { selectSkill } from "./skill-resolver.js";
 
 export type SkillRoutePhase = "auto" | "design" | "implement" | "review" | "test" | "migrate" | "explain";
 export interface SkillRouteRequest {
@@ -40,12 +41,17 @@ const CAPABILITIES: Capability[] = [
     skill: /(?:testing|verification|verify|regression|test|visual-qa|quality assurance|QA|测试|验证|验收)/i, weight: 8, phases: ["test", "review"] },
   { name: "browser-automation", task: /(?:浏览器操作|网页测试|截图验证|网页交互|浏览器自动化|browser automation|browser use|web app testing|browser test)/i,
     skill: /(?:browser-use|browser|web app testing|control.*browser|visual feedback)/i, weight: 10, phases: ["test", "implement"] },
+  { name: "webapp-testing", task: /(?:test|debug|验证|测试).{0,45}(?:web app(?:lication)?|网页|网站).{0,45}(?:browser|浏览器)|(?:browser|浏览器).{0,45}(?:test|测试).{0,45}(?:web app(?:lication)?|网页)/i,
+    skill: /(?:webapp-testing)/i, weight: 18, phases: ["test"] },
+  { name: "web-artifact", task: /(?:build|create|make|创建|制作).{0,45}(?:interactive|交互式).{0,30}(?:web artifact|网页原型)|(?:interactive|交互式).{0,30}(?:web artifact|网页原型)/i,
+    skill: /(?:web-artifacts-builder)/i, weight: 18, phases: ["design", "implement"] },
   { name: "code-explanation", task: /(?:解释|讲解|为什么|说明代码|原理|只读分析|explain|how does.*work|read-only analysis)/i,
     skill: /(?:explains how code|code.*work|explain|分析|讲解|research)/i, weight: 10, phases: ["explain"] },
   { name: "skill-authoring", task: /(?:创建.{0,5}(?:技能|skill)|编写.{0,5}(?:技能|skill)|更新.{0,5}(?:技能|skill)|create a skill|build a skill)/i,
     skill: /(?:skill creation|creating.*skills|create.*skill|skill-creator|编写技能|创建技能)/i, weight: 11, phases: ["implement"] },
 ];
 const STOP = new Set(["this", "that", "with", "from", "please", "into", "make", "using",
+  "the", "what", "when", "where", "which", "will", "your", "their", "would", "could",
   "have", "more", "code", "task", "these", "those", "should", "about", "after",
   "text", "data", "file", "files", "create", "produce", "output", "help", "some", "just", "answer", "user", "request"]);
 function englishTokens(text: string): string[] {
@@ -80,11 +86,38 @@ export function routeSkills(skills: readonly SkillSummary[], input: SkillRouteRe
   if (/(?:(?:不|别|勿|不要|不准|不允许)(?:再|要)?(?:使用|调用|用|启用).{0,16}(?:skills?|技能)|(?:不要|无需|不用).{0,16}(?:skills?|技能)|without.{0,32}skills?|(?:do not|don't|never|avoid|no)\s+(?:use\s+|using\s+|any\s+|of\s+|the\s+|calling\s+)*skills?)/i.test(task)) return empty("suppressed");
   if (task.length < 4) return empty("no_match");
 
+  // A named ID or alias resolves with the same source precedence as load_skill.
+  // Resolve before the implicit policy check, so a manual-only project Skill
+  // cannot silently fall back to an identically named built-in alias.
+  const named = skills.filter(s => s.enabled && !s.shadowedBy && !s.error)
+    .flatMap(s => [s.id, ...(s.aliases || [])])
+    .filter(name => /[.-]/.test(name))
+    .map(name => {
+      const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const match = new RegExp(`(^|[^a-z0-9._-])(${escaped})(?![a-z0-9._-])`, "i").exec(task);
+      return match ? { name, index: match.index + match[1].length } : null;
+    }).filter((item): item is { name: string; index: number } => item !== null)
+    .sort((a, b) => a.index - b.index || b.name.length - a.name.length)[0];
+  if (named) {
+    let chosen: SkillSummary;
+    try { chosen = selectSkill([...skills], named.name, "implicit"); }
+    catch { return empty("no_match"); }
+    if (!eligible(chosen)) return empty("no_match");
+    return { status: "matched", phase, considered, primary: { id: chosen.id, name: chosen.name,
+      source: chosen.source, content_sha256: chosen.content_sha256!, score: 100,
+      matched_capabilities: ["named-skill"], invocation_mode: "implicit" }, supporting: [] };
+  }
+
   const words = englishTokens(task);
   const chinese = chineseTokens(task);
   const ranked: RoutedSkill[] = [];
   for (const skill of skills) {
     if (!eligible(skill)) continue;
+    // These provider-specific skills must not match generic design, API,
+    // training or brand work merely through lexical overlap.
+    if (skill.id === "anthropic.claude-api" && !/(?:anthropic|claude).{0,50}(?:api|sdk|开发|集成|platform)|(?:api|sdk).{0,50}(?:anthropic|claude)|anthropic\.claude-api/i.test(task)) continue;
+    if (skill.id === "anthropic.academy-guide" && !/(?:claude|anthropic).{0,50}(?:academy|learning|course|training|教程|学习|课程)|(?:academy|学习|课程).{0,50}(?:claude|anthropic)|anthropic\.academy-guide/i.test(task)) continue;
+    if (skill.id === "anthropic.brand-guidelines" && !/(?:anthropic|claude).{0,50}(?:brand|branding|品牌|视觉识别)|(?:brand|品牌).{0,50}(?:anthropic|claude)|anthropic\.brand-guidelines/i.test(task)) continue;
     const description = String(skill.description || "").slice(0, 2400);
     const text = [skill.id, skill.name, ...(skill.aliases || []), description].join(" ").toLowerCase();
     let score = 0;

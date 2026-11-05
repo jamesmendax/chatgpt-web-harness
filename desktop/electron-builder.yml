@@ -3,7 +3,7 @@ productName: ChatGPT Web Harness Isolated
 copyright: MIT
 publish: null
 directories:
-  output: release-3.1.2
+  output: release-3.1.0-alpha.2
   buildResources: build
 files:
   - src/**

@@ -500,6 +500,26 @@ async function scanTree(root: string, source: "project" | "builtin", registryEnt
   return found;
 }
 
+// Only the bundled, explicitly enumerated children are registered. Generic
+// skill discovery remains bounded and never walks arbitrary resource trees.
+async function scanAnthropicChildren(codeRoot: string, registryEntries: SkillResolverRegistryEntry[], includeLayout: boolean): Promise<ResolvedSkill[]> {
+  const root = path.join(path.resolve(codeRoot), "skills", "anthropic-official-skills");
+  let manifest: { children: string[] };
+  try { manifest = JSON.parse(await fs.readFile(path.join(root, "children.json"), "utf8")); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return []; throw error; }
+  if (!Array.isArray(manifest.children) || new Set(manifest.children).size !== manifest.children.length ||
+      manifest.children.some(slug => typeof slug !== "string" || !/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(slug))) {
+    throw new Error("Invalid Anthropic child skill manifest");
+  }
+  return Promise.all(manifest.children.map(async slug => {
+    const id = `anthropic.${slug}`;
+    const registered = registryEntries.find(entry => entry.source === "builtin" && entry.id?.toLowerCase() === id);
+    return makeSkill({ id, source: "builtin", skillPath: path.join(root, "references", "skills", slug, "SKILL.md"),
+      aliases: [slug, ...(registered?.aliases ?? [])], enabled: registered?.enabled !== false,
+      version: registered?.version, includeLayout });
+  }));
+}
+
 async function scanInstalled(root: string, registryEntries: SkillResolverRegistryEntry[] = [], includeLayout = true): Promise<ResolvedSkill[]> {
   const found: ResolvedSkill[] = [];
   const registryById = new Map(registryEntries.filter((entry) => entry.source === "installed").map((entry) => [String(entry.id || "").toLowerCase(), entry]));
@@ -622,7 +642,8 @@ export async function resolveSkills(input: ResolveSkillsInput): Promise<Resolved
   const installed = await scanInstalled(path.resolve(input.installedDir), registryEntries, includeLayout);
   const external = await scanExternal(input.registry.skills ?? [], includeLayout);
   const builtin = await scanTree(path.join(path.resolve(input.codeRoot), "skills"), "builtin", registryEntries, includeLayout);
-  const all = [...project, ...installed, ...external, ...builtin];
+  const children = await scanAnthropicChildren(input.codeRoot, registryEntries, includeLayout);
+  const all = [...project, ...installed, ...external, ...builtin, ...children];
   const computerPath = await findComputerUseSkill({
     codeRoot: input.codeRoot,
     platform: input.platform,

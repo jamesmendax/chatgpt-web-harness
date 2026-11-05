@@ -18,6 +18,48 @@ async function assertAuraNavigation({ js, click, wheel, pause }) {
       x:Math.round(frame.left+frame.width*.6),y:Math.round(frame.top+Math.min(180,frame.height*.4)) };
   })()`);
   const synced = (sample,message) => assert.ok(sample.allowed.includes(sample.current),`${message}: ${JSON.stringify(sample)}`);
+  // Native input is queued asynchronously; do not enqueue another wheel before
+  // the previous event reached the renderer and its resulting scroll settled.
+  // Poll from the Node side so occlusion/throttled requestAnimationFrame cannot
+  // turn this into an unbounded wait.
+  const waitStable = async (label, before, direction) => {
+    const deadline = Date.now() + 6000;
+    let last, stableSince = 0, stableSamples = 0;
+    let moved = before === undefined;
+    while (Date.now() < deadline) {
+      const sample = await read();
+      if (before !== undefined && Math.abs(sample.top - before) > 1) moved = true;
+      const boundary = direction > 0 ? before >= sample.max - 1 : direction < 0 ? before <= 1 : false;
+      const same = last && Math.abs(sample.top - last.top) <= 0.5 && sample.current === last.current;
+      if (same) stableSamples += 1;
+      else { stableSince = Date.now(); stableSamples = 0; }
+      if ((moved || boundary) && same && stableSamples >= 3 && Date.now() - stableSince >= 100 && sample.allowed.includes(sample.current)) return sample;
+      last = sample;
+      await pause(35);
+    }
+    throw new Error(`settings scroll did not settle (${label}): ${JSON.stringify({before,direction,last})}`);
+  };
+  const nativeWheel = async (x, y, delta) => {
+    await js(`(() => {
+      window.__auraWheelProbe = null;
+      document.querySelector('#setup-form').addEventListener('wheel', event => {
+        window.__auraWheelProbe = {top:event.currentTarget.scrollTop,deltaY:event.deltaY,deltaMode:event.deltaMode,trusted:event.isTrusted};
+      }, {once:true,passive:true,capture:true});
+    })()`);
+    await wheel(x, y, delta);
+    const deadline = Date.now() + 6000;
+    let event;
+    while (Date.now() < deadline && !event) {
+      event = await js(`window.__auraWheelProbe`);
+      if (!event) await pause(35);
+    }
+    await js(`delete window.__auraWheelProbe`);
+    assert.ok(event?.trusted, `native wheel did not reach settings form: ${JSON.stringify({delta,event})}`);
+    assert.equal(Math.sign(event.deltaY), Math.sign(delta), `native wheel direction changed: ${JSON.stringify({delta,event})}`);
+    assert.equal(event.deltaMode, 0, `native wheel did not report pixel deltas: ${JSON.stringify(event)}`);
+    assert.equal(Math.abs(event.deltaY), Math.abs(delta), `native wheel delta was coalesced or scaled: ${JSON.stringify({delta,event})}`);
+    return event;
+  };
   await click('#nav [data-view="settings"]');
   await pause(300);
   await click('#st-index [data-ch="tools"]');
@@ -41,14 +83,15 @@ async function assertAuraNavigation({ js, click, wheel, pause }) {
     assert.equal(sample.visible,true,`clicked settings ${chapter} is not visible`);
   }
 
+  await waitStable("final chapter navigation");
   await js(`document.querySelector('#setup-form').scrollTo({top:0,behavior:'instant'})`);
-  await pause(100);
-  let previous = await read();
+  let previous = await waitStable("initial reset");
+  assert.ok(previous.top <= 1, "initial settings reset did not reach the top");
   for (const direction of [1, -1]) {
     for (let i = 0; i < 50; i++) {
-      await wheel(previous.x, previous.y, direction * 80);
-      await pause(65);
-      const sample = await read(); samples.push({direction,...sample});
+      const wheelEvent = await nativeWheel(previous.x, previous.y, direction * 80);
+      const sample = await waitStable("wheel", previous.top, direction);
+      samples.push({direction,wheelEvent,...sample});
       synced(sample,"settings wheel selection does not match the chapter at the reading line");
       assert.equal(sample.visible, true, "selected settings chapter must be visible");
       if (Math.abs(sample.top-previous.top) > 1) {
@@ -78,15 +121,8 @@ async function assertAuraNavigation({ js, click, wheel, pause }) {
   await click('#st-index [data-ch="guide"]');
   await pause(100);
   const moving = await read();
-  await js(`(() => {
-    window.__auraWheelProbe = null;
-    const form = document.querySelector('#setup-form');
-    form.addEventListener('wheel',event=>{window.__auraWheelProbe={top:form.scrollTop,deltaY:event.deltaY,trusted:event.isTrusted};},{once:true,passive:true,capture:true});
-  })()`);
-  await wheel(moving.x,moving.y,-80);
-  await pause(100);
-  const interrupted = await read();
-  const wheelEvent = await js(`(() => {const event=window.__auraWheelProbe;delete window.__auraWheelProbe;return event;})()`);
+  const wheelEvent = await nativeWheel(moving.x,moving.y,-80);
+  const interrupted = await waitStable("reversed wheel", wheelEvent.top, -1);
   assert.ok(wheelEvent?.trusted && wheelEvent.deltaY < 0,"native reversed wheel did not reach the settings form");
   synced(interrupted,"wheel reversal leaves click navigation selection stale");
   assert.ok(interrupted.top < wheelEvent.top,`wheel reversal did not interrupt click navigation: ${JSON.stringify({moving,wheelEvent,interrupted})}`);

@@ -465,11 +465,26 @@ export async function uninstallSkill(options: UninstallSkillOptions): Promise<{ 
   return { ok: true, id, removed: false };
 }
 
+function builtinExists(codeRoot: string | undefined, id: string): boolean {
+  if (!codeRoot) return false;
+  const skillsRoot = path.join(path.resolve(codeRoot), "skills");
+  if (fs.existsSync(path.join(skillsRoot, id, "SKILL.md"))) return true;
+  const slug = /^anthropic\.([a-z0-9]+(?:-[a-z0-9]+)*)$/.exec(id)?.[1];
+  if (!slug) return false;
+  const root = path.join(skillsRoot, "anthropic-official-skills");
+  try {
+    const manifest = JSON.parse(fs.readFileSync(path.join(root, "children.json"), "utf8"));
+    return Array.isArray(manifest.children) && manifest.children.includes(slug) &&
+      fs.existsSync(path.join(root, "references", "skills", slug, "SKILL.md"));
+  } catch { return false; }
+}
+
 function sourceForId(options: SetSkillEnabledOptions, config: LocalPluginsConfig, id: string, fileOps: SkillFsOps): "installed" | "external" | "builtin" {
   if (options.source) return options.source;
   if (childDirectory(path.resolve(options.localSkillsDir), id, fileOps)) return "installed";
   const row = rowsFor(config, id)[0];
   if (row?.source) return row.source;
+  if (builtinExists(options.codeRoot, id)) return "builtin";
   return "external";
 }
 
@@ -481,8 +496,7 @@ export async function setSkillEnabled(options: SetSkillEnabledOptions): Promise<
   const config = registry(options.registryPath);
   const source = sourceForId({ ...options, localSkillsDir: localDir }, config, options.id, fileOps);
   if (source === "builtin") {
-    const builtin = options.codeRoot ? path.join(path.resolve(options.codeRoot), "skills", options.id, "SKILL.md") : "";
-    if (!builtin || !fs.existsSync(builtin)) throw new SkillInstallerError("builtin Skill 不存在。", 404);
+    if (!builtinExists(options.codeRoot, options.id)) throw new SkillInstallerError("builtin Skill 不存在。", 404);
   }
   if (source === "installed" && !childDirectory(localDir, options.id, fileOps)) {
     throw new SkillInstallerError(`installed Skill 不存在: ${options.id}`, 404);

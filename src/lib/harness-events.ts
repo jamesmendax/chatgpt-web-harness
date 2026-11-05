@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
+import { accountProjectDir } from "./account-project-scope.js";
 
 export type HarnessEvidenceKind = "deterministic" | "runtime" | "model_assessed" | "user_confirmed";
 
@@ -103,7 +104,7 @@ function projectSlug(workspaceRoot: string): string {
 
 export function harnessEventLogPath(workspaceRoot: string): string {
   const base = process.env.CODEX_HOME || path.join(os.homedir(), ".codex");
-  return path.join(base, "projects", projectSlug(workspaceRoot), "harness-events.jsonl");
+  return path.join(accountProjectDir(path.join(base, "projects", projectSlug(workspaceRoot))), "harness-events.jsonl");
 }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {

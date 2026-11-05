@@ -39,11 +39,14 @@ function payload(result) {
 
 try {
   const { createMcpServer } = await import("../dist/server-factory.js");
-  const { getRuntimeScope } = await import("../dist/lib/runtime-scope.js");
+  const { getRuntimeScope, createRuntimeScope, runWithRuntimeScope } = await import("../dist/lib/runtime-scope.js");
+  const { runtimePrincipalId } = await import("../dist/lib/mcp-request-identity.js");
   const { getGoal, getWorkspaceGoalProjection } = await import("../dist/lib/goals.js");
   const { readGoalRun } = await import("../dist/lib/goal-run-store.js");
   const { EffectiveToolRegistry } = await import("../dist/lib/effective-tool-registry.js");
   const { InvocationGateway } = await import("../dist/lib/invocation-gateway.js");
+  const inAccount = (sessionId, fn) => runWithRuntimeScope(createRuntimeScope({ workspaceRoot: workspace,
+    projectRoots: [workspace], principalId: runtimePrincipalId(workspace) }, { sessionId }), fn);
   ({ stopGoalWatchdog } = await import("../dist/lib/goal-watchdog.js"));
 
   const probeName = "anonymous_session_probe";
@@ -125,7 +128,7 @@ try {
   const goalB = (await create(second, "anonymous B independent Goal")).goal;
   assert.notEqual(goalA.id, goalB.id);
   assert.equal(goalB.owner_session, initialB.session);
-  assert.equal((await getWorkspaceGoalProjection(workspace)).id, goalB.id,
+  assert.equal((await inAccount(initialB.session, () => getWorkspaceGoalProjection(workspace))).id, goalB.id,
     "B must be the discovery projection before A re-enters");
 
   const spoof = {
@@ -150,8 +153,8 @@ try {
 
   assert.equal((await call(first, "goal", { action: "status" })).goal.id, goalA.id);
   assert.equal((await call(second, "goal", { action: "status" })).goal.id, goalB.id);
-  assert.equal((await getGoal(workspace, initialA.session)).id, goalA.id);
-  assert.equal((await getGoal(workspace, initialB.session)).id, goalB.id);
+  assert.equal((await inAccount(initialA.session, () => getGoal(workspace, initialA.session))).id, goalA.id);
+  assert.equal((await inAccount(initialB.session, () => getGoal(workspace, initialB.session))).id, goalB.id);
   const evidenceA = await call(first, "file_info", { path: fixtureFile, sha256: true });
   const evidenceB = await call(second, "file_info", { path: fixtureFile, sha256: true });
   assert.ok(evidenceA.goal_run_evidence?.id, "A lost evidence without a transport session ID");
@@ -159,10 +162,12 @@ try {
   assert.equal(evidenceA.goal_run_evidence.verifies_criterion, true);
   assert.equal(evidenceB.goal_run_evidence.verifies_criterion, true);
   assert.notEqual(evidenceA.goal_run_evidence.id, evidenceB.goal_run_evidence.id);
-  assert.equal(evidenceA.harness_context.goal.goal_id, goalA.id);
-  assert.equal(evidenceB.harness_context.goal.goal_id, goalB.id);
-  const runA = (await readGoalRun(workspace, initialA.session)).run;
-  const runB = (await readGoalRun(workspace, initialB.session)).run;
+  // Unchanged context may be deduplicated; any context actually delivered
+  // must still belong to the receiving session.
+  if (evidenceA.harness_context) assert.equal(evidenceA.harness_context.goal.goal_id, goalA.id);
+  if (evidenceB.harness_context) assert.equal(evidenceB.harness_context.goal.goal_id, goalB.id);
+  const runA = (await inAccount(initialA.session, () => readGoalRun(workspace, initialA.session))).run;
+  const runB = (await inAccount(initialB.session, () => readGoalRun(workspace, initialB.session))).run;
   assert.equal(runA.runId, goalA.id);
   assert.equal(runB.runId, goalB.id);
   assert.ok(runA.typedEvidence.some(evidence => evidence.id === evidenceA.goal_run_evidence.id));
@@ -200,7 +205,7 @@ try {
   assert.equal(bareResult.session, null);
   assert.equal(bareResult.goal, null);
   assert.equal(bareResult.owner, null);
-  assert.equal((await getWorkspaceGoalProjection(workspace)).id, goalC.id);
+  assert.equal((await inAccount(trustedTransportSession, () => getWorkspaceGoalProjection(workspace))).id, goalC.id);
   console.log("Anonymous MCP factory sessions: stable distinct owners, per-Goal evidence, transport precedence, raw-argument rejection and bare-Gateway isolation passed");
 } finally {
   for (const { client, server } of servers) {

@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "id": "computer-use",
+  "name": "Harness Computer Use",
+  "version": "1.0.0",
+  "provider": "harness-windows-native",
+  "protocol_version": 1,
+  "license": "MIT",
+  "platforms": ["win32-x64"],
+  "entrypoint": "windows-action.ps1",
+  "tool": "computer_use",
+  "default_enabled": false,
+  "capability_ttl_seconds": 3600,
+  "actions": ["status", "list_windows", "select_target", "screenshot", "click", "double_click", "move", "type", "scroll", "keypress", "drag", "wait", "close"],
+  "attribution": "Project-owned implementation following the public OpenAI computer action model; it is not the proprietary Codex Computer Use plugin."
+}

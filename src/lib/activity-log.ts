@@ -5,7 +5,7 @@ import { getAuditPath } from "./audit-path.js";
 import type { McpOutcomeObservation } from "./mcp-outcome.js";
 import { redactSensitiveText, toolDiagnosticTokens } from "./tool-diagnostics.js";
 export { redactSensitiveText } from "./tool-diagnostics.js";
-import { conversationSessionIdFromHeaders, conversationSessionIdFromMeta } from "./mcp-request-identity.js";
+import { getMcpRequestIdentity, resolveMcpConversationIdentity } from "./mcp-request-identity.js";
 
 export type ActivityKind = "tool" | "mcp" | "session" | "system";
 
@@ -74,7 +74,7 @@ export function conversationTaskTitleHint(tool: string, args: unknown): string |
 
 /**
  * Conversation attribution for activity entries. Only the documented ChatGPT
- * conversation identity (`openai/session` metadata or header) qualifies. The
+ * conversation identity (`openai/session` request-body metadata) qualifies. The
  * legacy workflow id and transport sessions are left out, so a call without it
  * stays unattributed instead of being pinned to the wrong conversation.
  */
@@ -85,7 +85,7 @@ export function activityConversationId(
   const params = body && typeof body === "object" && !Array.isArray(body)
     ? (body as { params?: { _meta?: unknown } }).params
     : undefined;
-  const id = conversationSessionIdFromMeta(params?._meta) ?? conversationSessionIdFromHeaders(headers);
+  const id = resolveMcpConversationIdentity(params?._meta).conversationSessionId;
   return id?.startsWith("oai_conv_") ? id : undefined;
 }
 
@@ -96,12 +96,29 @@ function shortConversationId(id: string): string {
 
 export function appendActivity(partial: Omit<ActivityEntry, "id" | "time"> & { time?: string }): ActivityEntry {
   const scope = getRuntimeScope();
+  const request = getMcpRequestIdentity();
   const scopedDetail = partial.kind === "tool" && scope && !partial.details?.canonical_lifecycle;
   const entry: ActivityEntry = {
     id: randomUUID(),
     time: partial.time ?? new Date().toISOString(),
     ...partial,
-    ...(scopedDetail ? { details: { ...partial.details, invocation_id: scope.invocationId, lifecycle_detail: true } } : {}),
+    details: {
+      runtime_instance_id: scope?.runtimeInstanceId ?? request?.runtimeInstanceId,
+      request_instance_id: scope?.requestInstanceId ?? request?.requestInstanceId,
+      conversation_continuity: scope?.conversationContinuity ?? request?.continuity ?? "unknown",
+      conversation_source: scope?.conversationContinuity === "trusted" ? "openai/session" : request?.source ?? "none",
+      ...(scope?.principalId ? { account_id: scope.principalId } : {}),
+      ...(scope?.requestId !== undefined ? { rpc_request_id: scope.requestId } : {}),
+      ...partial.details,
+    },
+    ...(scopedDetail ? { details: { ...partial.details,
+      runtime_instance_id: scope?.runtimeInstanceId ?? request?.runtimeInstanceId,
+      request_instance_id: scope?.requestInstanceId ?? request?.requestInstanceId,
+      conversation_continuity: scope?.conversationContinuity ?? request?.continuity ?? "unknown",
+      conversation_source: scope?.conversationContinuity === "trusted" ? "openai/session" : request?.source ?? "none",
+      account_id: scope.principalId,
+      rpc_request_id: scope.requestId,
+      invocation_id: scope.invocationId, lifecycle_detail: true } } : {}),
   };
 
   entries.push(entry);
@@ -172,7 +189,7 @@ function writeConsole(entry: ActivityEntry): void {
       entry.action === "tools/list" && entry.details?.tool_count != null
         ? ` (${entry.details.tool_count} tools)`
         : "";
-    console.log(`[MCP]${status} ${label}${discovery}${extra}${dur}${call}${sid}`);
+    console.log(`[MCP]${status} ${label}${discovery}${extra}${dur}${diagnostic}${call}${sid}`);
     return;
   }
 
@@ -267,7 +284,8 @@ export function logMcpRequest(
   httpStatus: number,
   errorMessage?: string,
   outcome?: McpOutcomeObservation,
-  conversationId?: string
+  conversationId?: string,
+  requestDetails?: Record<string, unknown>
 ): void {
   if (typeof body !== "object" || body === null) {
     if (httpStatus >= 400 || errorMessage) {
@@ -293,6 +311,8 @@ export function logMcpRequest(
     rpcResultStatus === "error" ||
     toolResultStatus === "error"
       ? "error"
+      : toolResultStatus === "running" || toolResultStatus === "unknown"
+        ? toolResultStatus
       : toolResultStatus === "success"
         ? "ok"
         : "transport_ok";
@@ -306,12 +326,16 @@ export function logMcpRequest(
     ? trimSummary(redactSensitiveText([argSummary, failure.error_summary].filter(Boolean).join(" — ")), 400)
     : argSummary);
   const outcomeDetails = {
+    ...requestDetails,
+    rpc_request_id: (body as { id?: unknown }).id,
     transport_status: transportStatus,
     rpc_result_status: rpcResultStatus,
     tool_result_status: toolResultStatus,
     client_delivery: outcome?.client_delivery ?? "unknown",
     request_error_observed: requestErrorObserved,
     ...(outcome?.invocation_id ? { invocation_id: outcome.invocation_id } : {}),
+    ...(outcome?.request_instance_id ? { request_instance_id: outcome.request_instance_id } : {}),
+    ...(outcome?.runtime_instance_id ? { runtime_instance_id: outcome.runtime_instance_id } : {}),
     ...(outcome?.observed_at ? { outcome_observed_at: outcome.observed_at } : {}),
     ...(failure ? { ...failure } : {}),
   };

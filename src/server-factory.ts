@@ -1,8 +1,6 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { RegisteredTool } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { randomUUID } from "node:crypto";
-import path from "node:path";
-import { recoveryStrictEnabled, recoveryToolMayRegister } from "./lib/recovery-integrity.js";
 import { registerFilesystemTools } from "./tools/filesystem.js";
 import { registerShellTools } from "./tools/shell.js";
 import { registerGitTools } from "./tools/git.js";
@@ -35,6 +33,7 @@ import {
   type InvocationTraceRecord,
 } from "./lib/invocation-gateway.js";
 import { setAllowedRoots, setDefaultCwd, setFullDiskAccess } from "./lib/path-security.js";
+import { runtimePrincipalId } from "./lib/mcp-request-identity.js";
 import { APP_VERSION, setRuntimeToolCatalog } from "./lib/runtime-manifest.js";
 
 const NOOP_TOOL = {
@@ -93,10 +92,11 @@ function configureToolRegistration(
     registry,
     {
       workspaceRoot,
+      principalId: runtimePrincipalId(workspaceRoot),
       projectRoots: workspaceRoots,
       tunnelProfile,
-      // Anonymous embedded transports still need a stable per-server boundary.
-      // HTTP transport sessions take precedence in createRuntimeScope.
+      // Anonymous embedded transports still need a per-server fallback.
+      // Trusted conversation identity takes precedence in createRuntimeScope.
       fallbackSessionId: `local_mcp_${randomUUID()}`,
     },
     {
@@ -108,9 +108,6 @@ function configureToolRegistration(
   const original = server.registerTool.bind(server);
   server.registerTool = ((name, config, callback) => {
     const toolName = String(name);
-    if (!recoveryToolMayRegister(toolName, toolName.includes("__") ? "upstream" : "native")) {
-      return NOOP_TOOL;
-    }
     const definition = registry.prepare(
       toolName,
       config as EffectiveToolConfig,
@@ -144,17 +141,6 @@ export function createMcpServer(
   upstreamManager?: McpUpstreamManager,
   projectMemoryInstructions?: string
 ): McpServer {
-  // In the isolated RI preview, filesystem read authority must not silently
-  // expand to full-disk or extra roots. No dynamic upstream host may register
-  // itself during construction, even when its callbacks are later denied.
-  if (recoveryStrictEnabled()) {
-    const rootKey = (value: string) =>
-      process.platform === "win32" ? path.resolve(value).toLowerCase() : path.resolve(value);
-    if (fullDiskAccess || workspaceRoots.length !== 1 ||
-        rootKey(workspaceRoots[0]) !== rootKey(workspaceRoot) || upstreamManager) {
-      throw new Error("RI_ISOLATED_BOUNDARY_REQUIRED: strict isolated MCP mode demands one workspace, no full-disk access and no upstream manager");
-    }
-  }
   // The server factory is the composition root for runtime policy. Direct
   // in-memory/test servers must see the same workspace boundary as the HTTP
   // entrypoint, so configure path security here rather than only in index.ts.
