@@ -4,6 +4,7 @@ import fs from "node:fs/promises";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
+import isolation from "../desktop/scripts/lib/test-isolation.cjs";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const sourceRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -13,7 +14,7 @@ const runtimeRoot = process.env.HARNESS_TEST_RUNTIME_ROOT
 const distRoot = process.env.HARNESS_TEST_DIST_ROOT
   ? path.resolve(process.env.HARNESS_TEST_DIST_ROOT)
   : path.join(sourceRoot, "dist");
-const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "harness-browser-use-"));
+const tmp = isolation.artifactRoot("browser-use-provider");
 const dataDir = path.join(tmp, "account-browser-use");
 const auditLog = path.join(tmp, "browser-use.audit.jsonl");
 const runtimeLock = path.join(runtimeRoot, "bundled-plugins", "browser-use", "runtime-lock.json");

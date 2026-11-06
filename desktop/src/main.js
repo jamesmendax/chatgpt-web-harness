@@ -33,6 +33,12 @@ if (profile.isolated) {
   }
 }
 const taskbarAppId = resolveTaskbarAppId(profile.appId, { isPackaged: app.isPackaged });
+// Hard backstop for the UI renderer's JavaScript heap between the 3-second
+// memory samples: a runaway heap ends in an "oom" renderer exit, which the
+// recovery below turns into the static UI, instead of consuming system RAM.
+// Normal Aura use is far below it (66–109 MiB private in the 5-minute run).
+// Renderer processes only; the main process V8 is already initialized.
+app.commandLine.appendSwitch("js-flags", "--max-old-space-size=1024");
 const paths = require("./paths");
 const configStore = require("./config");
 const computerUseRuntime = require("./computer-use-runtime");
@@ -52,19 +58,22 @@ const normalAuraUrl = auraUrl(auraFile);
 const safeAuraUrl = normalAuraUrl + "&safeGraphics=1";
 let expectedAuraUrl = normalAuraUrl;
 const rendererSafeMarkerPath = () => path.join(app.getPath("userData"), "renderer-safe-graphics.json");
-function hasPersistedRendererSafeMode() {
+function readRendererSafeMarker() {
   try {
     const state = JSON.parse(fs.readFileSync(rendererSafeMarkerPath(), "utf8"));
-    return state && state.schema === 1 && state.enabled === true;
-  } catch (_) { return false; }
+    return state && state.schema === 1 && state.enabled === true ? state : null;
+  } catch (_) { return null; }
 }
 
 const APP_NAME = profile.displayName;
 let mainWindow = null;
 let rendererMemoryTimer = null;
-// A renderer exceeding the hard bound must not silently reenable WebGL on
-// the next cold start. A reviewed repair can clear this local marker.
-let rendererGraphicsSafe = hasPersistedRendererSafeMode();
+// A renderer that hit the memory emergency must not silently reenable WebGL
+// on the next cold start. Other renderer exits keep only this session static.
+// Settings → Appearance shows the reason and can clear it (graphics:restore).
+const persistedRendererSafe = readRendererSafeMarker();
+let rendererGraphicsSafe = !!persistedRendererSafe;
+let rendererSafeReason = persistedRendererSafe ? String(persistedRendererSafe.reason || "persisted") : null;
 let rendererRecoveryInProgress = false;
 const rendererCrashHistory = [];
 const rendererMemoryGuard = createRendererMemoryGuard();
@@ -85,6 +94,7 @@ const services = accounts.services;
 const feeds = accounts.feeds;
 function persistRendererSafeMode(reason) {
   rendererGraphicsSafe = true;
+  rendererSafeReason = reason;
   try {
     const file = rendererSafeMarkerPath();
     fs.mkdirSync(path.dirname(file), { recursive: true });
@@ -209,14 +219,23 @@ function createWindow() {
   const contents = mainWindow.webContents;
   contents.on("render-process-gone", (_event, details) => {
     if (quitting || !mainWindow || mainWindow.isDestroyed() || mainWindow.webContents !== contents) return;
+    const memoryRecovery = rendererRecoveryInProgress;
     rendererRecoveryInProgress = false;
     rendererMemoryGuard.reset();
-    persistRendererSafeMode("render-process-gone");
-    expectedAuraUrl = safeAuraUrl;
+    const reason = String(details?.reason || "unknown");
+    // Only memory evidence keeps later cold starts static. A Task Manager
+    // kill, driver reset or renderer crash keeps just this session static,
+    // which still stops a WebGL crash loop; a clean exit changes nothing.
+    if (memoryRecovery || reason === "oom" || reason === "memory-eviction") {
+      persistRendererSafeMode(memoryRecovery ? "renderer-memory-emergency" : reason);
+    } else if (reason !== "clean-exit") {
+      rendererGraphicsSafe = true;
+      rendererSafeReason = reason;
+    }
+    expectedAuraUrl = rendererGraphicsSafe ? safeAuraUrl : normalAuraUrl;
     const now = Date.now();
     rendererCrashHistory.push(now);
     while (rendererCrashHistory.length && rendererCrashHistory[0] < now - 300_000) rendererCrashHistory.shift();
-    const reason = String(details?.reason || "unknown");
     services.note("[renderer-guard] Aura renderer stopped (" + reason + "); backend and tunnel remain untouched.");
     if (rendererCrashHistory.length > 3) {
       // Stop a crash/relaunch storm without stopping the protected MCP/tunnel.
@@ -228,8 +247,8 @@ function createWindow() {
       }).catch(() => {});
       return;
     }
-    contents.loadFile(auraFile, { query: { desktop: "1", safeGraphics: "1" } })
-      .catch(error => services.note("[renderer-guard] Static UI reload failed: " + error.message));
+    contents.loadFile(auraFile, { query: rendererGraphicsSafe ? { desktop: "1", safeGraphics: "1" } : { desktop: "1" } })
+      .catch(error => services.note("[renderer-guard] UI reload failed: " + error.message));
   });
   mainWindow.show();
   mainWindow.on("close", (event) => {
@@ -290,18 +309,94 @@ function inspectRendererMemory() {
       contents.executeJavaScript("window.AuraMemoryGuard?.reduceLoad()", true).catch(error => {
         services.note("[renderer-guard] Dynamic GPU load reduction failed: " + error.message);
       });
+      captureRendererEvidence("warning", source, pressure, metrics, contents);
       return;
     }
     rendererRecoveryInProgress = true;
     persistRendererSafeMode("renderer-memory-emergency");
+    // Main-process evidence only: the emergency never waits for the renderer.
+    const evidence = writeRendererIncident(rendererIncident("emergency", source, pressure, metrics));
     services.note("[renderer-guard] Aura " + source + " PID " + pressure.pid + " private " + size +
-      " MiB: recycling only the renderer; GPU/Node/MCP/tunnel processes are untouched.");
+      " MiB: recycling only the renderer; GPU/Node/MCP/tunnel processes are untouched." +
+      (evidence ? " Evidence: " + evidence : ""));
     contents.forcefullyCrashRenderer();
   } catch (error) {
     rendererRecoveryInProgress = false;
     rendererMemoryGuard.reset();
     services.note("[renderer-guard] Memory observation/recovery failed: " + error.message);
   }
+}
+
+// Attribution evidence for the next memory incident. The 10 GiB event left no
+// way to tell V8 heap from Blink, Skia/GPU or driver memory. Records stay
+// small and bounded, and never block or delay the recovery itself.
+const RENDERER_INCIDENT_LIMIT = 12;
+const rendererIncidentDir = () => path.join(app.getPath("userData"), "diagnostics", "renderer-memory");
+function rendererIncident(stage, source, pressure, metrics) {
+  let system = null;
+  try { system = process.getSystemMemoryInfo(); } catch (_) {}
+  const mib = kib => Number.isFinite(kib) ? Math.round(kib / 1024) : null;
+  return {
+    schema: 1, stage, source, at: new Date().toISOString(), pid: pressure.pid,
+    privateMiB: Math.round(pressure.privateMiB), workingMiB: pressure.workingMiB == null ? null : Math.round(pressure.workingMiB),
+    graphicsSafe: rendererGraphicsSafe,
+    processes: metrics.map(m => ({ pid: m.pid, type: m.type, name: m.name || m.serviceName || null,
+      privateMiB: mib(m.memory?.privateBytes), workingMiB: mib(m.memory?.workingSetSize),
+      cpuPercent: Number.isFinite(m.cpu?.percentCPUUsage) ? Math.round(m.cpu.percentCPUUsage * 10) / 10 : null })),
+    systemMemoryMiB: system ? { total: mib(system.total), free: mib(system.free) } : null,
+  };
+}
+function writeRendererIncident(record) {
+  try {
+    const dir = rendererIncidentDir();
+    fs.mkdirSync(dir, { recursive: true });
+    const file = path.join(dir, `${record.at.replace(/[:.]/g, "-")}-${record.stage}-${record.source}.json`);
+    fs.writeFileSync(file, JSON.stringify(record, null, 2) + "\n", { mode: 0o600 });
+    const names = fs.readdirSync(dir).filter(name => name.endsWith(".json")).sort();
+    for (const name of names.slice(0, Math.max(0, names.length - RENDERER_INCIDENT_LIMIT))) fs.rmSync(path.join(dir, name), { force: true });
+    return file;
+  } catch (error) {
+    services.note("[renderer-guard] Could not save memory evidence: " + error.message);
+    return null;
+  }
+}
+// At the warning threshold the renderer is still responsive: ask it for V8
+// heap, Blink allocation, DOM size and scene state, bounded by two seconds.
+function captureRendererEvidence(stage, source, pressure, metrics, contents) {
+  const record = rendererIncident(stage, source, pressure, metrics);
+  const probe = contents.isDestroyed() ? Promise.resolve(null) : Promise.race([
+    contents.executeJavaScript("(() => ({ memory: window.launcherDiagnostics?.memory?.() ?? null, domNodes: document.getElementsByTagName('*').length, aura: window.AuraMemoryGuard?.status?.() ?? null }))()", true),
+    new Promise(resolve => { const timer = setTimeout(() => resolve({ timedOut: true }), 2000); timer.unref?.(); }),
+  ]).catch(error => ({ error: String(error?.message || error) }));
+  return probe.then(renderer => {
+    record.renderer = renderer;
+    const file = writeRendererIncident(record);
+    if (file) services.note("[renderer-guard] Memory evidence saved: " + file);
+    return file;
+  });
+}
+
+// The user can always undo the static fallback from Settings → Appearance.
+// Both guards are one-shot per PID; re-arm them, because the GPU process (and
+// often the renderer) keeps its PID, or a second emergency would go unseen.
+function restoreDynamicGraphics() {
+  if (!mainWindow || mainWindow.isDestroyed()) throw new Error("界面窗口不可用。");
+  fs.rmSync(rendererSafeMarkerPath(), { force: true });
+  rendererGraphicsSafe = false;
+  rendererSafeReason = null;
+  rendererRecoveryInProgress = false;
+  rendererMemoryGuard.reset();
+  gpuMemoryGuard.reset();
+  expectedAuraUrl = normalAuraUrl;
+  services.note("[renderer-guard] Dynamic graphics restored from Settings; Renderer and GPU memory guards re-armed.");
+  const contents = mainWindow.webContents;
+  // Reply first, then replace the static document with the dynamic one.
+  setImmediate(() => {
+    if (contents.isDestroyed()) return;
+    contents.loadFile(auraFile, { query: { desktop: "1" } })
+      .catch(error => services.note("[renderer-guard] Dynamic UI reload failed: " + error.message));
+  });
+  return { restored: true };
 }
 
 function createTray() {
@@ -684,6 +779,11 @@ function registerIpc() {
     return {selected:"custom",durationMs:saved.durationMs,bytes:saved.bytes};
   }));
 
+  ipcMain.handle("graphics:state", wrap(async () => ({
+    safe: rendererGraphicsSafe, persisted: !!readRendererSafeMarker(), reason: rendererSafeReason,
+  })));
+  ipcMain.handle("graphics:restore", wrap(async () => restoreDynamicGraphics()));
+
   ipcMain.handle("app:info", wrap(async () => ({
     name: APP_NAME,
     accountId: accounts.currentId,
@@ -876,12 +976,24 @@ function registerIpc() {
       noLink: true,
     });
     if (result.response !== 1) return { canceled: true };
-    await paths.uninstallUserData({
-      ...deleteOptions,
-      stopExternal: undefined,
-      shutdown: () => services.shutdown(),
-      stopFeeds: () => feeds.stop(),
-    });
+    let servicesStopped = false;
+    try {
+      await paths.uninstallUserData({
+        ...deleteOptions,
+        stopExternal: undefined,
+        shutdown: async () => { servicesStopped = true; await services.shutdown(); },
+        stopFeeds: () => feeds.stop(),
+      });
+    } catch (error) {
+      if (!servicesStopped) throw error;
+      // Services are already shut down (files Chromium still holds in userData
+      // often make the delete fail). Staying open would leave every action
+      // failing with "程序正在退出", so quit and say what is left to delete.
+      quitting = true;
+      dialog.showErrorBox("部分数据未能删除", `${error.message}\n\n程序将退出；退出后可手动删除：\n${userData}`);
+      setImmediate(() => app.quit());
+      return { removed: null, partial: true, error: error.message };
+    }
     quitting = true;
     setImmediate(() => app.quit());
     return { removed: userData, restartRequired: false };

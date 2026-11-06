@@ -11,17 +11,27 @@ const POLL_MS = 1500;
 
 function getJson(url, timeoutMs = 2500) {
   return new Promise((resolve) => {
+    let settled = false;
+    const done = (value) => { if (settled) return; settled = true; clearTimeout(deadline); resolve(value); };
+    // A server that dies mid-body emits "aborted"/"close" instead of "end".
+    // This poll then never settled, tick() stayed busy and the account's MCP
+    // and tunnel feeds stopped until restart; settle on every outcome.
+    const deadline = setTimeout(() => { req.destroy(); done(null); }, timeoutMs + 1000);
+    deadline.unref?.();
     const req = http.get(url, { timeout: timeoutMs }, (res) => {
       let body = "";
       res.setEncoding("utf8");
       res.on("data", (c) => { if (body.length < 2_000_000) body += c; });
       res.on("end", () => {
-        if (res.statusCode !== 200) return resolve(null);
-        try { resolve(JSON.parse(body)); } catch { resolve(null); }
+        if (res.statusCode !== 200) return done(null);
+        try { done(JSON.parse(body)); } catch { done(null); }
       });
+      res.on("aborted", () => done(null));
+      res.on("error", () => done(null));
+      res.on("close", () => done(null));
     });
-    req.on("timeout", () => { req.destroy(); resolve(null); });
-    req.on("error", () => resolve(null));
+    req.on("timeout", () => { req.destroy(); done(null); });
+    req.on("error", () => done(null));
   });
 }
 
@@ -164,6 +174,11 @@ class ActivityFeeds extends EventEmitter {
     if (!port) return;
     const data = await getJson(`http://127.0.0.1:${port}/api/logs`);
     if (generation !== this.generation || !data || !Array.isArray(data.events)) return;
+    // tunnel-client keeps its log buffer in memory, so after a restart seq
+    // starts again from 1; reset the watermark instead of hiding new events
+    // until they pass the old maximum.
+    const newest = data.events.reduce((max, e) => Math.max(max, Number(e.seq) || 0), 0);
+    if (newest && newest < this.lastTunnelSeq) this.lastTunnelSeq = 0;
     let events = data.events.filter((e) => Number(e.seq) > this.lastTunnelSeq);
     if (!events.length) return;
     this.lastTunnelSeq = Math.max(...events.map((e) => Number(e.seq) || 0));

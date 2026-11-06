@@ -58,11 +58,22 @@ contextBridge.exposeInMainWorld("launcher", {
   openLogsFolder: invoke("shell:openLogs"),
   openRuntimeFolder: invoke("shell:openRuntime"),
   copyText: invoke("clipboard:copy"),
+  getGraphicsState: invoke("graphics:state"),
+  restoreGraphics: invoke("graphics:restore"),
   on(channel, callback) {
     const allowed = new Set(["status", "log", "setup:progress", "notice", "accounts:changed"]);
     if (!allowed.has(channel)) return () => {};
     const listener = (_event, data) => callback(data);
     ipcRenderer.on(channel, listener);
     return () => ipcRenderer.removeListener(channel, listener);
+  },
+});
+
+// Read-only memory attribution (V8 heap vs Blink) for the main-process memory
+// guard's evidence file. No IPC, files or account data.
+contextBridge.exposeInMainWorld("launcherDiagnostics", {
+  memory() {
+    const read = fn => { try { return fn(); } catch (error) { return { error: String((error && error.message) || error) }; } };
+    return { heap: read(() => process.getHeapStatistics()), blink: read(() => process.getBlinkMemoryInfo()) };
   },
 });

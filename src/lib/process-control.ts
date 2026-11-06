@@ -43,6 +43,10 @@ export interface ProcessHostState {
   effect_binding?: ProcessEffectReference;
   host_start_identity?: string | null;
   child_start_identity?: string | null;
+  /** The child never started (ENOENT, EINVAL); nothing of the command ran. */
+  spawn_error?: string;
+  /** The managed child exited while a background descendant still held its output pipes. */
+  stdio_held_by_descendant?: boolean;
 }
 
 export interface ProcessControlPaths {
@@ -69,6 +73,31 @@ export function processControlPaths(workspaceRoot: string, id: string): ProcessC
     stdout: path.join(root, "stdout.log"),
     stderr: path.join(root, "stderr.log"),
   };
+}
+
+/**
+ * Folders of finished background processes (logs, state, control files) were
+ * never deleted. Remove those whose host recorded a final state over a week
+ * ago; running or unreadable ones stay.
+ */
+export async function sweepFinishedProcessFolders(workspaceRoot: string, maxAgeMs = 7 * 24 * 60 * 60 * 1000): Promise<number> {
+  const home = process.env.CODEX_HOME || path.join(os.homedir(), ".codex");
+  const namespace = path.join(home, "process-control", processNamespace(workspaceRoot));
+  let names: string[];
+  try { names = await fs.readdir(namespace); } catch { return 0; }
+  const now = Date.now();
+  let removed = 0;
+  for (const name of names) {
+    const statePath = path.join(namespace, name, "state.json");
+    try {
+      const state = await readProcessHostState(statePath);
+      if (!state || state.running) continue;
+      if (now - (await fs.stat(statePath)).mtimeMs < maxAgeMs) continue;
+      await fs.rm(path.join(namespace, name), { recursive: true, force: true });
+      removed++;
+    } catch { /* keep anything we cannot judge */ }
+  }
+  return removed;
 }
 
 export async function writeProcessHostSpec(specPath: string, spec: ProcessHostSpec): Promise<void> {
@@ -103,7 +132,7 @@ export async function waitForProcessHostState(statePath: string, timeoutMs = 500
   const deadline = Date.now() + Math.max(100, timeoutMs);
   for (;;) {
     const state = await readProcessHostState(statePath);
-    if (state?.child_pid) return state;
+    if (state?.child_pid || state?.spawn_error) return state;
     if (Date.now() >= deadline) throw new Error("PROCESS_HOST_START_TIMEOUT: host did not publish child state");
     await new Promise((resolve) => setTimeout(resolve, 25));
   }

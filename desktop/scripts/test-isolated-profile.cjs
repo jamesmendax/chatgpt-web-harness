@@ -193,7 +193,7 @@ function boundaryFixture({ packaged = false, requested = "", linked = false } = 
   const roots = { appData: path.join(root, ".codex", "fake-appdata") };
   const app = {
     isPackaged: packaged,
-    commandLine: { getSwitchValue: () => requested },
+    commandLine: { getSwitchValue: () => requested, appendSwitch: (name) => events.push("switch:" + name) },
     getPath: (name) => roots[name],
     setPath: (name, value) => { events.push("setPath:" + name); roots[name] = value; },
     setAppUserModelId: () => events.push("app-id"),
@@ -374,6 +374,9 @@ test("real main entry initializes isolation before Services and single-instance 
   assert.ok(f.events.indexOf("setPath:userData") < f.events.indexOf("services"));
   assert.ok(f.events.indexOf("setPath:sessionData") < f.events.indexOf("lock"));
   assert.ok(f.events.indexOf("app-id") < f.events.indexOf("lock"));
+  // The renderer V8 heap backstop must be set after isolation, before ready.
+  assert.ok(f.events.indexOf("setPath:userData") < f.events.indexOf("switch:js-flags"));
+  assert.ok(f.events.indexOf("switch:js-flags") >= 0 && f.events.indexOf("switch:js-flags") < f.events.indexOf("lock"));
 });
 
 test("both real main entry modes reject original-data CLI before services or locks", () => {

@@ -284,10 +284,14 @@ export class McpUpstreamManager {
   }
 
   private getOAuthProvider(config: UpstreamServerConfig): FileOAuthClientProvider {
+    if (config.transport !== "http" || !config.url) {
+      throw new Error(`OAuth requires an HTTP upstream: ${config.id}`);
+    }
     let provider = this.oauthProviders.get(config.id);
     if (!provider) {
       provider = new FileOAuthClientProvider({
         serverId: config.id,
+        serverUrl: config.url,
         scope: config.auth?.scope,
         openBrowser: false,
       });

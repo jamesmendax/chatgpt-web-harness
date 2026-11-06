@@ -203,7 +203,18 @@ function writeConsole(entry: ActivityEntry): void {
 export async function loadAuditHistory(limit = 80): Promise<ActivityEntry[]> {
   const auditPath = getAuditPath();
   try {
-    const raw = await fs.readFile(auditPath, "utf-8");
+    // Read only the tail: this used to load the whole, ever-growing file to
+    // return the last 80 lines.
+    const handle = await fs.open(auditPath, "r");
+    let raw: string;
+    try {
+      const size = (await handle.stat()).size;
+      const length = Math.min(size, Math.max(64 * 1024, limit * 4096));
+      const buffer = Buffer.alloc(length);
+      const { bytesRead } = await handle.read(buffer, 0, length, size - length);
+      raw = buffer.subarray(0, bytesRead).toString("utf8");
+      if (length < size) raw = raw.slice(raw.indexOf("\n") + 1);
+    } finally { await handle.close(); }
     const lines = raw.trim().split("\n").filter(Boolean);
     const slice = lines.slice(-limit);
     return slice.map((line) => {

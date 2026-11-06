@@ -1,12 +1,20 @@
-import fs from "fs/promises";
+import { physicalPromises as fs } from "./physical-fs.js";
 import path from "path";
+import { assertWritable, decodeText, encodeText } from "./text-codec.js";
+import { assertFileRevision, readFileForEdit, writeFileBytesCas, withCanonicalFileLocks } from "./safe-text-write.js";
 
 /**
  * Apply unified diff / Codex-style patches to text.
  * Supports:
- * - Codex/OpenAI format: hunk header "@@" without line numbers
+ * - Codex/OpenAI format: hunk header "@@" without line numbers, optionally
+ *   "@@ <anchor line>", and a first hunk without any "@@"
  * - Standard unified diff: "@@ -1,3 +1,4 @@"
  * - Mixed CRLF/LF input (normalized to LF for matching, preserves original EOL when possible)
+ *
+ * Every hunk is checked against the file before it is applied. A numbered
+ * hunk whose context is not at its line is searched for nearby (like GNU
+ * patch offsets); if its lines are nowhere, the patch fails instead of
+ * replacing whatever happens to be at that line number.
  */
 
 function normalizeEol(text: string): string {
@@ -17,143 +25,164 @@ function detectEol(text: string): "\r\n" | "\n" {
   return text.includes("\r\n") ? "\r\n" : "\n";
 }
 
+interface HunkLine { type: "context" | "remove" | "add"; text: string }
+
 interface ParsedHunk {
   oldStart?: number;
-  lines: Array<{ type: "context" | "remove" | "add"; text: string }>;
+  oldCount?: number;
+  /** Codex "@@ def handler():" — the hunk follows this line. */
+  anchor?: string;
+  /** Codex "*** End of File" — the hunk ends at the end of the file. */
+  endOfFile?: boolean;
+  lines: HunkLine[];
 }
 
+const GIT_METADATA = /^(?:diff |index |new file mode |deleted file mode |old mode |new mode |similarity index |dissimilarity index |rename from |rename to |copy from |copy to |Binary files )/;
+
 function parsePatch(patchText: string): ParsedHunk[] {
-  const normalized = normalizeEol(patchText.trim());
-  const rawLines = normalized.split("\n");
+  const lines = normalizeEol(patchText).split("\n");
+  while (lines.length && lines[lines.length - 1].trim() === "") lines.pop();
   const hunks: ParsedHunk[] = [];
-  let i = 0;
+  let current: ParsedHunk | null = null;
+  const close = (): void => {
+    if (current && current.lines.length) hunks.push(current);
+    current = null;
+  };
 
-  while (i < rawLines.length) {
-    const line = rawLines[i];
-    if (line.startsWith("---") || line.startsWith("+++") || line.startsWith("diff ")) {
-      i++;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (line.startsWith("@@")) {
+      close();
+      const numbered = /^@@\s*-(\d+)(?:,(\d+))?\s+\+(\d+)(?:,(\d+))?\s*@@(.*)$/.exec(line);
+      current = numbered
+        ? { oldStart: Number(numbered[1]), oldCount: numbered[2] === undefined ? 1 : Number(numbered[2]), lines: [] }
+        : { anchor: line.replace(/^@@\s*/, "").replace(/\s*@@\s*$/, "").trim() || undefined, lines: [] };
       continue;
     }
-    if (!line.startsWith("@@")) {
-      i++;
-      continue;
+    if (line === "*** End of File") { if (current) current.endOfFile = true; continue; }
+    if (line === "\\ No newline at end of file") continue;
+    if (!current) {
+      // Before the first hunk: "--- a/x" + "+++ b/x" headers and git metadata.
+      if (line.startsWith("--- ") && lines[i + 1]?.startsWith("+++ ")) { i++; continue; }
+      if (GIT_METADATA.test(line) || line.startsWith("*** ")) continue;
+      // Codex patches may omit the first "@@": its lines start an implicit hunk.
+      if (!/^[ +-]/.test(line)) continue;
+      current = { lines: [] };
     }
-
-    const headerMatch = line.match(/^@@\s*-(\d+)(?:,(\d+))?\s+\+(\d+)(?:,(\d+))?\s+@@/);
-    const hunk: ParsedHunk = {
-      oldStart: headerMatch ? Number(headerMatch[1]) : undefined,
-      lines: [],
-    };
-    i++;
-
-    for (; i < rawLines.length; i++) {
-      const patchLine = rawLines[i];
-      if (patchLine.startsWith("@@")) {
-        break;
-      }
-      if (patchLine === "\\ No newline at end of file") continue;
-      if (patchLine.startsWith(" ")) {
-        hunk.lines.push({ type: "context", text: patchLine.slice(1) });
-      } else if (patchLine.startsWith("-")) {
-        hunk.lines.push({ type: "remove", text: patchLine.slice(1) });
-      } else if (patchLine.startsWith("+")) {
-        hunk.lines.push({ type: "add", text: patchLine.slice(1) });
-      } else if (patchLine.length === 0) {
-        hunk.lines.push({ type: "context", text: "" });
-      }
-    }
-
-    if (hunk.lines.length > 0) hunks.push(hunk);
+    const hunk = current as ParsedHunk;
+    if (line.startsWith(" ")) hunk.lines.push({ type: "context", text: line.slice(1) });
+    else if (line.startsWith("-")) hunk.lines.push({ type: "remove", text: line.slice(1) });
+    else if (line.startsWith("+")) hunk.lines.push({ type: "add", text: line.slice(1) });
+    else if (line.length === 0) hunk.lines.push({ type: "context", text: "" });
   }
+  close();
 
-  if (hunks.length === 0 && normalized.includes("\n")) {
-    throw new Error("No valid patch hunks found. Use @@ header with +/- lines.");
+  if (hunks.length === 0) {
+    throw new Error("No valid patch hunks found. Use @@ hunks with +/- lines, or the *** Begin Patch format.");
   }
-
   return hunks;
 }
 
-function hunkSearchPattern(hunk: ParsedHunk): string[] {
-  const pattern: string[] = [];
-  for (const entry of hunk.lines) {
-    if (entry.type === "context" || entry.type === "remove") {
-      pattern.push(entry.text);
-    }
-  }
-  return pattern;
+type LineMatch = (fileLine: string, patchLine: string) => boolean;
+// Exact first; then tolerate trailing, then surrounding whitespace, the most
+// common difference between a model's copy and the file.
+const MATCHERS: readonly LineMatch[] = [
+  (a, b) => a === b,
+  (a, b) => a.trimEnd() === b.trimEnd(),
+  (a, b) => a.trim() === b.trim(),
+];
+
+function matchesAt(lines: string[], pattern: string[], index: number, same: LineMatch): boolean {
+  if (index < 0 || index + pattern.length > lines.length) return false;
+  for (let j = 0; j < pattern.length; j++) if (!same(lines[index + j], pattern[j])) return false;
+  return true;
 }
 
-function hunkReplacement(hunk: ParsedHunk): string[] {
-  const replacement: string[] = [];
-  for (const entry of hunk.lines) {
-    if (entry.type === "context" || entry.type === "add") {
-      replacement.push(entry.text);
-    }
+function findForward(lines: string[], pattern: string[], from: number): number {
+  for (const same of MATCHERS) {
+    for (let i = Math.max(0, from); i <= lines.length - pattern.length; i++) if (matchesAt(lines, pattern, i, same)) return i;
   }
-  return replacement;
-}
-
-function findPatternIndex(haystack: string[], needle: string[], startAt = 0): number {
-  if (needle.length === 0) return startAt;
-
-  outer: for (let i = startAt; i <= haystack.length - needle.length; i++) {
-    for (let j = 0; j < needle.length; j++) {
-      if (haystack[i + j] !== needle[j]) continue outer;
-    }
-    return i;
-  }
-
   return -1;
 }
 
-function applyHunkAtIndex(output: string[], hunk: ParsedHunk, index: number): void {
-  const removeCount = hunk.lines.filter((l) => l.type === "context" || l.type === "remove").length;
-  const replacement = hunkReplacement(hunk);
-  output.splice(index, removeCount, ...replacement);
+/** Closest occurrence to the expected line, searching outwards. */
+function findNear(lines: string[], pattern: string[], target: number): number {
+  const last = lines.length - pattern.length;
+  for (const same of MATCHERS) {
+    for (let distance = 0; target - distance >= 0 || target + distance <= last; distance++) {
+      if (matchesAt(lines, pattern, target + distance, same)) return target + distance;
+      if (distance && matchesAt(lines, pattern, target - distance, same)) return target - distance;
+    }
+  }
+  return -1;
 }
 
-function applyHunkWithLineNumber(output: string[], hunk: ParsedHunk, delta: number): number {
-  if (hunk.oldStart === undefined) {
-    throw new Error("Missing line number in hunk header");
-  }
-
-  const targetIndex = hunk.oldStart - 1 + delta;
-  const removeCount = hunk.lines.filter((l) => l.type === "context" || l.type === "remove").length;
-  const replacement = hunkReplacement(hunk);
-  output.splice(targetIndex, removeCount, ...replacement);
-  return replacement.length - removeCount;
+function findAnchor(lines: string[], anchor: string, from: number): number {
+  const wanted = anchor.trim();
+  for (let i = Math.max(0, from); i < lines.length; i++) if (lines[i].trim() === wanted) return i;
+  for (let i = Math.max(0, from); i < lines.length; i++) if (lines[i].includes(wanted)) return i;
+  return -1;
 }
 
-function applyHunkWithContextSearch(output: string[], hunk: ParsedHunk, searchFrom: number): number {
-  const pattern = hunkSearchPattern(hunk);
-  const index = findPatternIndex(output, pattern, searchFrom);
-  if (index < 0) {
-    const preview = pattern.slice(0, 3).join(" | ") || "(empty hunk)";
-    throw new Error(`Patch context not found in file. Expected lines like: ${preview}`);
-  }
+/** Index after the last content line (a final newline yields a trailing ""). */
+function contentEnd(lines: string[]): number {
+  return lines.length && lines[lines.length - 1] === "" ? lines.length - 1 : lines.length;
+}
 
-  applyHunkAtIndex(output, hunk, index);
-  return index + hunkReplacement(hunk).length;
+/** Replace in place; context keeps the file's own text. Returns the line-count change. */
+function applyAt(lines: string[], hunk: ParsedHunk, index: number): number {
+  const replacement: string[] = [];
+  let cursor = index;
+  for (const entry of hunk.lines) {
+    if (entry.type === "context") replacement.push(lines[cursor++]);
+    else if (entry.type === "remove") cursor++;
+    else replacement.push(entry.text);
+  }
+  const removed = cursor - index;
+  lines.splice(index, removed, ...replacement);
+  return replacement.length - removed;
+}
+
+function contextNotFound(hunk: ParsedHunk, pattern: string[]): Error {
+  const preview = pattern.slice(0, 3).join(" | ") || "(empty hunk)";
+  const where = hunk.oldStart !== undefined ? ` near line ${hunk.oldStart}` : hunk.anchor ? ` after "${hunk.anchor}"` : "";
+  return new Error(`Patch context not found in file${where}. Expected lines like: ${preview}. Re-read the file and rebuild the hunk from its current text.`);
 }
 
 export function applyUnifiedPatchToText(original: string, patchText: string): string {
   const eol = detectEol(original);
-  const normalizedOriginal = normalizeEol(original);
-  const output = normalizedOriginal.split("\n");
+  const lines = normalizeEol(original).split("\n");
   const hunks = parsePatch(patchText);
 
-  let delta = 0;
+  let offset = 0;
   let searchFrom = 0;
-
   for (const hunk of hunks) {
+    const pattern = hunk.lines.filter((entry) => entry.type !== "add").map((entry) => entry.text);
+    let index = -1;
     if (hunk.oldStart !== undefined) {
-      delta += applyHunkWithLineNumber(output, hunk, delta);
+      // "-5,0" inserts after line 5; "-5,3" starts at line 5.
+      const expected = Math.max(0, (hunk.oldCount === 0 ? hunk.oldStart : hunk.oldStart - 1) + offset);
+      index = findNear(lines, pattern, Math.min(expected, lines.length));
+      if (index >= 0) offset += index - expected;
     } else {
-      searchFrom = applyHunkWithContextSearch(output, hunk, searchFrom);
+      const anchorAt = hunk.anchor ? findAnchor(lines, hunk.anchor, searchFrom) : -1;
+      const from = anchorAt >= 0 ? anchorAt + 1 : searchFrom;
+      if (hunk.endOfFile) {
+        const atEnd = contentEnd(lines) - pattern.length;
+        if (MATCHERS.some((same) => matchesAt(lines, pattern, atEnd, same))) index = atEnd;
+      }
+      if (index < 0 && pattern.length === 0) index = anchorAt >= 0 ? from : contentEnd(lines);
+      if (index < 0) index = findForward(lines, pattern, from);
+      // Hunks given out of order, or an anchor that is not in the file.
+      if (index < 0 && from > 0) index = findForward(lines, pattern, 0);
     }
+    if (index < 0) throw contextNotFound(hunk, pattern);
+    const delta = applyAt(lines, hunk, index);
+    if (hunk.oldStart !== undefined) offset += delta;
+    searchFrom = index + pattern.length + delta;
   }
 
-  const result = output.join("\n");
+  const result = lines.join("\n");
   return eol === "\r\n" ? result.replace(/\n/g, "\r\n") : result;
 }
 
@@ -162,6 +191,8 @@ export interface MultiPatchFileOp {
   operation: "create" | "update" | "delete";
   patch?: string;
   content?: string;
+  /** Codex "*** Move to:" or a unified diff whose +++ path differs. */
+  moveTo?: string;
 }
 
 export interface MultiPatchResult {
@@ -170,37 +201,52 @@ export interface MultiPatchResult {
   ok: boolean;
   diff?: string;
   error?: string;
+  moved_to?: string;
+  encoding?: string;
 }
 
 export function isMultiFilePatch(patchText: string): boolean {
-  const t = patchText.trim();
+  const t = normalizeEol(patchText.trim());
+  // A removed "-- comment" line reads "--- comment"; only a ---/+++ header
+  // pair (or git metadata) marks a file section.
   return (
     t.includes("*** Begin Patch") ||
     t.includes("*** Update File:") ||
     t.includes("*** Add File:") ||
     t.includes("*** Delete File:") ||
-    /^---\s+/m.test(t) ||
-    /^\+\+\+\s+/m.test(t)
+    /^--- [^\n]*\n\+\+\+ /m.test(t) ||
+    /^diff --git /m.test(t)
   );
+}
+
+/** Path from a "--- " / "+++ " header; null for /dev/null. */
+function headerPath(raw: string): string | null {
+  const value = raw.split("\t")[0].trim().replace(/^"(.*)"$/, "$1");
+  if (value === "/dev/null" || value === "nul" || value === "NUL") return null;
+  return value.replace(/^[ab]\//, "");
+}
+
+function addedContent(body: string): string {
+  const lines = normalizeEol(body).split("\n");
+  const added = lines.filter((line) => line.startsWith("+")).map((line) => line.slice(1));
+  if (!added.length) return "";
+  return added.join("\n") + (lines.includes("\\ No newline at end of file") ? "" : "\n");
 }
 
 export function parseMultiFilePatch(patchText: string, baseDir?: string): MultiPatchFileOp[] {
   const normalized = normalizeEol(patchText.trim());
   const ops: MultiPatchFileOp[] = [];
 
-  if (normalized.includes("*** Begin Patch") || normalized.includes("*** Update File:")) {
+  if (normalized.includes("*** Begin Patch") || /^\*\*\* (?:Update|Add|Delete) File:/m.test(normalized)) {
     const lines = normalized.split("\n");
-    let i = 0;
     let current: MultiPatchFileOp | null = null;
     const chunk: string[] = [];
 
     const flush = () => {
       if (!current) return;
       if (current.operation === "create") {
-        current.content = chunk
-          .filter((l) => l.startsWith("+"))
-          .map((l) => l.slice(1))
-          .join("\n");
+        const added = chunk.filter((l) => l.startsWith("+")).map((l) => l.slice(1));
+        current.content = added.length ? added.join("\n") + "\n" : "";
       } else if (current.operation === "update") {
         current.patch = chunk.join("\n");
       }
@@ -209,8 +255,7 @@ export function parseMultiFilePatch(patchText: string, baseDir?: string): MultiP
       chunk.length = 0;
     };
 
-    for (; i < lines.length; i++) {
-      const line = lines[i];
+    for (const line of lines) {
       if (line.startsWith("*** Update File:")) {
         flush();
         current = { path: resolvePatchPath(line.slice(16).trim(), baseDir), operation: "update" };
@@ -226,6 +271,11 @@ export function parseMultiFilePatch(patchText: string, baseDir?: string): MultiP
         ops.push({ path: resolvePatchPath(line.slice(16).trim(), baseDir), operation: "delete" });
         continue;
       }
+      if (line.startsWith("*** Move to:")) {
+        const target: MultiPatchFileOp | null = current;
+        if (target && target.operation === "update") target.moveTo = resolvePatchPath(line.slice(12).trim(), baseDir);
+        continue;
+      }
       if (line.startsWith("*** End Patch") || line.startsWith("*** Begin Patch")) continue;
       if (current) chunk.push(line);
     }
@@ -233,22 +283,30 @@ export function parseMultiFilePatch(patchText: string, baseDir?: string): MultiP
     return ops;
   }
 
-  // Unified diff multi-file: --- a/path +++ b/path blocks
-  const blocks = normalized.split(/\n(?=---\s)/);
+  // Unified diff multi-file: one section per "--- old" / "+++ new" header pair.
+  const blocks = normalized.split(/\n(?=--- [^\n]*\n\+\+\+ )/);
   for (const block of blocks) {
-    const trimmed = block.trim();
-    if (!trimmed.startsWith("---")) continue;
-    const header = trimmed.split("\n")[0];
-    const filePath = header.replace(/^---\s+[ab]\//, "").replace(/^---\s+/, "").trim();
-    const hunks = trimmed.split("\n").slice(1).join("\n");
-    ops.push({
-      path: resolvePatchPath(filePath, baseDir),
-      operation: "update",
-      patch: hunks,
-    });
+    const lines = block.split("\n");
+    const header = lines.findIndex((line, index) => line.startsWith("--- ") && lines[index + 1]?.startsWith("+++ "));
+    if (header < 0) continue;
+    const oldPath = headerPath(lines[header].slice(4));
+    const newPath = headerPath(lines[header + 1].slice(4));
+    const body = lines.slice(header + 2).join("\n");
+    if (newPath === null && oldPath !== null) {
+      ops.push({ path: resolvePatchPath(oldPath, baseDir), operation: "delete" });
+    } else if (oldPath === null && newPath !== null) {
+      ops.push({ path: resolvePatchPath(newPath, baseDir), operation: "create", content: addedContent(body) });
+    } else if (oldPath !== null && newPath !== null) {
+      const source = resolvePatchPath(oldPath, baseDir), target = resolvePatchPath(newPath, baseDir);
+      ops.push({ path: source, operation: "update", patch: body, ...(source === target ? {} : { moveTo: target }) });
+    }
   }
 
   return ops;
+}
+
+function samePath(a: string, b: string): boolean {
+  return process.platform === "win32" ? path.resolve(a).toLowerCase() === path.resolve(b).toLowerCase() : path.resolve(a) === path.resolve(b);
 }
 
 function resolvePatchPath(input: string, baseDir?: string): string {
@@ -258,9 +316,13 @@ function resolvePatchPath(input: string, baseDir?: string): string {
   return path.resolve(cleaned);
 }
 
+function hasHunkLines(patchText: string | undefined): boolean {
+  return Boolean(patchText && normalizeEol(patchText).split("\n").some((line) => line.startsWith("@@") || /^[+-]/.test(line)));
+}
+
 export async function applyMultiFilePatch(
   patchText: string,
-  options?: { base_dir?: string; dry_run?: boolean }
+  options?: { base_dir?: string; dry_run?: boolean; before_commit?: (target: string) => Promise<void> }
 ): Promise<MultiPatchResult[]> {
   const baseDir = options?.base_dir;
   const dryRun = options?.dry_run ?? false;
@@ -272,7 +334,7 @@ export async function applyMultiFilePatch(
   for (const op of ops) {
     try {
       if (op.operation === "delete") {
-        if (!dryRun) await fs.unlink(op.path);
+        if (!dryRun) { await options?.before_commit?.(op.path); await fs.unlink(op.path); }
         results.push({ path: op.path, operation: "delete", ok: true, diff: "[deleted]" });
         continue;
       }
@@ -280,18 +342,56 @@ export async function applyMultiFilePatch(
       if (op.operation === "create") {
         const content = op.content ?? "";
         if (!dryRun) {
-          await fs.mkdir(path.dirname(op.path), { recursive: true });
-          await fs.writeFile(op.path, content, "utf-8");
+          await writeFileBytesCas(op.path, Buffer.from(content, "utf8"), { createOnly: true,
+            beforeCommit: () => options?.before_commit?.(op.path) ?? Promise.resolve() });
         }
         results.push({ path: op.path, operation: "create", ok: true, diff: buildSimpleDiff("", content) });
         continue;
       }
 
-      const original = await fs.readFile(op.path, "utf-8");
-      const next = applyUnifiedPatchToText(original, op.patch || "");
-      const diff = buildSimpleDiff(original, next);
-      if (!dryRun) await fs.writeFile(op.path, next, "utf-8");
-      results.push({ path: op.path, operation: "update", ok: true, diff });
+      const snapshot = await readFileForEdit(op.path);
+      const bytes = snapshot.bytes;
+      const decoded = decodeText(bytes);
+      // A Codex "*** Move to:" without hunks is a pure rename.
+      const next = op.moveTo && !hasHunkLines(op.patch) ? decoded.text : applyUnifiedPatchToText(decoded.text, op.patch || "");
+      const diff = buildSimpleDiff(decoded.text, next);
+      if (!dryRun) {
+        const target = op.moveTo ?? op.path;
+        const output = next === decoded.text ? bytes : (assertWritable(decoded, op.path), encodeText(next, decoded.encoding));
+        let destination: Awaited<ReturnType<typeof readFileForEdit>> | null = null;
+        if (op.moveTo && !samePath(target, op.path)) {
+          try { await fs.lstat(target); destination = await readFileForEdit(target); }
+          catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+        }
+        const sameTarget = !op.moveTo || samePath(target, op.path) ||
+          (destination && samePath(destination.revision.canonicalPath, snapshot.revision.canonicalPath));
+        if (sameTarget) {
+          // Do not acquire the same canonical lock twice for case-only moves or aliases.
+          await writeFileBytesCas(op.path, output, { expectedRevision: snapshot.revision,
+            beforeCommit: () => options?.before_commit?.(op.path) ?? Promise.resolve() });
+          if (op.moveTo && samePath(target, op.path) && target !== op.path) await fs.rename(op.path, target);
+        } else {
+          // Keep the source revision locked while publishing its edited bytes
+          // at the destination. A failed publication never removes the source.
+          await withCanonicalFileLocks([op.path, target], async scope => {
+            await assertFileRevision(op.path, snapshot.revision);
+            await scope.writeBytes(target, output, { expectedRevision: destination?.revision,
+              createOnly: !destination, mode: snapshot.revision.mode,
+              beforeCommit: async () => {
+                await options?.before_commit?.(target);
+                await assertFileRevision(op.path, snapshot.revision);
+              } });
+            await options?.before_commit?.(op.path);
+            await assertFileRevision(op.path, snapshot.revision);
+            // Remove the source entry, preserving the existing semantics when
+            // it is a file symlink rather than deleting its resolved referent.
+            await fs.unlink(op.path);
+          });
+        }
+      }
+      results.push({ path: op.path, operation: "update", ok: true, diff,
+        ...(op.moveTo ? { moved_to: op.moveTo } : {}),
+        ...(decoded.encoding !== "utf-8" ? { encoding: decoded.encoding } : {}) });
     } catch (err) {
       results.push({
         path: op.path,

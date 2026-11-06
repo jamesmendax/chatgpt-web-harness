@@ -27,6 +27,9 @@
   let curtainChoice = AuraQuality.readCurtain(qualityStorage);
   const curtainEnabled = () => AuraQuality.curtainEnabled(curtainChoice, qualityChoice);
   let graphicsBlocked = params.has("safeGraphics"), closingGraphics = false;
+  // "main": the Electron memory guard loaded the static URL; otherwise a
+  // local cause (repeated context loss, shader failure, failing frames).
+  let graphicsBlockedBy = graphicsBlocked ? "main" : null;
   const currentTier = () => AuraQuality.tiers[qualityChoice];
   const motionStopped = () => RM.matches || qualityChoice === "static" || graphicsBlocked;
   document.documentElement.dataset.quality = qualityChoice;
@@ -399,16 +402,49 @@
     if (idleTimer) clearTimeout(idleTimer);
     raf = idleTimer = last = frameDueAt = 0;
   }
-  // Called by the trusted Electron main-process memory guard or context loss.
-  // The scene is decorative; never touch IPC, account data or managed services.
-  function disableGraphics() {
+  const contextLosses = [];
+  let contextRestoreTimer = 0, frameFaults = 0;
+  // Static UI for the rest of this renderer session: shader failure, repeated
+  // context loss or failing frames. The scene is decorative; never touch IPC,
+  // account data or managed services. Settings → Appearance can undo it.
+  function disableGraphics(reason = "device") {
     graphicsBlocked = true;
+    if (graphicsBlockedBy !== "main") graphicsBlockedBy = String(reason);
+    clearTimeout(contextRestoreTimer); contextRestoreTimer = 0;
     stopFrames(); settle = 0;
     cancelSceneReady?.(); cancelSceneReady = null;
     scene = sceneOwner.enable(false);
     document.documentElement.classList.add("no-webgl");
     placeIndicators();
+    renderGraphicsGuard();
     return true;
+  }
+  // A lost WebGL context is usually transient: GPU process restart, driver
+  // reset, sleep/resume. Release it and rebuild a fresh context; only a third
+  // loss within ten minutes keeps this session on the static UI.
+  function contextLost() {
+    if (closingGraphics) return false;
+    const now = performance.now();
+    while (contextLosses.length && now - contextLosses[0] > 600000) contextLosses.shift();
+    contextLosses.push(now);
+    if (contextLosses.length > 2) return disableGraphics("context");
+    stopFrames(); settle = 0; lifecycle++;
+    cancelSceneReady?.(); cancelSceneReady = null;
+    scene = sceneOwner.enable(false);
+    document.documentElement.classList.add("no-webgl");
+    placeIndicators();
+    clearTimeout(contextRestoreTimer);
+    contextRestoreTimer = setTimeout(() => {
+      contextRestoreTimer = 0;
+      if (!graphicsBlocked && !closingGraphics && !scene) setQuality(qualityChoice, { persist: false });
+    }, 2000 * contextLosses.length);
+    return true;
+  }
+  // Shader clocks are float32 on the GPU. Restart them after the window was
+  // hidden (the jump is unseen), or once a day if it is always on screen.
+  function rebaseClocks(limit) {
+    scene?.rebase?.(limit);
+    choreography.rebase(limit);
   }
   function setQuality(value, { persist = true } = {}) {
     if (!Object.prototype.hasOwnProperty.call(AuraQuality.tiers, value) || closingGraphics) return false;
@@ -467,10 +503,12 @@
   }
   globalThis.AuraMemoryGuard = Object.freeze({
     disable: disableGraphics,
+    contextLost,
     reduceLoad: reduceGraphicsLoad,
     status: () => ({ animated: !!scene && !motionStopped(), selected: qualityChoice, quality: governor.q,
       memoryPressure: governor.memoryPressure, resources: sceneOwner.status(), frames: renderCount,
-      scheduled: Number(!!raf) + Number(!!idleTimer), tier: currentTier(), blocked: graphicsBlocked, scene: scene?.stats?.() || null,
+      scheduled: Number(!!raf) + Number(!!idleTimer), tier: currentTier(), blocked: graphicsBlocked, blockedBy: graphicsBlockedBy,
+      contextLosses: contextLosses.length, restorePending: !!contextRestoreTimer, frameFaults, scene: scene?.stats?.() || null,
       curtain: { selected: curtainEnabled(), effective: curtainEnabled() && !!scene && !motionStopped(), preference: curtainChoice },
       choreography: choreography.status() }),
   });
@@ -496,6 +534,19 @@
     if (frameDueAt && now + .5 < frameDueAt) { raf = requestAnimationFrame(frame); return; }
     frameDueAt = now + interval;
     inFrame = true;
+    try { renderFrame(now); frameFaults = 0; }
+    catch (error) {
+      // A throwing frame must not wedge the scheduler (inFrame) or leave a
+      // stale orb over a changed layout; repeated faults use the static UI.
+      settle = 0;
+      console.error("Aura frame failed", error?.message || String(error));
+      if (++frameFaults >= 3) { disableGraphics("frame"); return; }
+    } finally { inFrame = false; }
+    if (settle > 0) { settle--; raf = requestAnimationFrame(frame); }
+    else if (canAnimate()) scheduleIdleFrame();
+  }
+  function renderFrame(now) {
+    rebaseClocks(86400);
     const rawDt = last ? (now - last) / 1000 : 1 / 60, dt = Math.min(.05, rawDt);
     if (last && rawDt < .2) governor.step(rawDt * currentTier().activeFps / 60);
     last = now;
@@ -531,19 +582,17 @@
     }
     if (scene.draw(frameState)) renderCount++;
     if (moving || m2) settle = Math.max(1, Math.ceil(currentTier().activeFps * .65));
-    inFrame = false;
-    if (settle > 0) { settle--; raf = requestAnimationFrame(frame); }
-    else if (canAnimate()) scheduleIdleFrame();
   }
   if (scene && params.has("t")) scene.freeze(Number(params.get("t")));
   if (scene && RM.matches) scene.freeze(9);
-  document.addEventListener("visibilitychange", () => { if (document.hidden) stopFrames(); else kick(); });
+  document.addEventListener("visibilitychange", () => { if (document.hidden) stopFrames(); else { rebaseClocks(3600); kick(); } });
   RM.addEventListener("change", () => {
     if (scene) scene.freeze(RM.matches ? 9 : params.has("t") ? Number(params.get("t")) : null);
     kick();
   });
   addEventListener("pagehide", () => {
     closingGraphics = true; lifecycle++; cancelSceneReady?.(); cancelSceneReady = null;
+    clearTimeout(contextRestoreTimer); contextRestoreTimer = 0;
     stopFrames(); choreography.destroy(); scene = null; sceneOwner.destroy();
   }, { once: true });
   addEventListener("resize", () => { placePresence(true); placeIndicators(); });
@@ -1158,10 +1207,11 @@
     const s = core.snapshot(), all = s.logs[ui.source] || [], view = $("#log-view");
     const prevIds = live ? new Set($$("[data-entry]", view).map(el => el.dataset.entry)) : null;
     view.classList.toggle("raw", ui.logMode === "raw");
-    let nodes = [];
-    if (ui.logMode === "raw") nodes = core.filterLogs(all, ui).slice(-LOG_RAW_CAP).map(lineEl);
+    let nodes = [], matches = 0;
+    if (ui.logMode === "raw") { const rows = core.filterLogs(all, ui); matches = rows.length; nodes = rows.slice(-LOG_RAW_CAP).map(lineEl); }
     else {
       const items = storyItems(all).filter(itemPasses), shown = items.slice(-LOG_STORY_CAP);
+      matches = items.length;
       if (items.length > shown.length) nodes.push(h("div", { class: "more-row" }, "仅显示最近 " + LOG_STORY_CAP + " 条，另有 " + (items.length - shown.length) + " 条请在日志文件查看。"));
       let minute = "";
       for (const it of shown) { const mm = it.e.time.slice(0, 5); if (mm !== minute) { minute = mm; nodes.push(h("div", { class: "minute", "aria-hidden": "true" }, mm)); } nodes.push(evEl(it)); }
@@ -1169,21 +1219,34 @@
     if (prevIds && !RM.matches) nodes.forEach(n => { if (n.dataset.entry && !prevIds.has(n.dataset.entry)) n.classList.add("fresh"); });
     view.replaceChildren(...(nodes.length ? nodes : [h("div", { class: "empty-state" }, all.length ? "没有符合条件的记录。" : "这里还没有记录。")]));
     if (ui.autoscroll) view.scrollTop = view.scrollHeight;
-    logMeta(s);
+    logMeta(s, matches);
   }
-  function logMeta(s) {
+  // Story parsing walks up to 3,000 lines with a dozen regexes each. Reuse the
+  // count until this source or a filter changes, instead of re-parsing for
+  // every status refresh and every log line.
+  let storyCount = { key: "", value: 0 };
+  const storyKey = all => [ui.source, all.length, all[0]?.seq, all.at(-1)?.seq, ui.level, ui.query, ui.hideHealth].join("\u0001");
+  function logMeta(s, matches) {
     const openLabel = ui.source === "launcher" ? "打开日志目录" : "打开日志文件";
     $("#btn-open-log").title = openLabel;
     $("#btn-open-log").setAttribute("aria-label", openLabel);
     for (const k of ["mcp", "tunnel", "launcher"]) text($("#count-" + k), (s.logs[k] || []).length);
-    const all = s.logs[ui.source] || [], matches = ui.logMode === "raw" ? core.filterLogs(all, ui).length : storyItems(all).filter(itemPasses).length;
+    const all = s.logs[ui.source] || [];
+    if (ui.logMode === "raw") { if (matches == null) matches = core.filterLogs(all, ui).length; }
+    else {
+      const key = storyKey(all);
+      if (matches != null) storyCount = { key, value: matches };
+      else if (storyCount.key !== key) storyCount = { key, value: storyItems(all).filter(itemPasses).length };
+      matches = storyCount.value;
+    }
     const shown = Math.min(matches, ui.logMode === "raw" ? LOG_RAW_CAP : LOG_STORY_CAP);
     text($("#log-summary"), `显示 ${shown} 条${matches > shown ? ` · 共 ${matches} 条匹配` : ""}`);
     $("#log-summary").title = "当前来源 " + all.length + " 行；完整历史请打开日志文件查看。";
   }
   core.on("log", e => {
     if (ui.view !== "logs") return;
-    if (e.source !== ui.source) return logMeta(core.snapshot());
+    // A line from another source changes only that source's count.
+    if (e.source !== ui.source) return text($("#count-" + e.source), (core.snapshot().logs[e.source] || []).length);
     if (ui.logMode === "raw") {
       logMeta(core.snapshot());
       if (!core.filterLogs([e], ui).length) return;
@@ -1227,6 +1290,28 @@
     return h("div", { class: "toggle-line " + cls, dataset: { key } }, b, h("span", null, F[key].label, "。"));
   }
   function chapter(id, title, kids, tag) { return h("section", { class: "chapter", id: "ch-" + id, dataset: { ch: id } }, h("p", { class: "eyebrow" }, title, tag ? h("span", { class: "tag" }, tag) : null), ...kids); }
+  // A static fallback says why it is static and can always be undone; the
+  // quality chips keep the user's choice for when graphics come back.
+  let graphicsGuardState = { persisted: false, reason: null };
+  function renderGraphicsGuard() {
+    const row = $("#graphics-guard-row");
+    if (!row) return;
+    row.hidden = !graphicsBlocked;
+    if (!graphicsBlocked) return;
+    text($("#graphics-guard-text"), graphicsBlockedBy !== "main" ? "图形设备异常，动态画面已暂停"
+      : graphicsGuardState.persisted ? "内存保护已暂停动态画面"
+      : graphicsGuardState.reason ? "界面异常退出后，动态画面已暂停" : "动态画面已暂停");
+  }
+  async function restoreGraphics() {
+    if (!graphicsBlocked) return;
+    // The main process owns the static URL: it clears its marker, re-arms the
+    // Renderer/GPU memory guards and loads the dynamic document.
+    if (graphicsBlockedBy === "main" && core.mode === "electron") { await A.restoreGraphics(); return; }
+    graphicsBlocked = false; graphicsBlockedBy = null;
+    contextLosses.length = 0; frameFaults = 0;
+    setQuality(qualityChoice, { persist: false });
+    renderGraphicsGuard();
+  }
   function buildSettings() {
     const form = $("#setup-form");
     const keyInput = inline("apiKey", { cls: "mono", min: 18, max: 40, placeholder: "sk-…" });
@@ -1320,6 +1405,8 @@
         h("p", { class: "say-line" }, "界面使用", themeChips, "。"),
         h("p", { class: "say-line quality-line", id: "quality-row" }, h("span", { class: "quality-label" }, "画质与动效"), qualityChips),
         h("p", { class: "say-line quality-line", id: "curtain-row" }, h("span", { class: "quality-label" }, "动态光幕"), curtainChips),
+        h("p", { class: "say-line", id: "graphics-guard-row", hidden: true }, h("span", { id: "graphics-guard-text" }), "，可以",
+          h("button", { class: "ghost strong", type: "button", id: "btn-restore-graphics", onclick: restoreGraphics }, "重新开启"), "。"),
       ]),
       chapter("maintenance", "维护", [
         h("p", { class: "say-line" }, "需要时，可以", h("button", { class: "ghost strong", type: "button", id: "btn-reset-profiles" }, "重置 Skill / 插件配置"), "，或", h("button", { class: "ghost warn", type: "button", id: "btn-uninstall" }, "卸载并清理数据"), "。"),
@@ -1571,6 +1658,7 @@
   setInterval(() => { if (!document.hidden) { const s = core.snapshot(); renderWorkspace(s); if (ui.view === "logs") renderSpectrum(s); } }, 1000);
 
   buildSettings();
+  renderGraphicsGuard();
   syncThemeControls();
   const first = core.snapshot();
   fillForm(first);
@@ -1592,7 +1680,12 @@
     placePresence(true); placeIndicators(); document.body.classList.remove("booting"); kick();
   };
   if (scene) { scene.whenReady(() => { kick(); requestAnimationFrame(reveal); }); setTimeout(reveal, 4000); } else reveal();
-  window.__harness = { core, setView, openGuide, applyTheme, refreshSkills, setReminder, setQuality, setCurtain };
+  if (graphicsBlockedBy === "main") Promise.resolve(A.graphicsState?.()).then(state => {
+    graphicsGuardState = { persisted: !!state?.persisted, reason: state?.reason || null };
+    renderGraphicsGuard();
+    toast($("#graphics-guard-text").textContent + "，可在“设置 · 外观”重新开启。");
+  }).catch(() => {});
+  window.__harness = { core, setView, openGuide, applyTheme, refreshSkills, setReminder, setQuality, setCurtain, restoreGraphics };
   if (core.mode === "preview" && (params.get("review") === "motion4" || globalThis.AURA_REVIEW_MOTION === true)) {
     setQuality("ultra", { persist: false });
   }

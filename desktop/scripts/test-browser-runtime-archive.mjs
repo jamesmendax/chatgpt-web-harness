@@ -4,7 +4,8 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import {spawnSync} from 'node:child_process';
 import {archiveBrowserRuntime,browserRuntimeInventory,resolveLocal7zip} from './lib/browser-runtime-archive.mjs';
-const desktopRoot=path.resolve(import.meta.dirname,'..'),root=path.join(desktopRoot,'.codex-tmp','browser-archive-'+process.pid+'-'+crypto.randomBytes(4).toString('hex'));
+import isolation from './lib/test-isolation.cjs';
+const desktopRoot=path.resolve(import.meta.dirname,'..'),root=isolation.artifactRoot('browser-runtime-archive');
 const source=path.join(root,'source'),staging=path.join(root,'staging'),vendor=path.join(staging,'vendor','browser-use');
 const inputs={'python/python.exe':Buffer.from([77,90,0,255,10]),'chrome/chrome-win64/chrome.exe':Buffer.from('MZ-offline-browser'),'site-packages/browser_use/__init__.py':Buffer.from('# retained offline'),'licenses/Python-LICENSE.txt':Buffer.from('license'),'SBOM.spdx.json':Buffer.from('{}'),'provenance.json':Buffer.from('{}'),'site-packages/unicode-测试.txt':Buffer.from('完整离线字节')};
 try{
@@ -21,4 +22,4 @@ try{
  assert.deepEqual(browserRuntimeInventory(unpacked),before);assert.equal(fs.existsSync(path.join(unpacked,'browser-use')),false);
  assert.equal(crypto.createHash('sha256').update(fs.readFileSync(path.join(staging,'vendor',manifest.archive))).digest('hex'),manifest.sha256);
  console.log('PASS offline browser archive round-trips all bytes, Unicode paths and licenses; source remains unchanged; logs/cache are rejected');
-}finally{const resolved=path.resolve(root);assert.ok(resolved.startsWith(path.join(desktopRoot,'.codex-tmp')+path.sep));fs.rmSync(resolved,{recursive:true,force:true});}
+}finally{const resolved=path.resolve(root);assert.ok(resolved.split(path.sep).includes('.validation'));fs.rmSync(resolved,{recursive:true,force:true});}

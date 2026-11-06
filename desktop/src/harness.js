@@ -56,11 +56,17 @@ function ensureNodeShim() {
   const file = path.join(dir, "node.cmd");
   fs.mkdirSync(dir, { recursive: true });
   const executable = String(process.execPath).replace(/"/g, '""');
+  // cmd.exe decodes a batch file in the console code page (936 on Chinese
+  // Windows), so a UTF-8 path such as C:\Users\张三\… written into this file
+  // was misread and `node` failed. The launcher passes the executable in
+  // HARNESS_NODE_EXE (environment strings are UTF-16, and expansion keeps "%"
+  // literal); the written path is only a fallback when that variable is absent.
   const content = [
     "@echo off",
     "setlocal DisableDelayedExpansion",
     "set \"ELECTRON_RUN_AS_NODE=1\"",
-    `\"${executable}\" %*`,
+    `if not defined HARNESS_NODE_EXE set \"HARNESS_NODE_EXE=${executable}\"`,
+    "\"%HARNESS_NODE_EXE%\" %*",
     "exit /b %ERRORLEVEL%",
     "",
   ].join("\r\n");
@@ -127,7 +133,7 @@ function mcpSpawnSpec(config) {
   // legacy flags and credentials, even for accounts saved with relayEnabled.
   stripRetiredRelayEnv(env);
   const nodeShimDir = ensureNodeShim();
-  if (nodeShimDir) prependWindowsPath(env, nodeShimDir);
+  if (nodeShimDir) { prependWindowsPath(env, nodeShimDir); env.HARNESS_NODE_EXE = process.execPath; }
   // 隧道凭据绝不传给 MCP 进程。
   delete env.OPENAI_TUNNEL_API_KEY;
   delete env.CONTROL_PLANE_API_KEY;

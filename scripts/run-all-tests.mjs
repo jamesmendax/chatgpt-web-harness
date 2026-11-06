@@ -5,6 +5,7 @@ import { spawn } from "node:child_process";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "path";
+import net from "node:net";
 import { fileURLToPath } from "url";
 import { assertToolsListBudget } from "./lib/tools-list-budget.mjs";
 import { assertTestManifest, fullTests, nodeArgs } from "./active-test-manifest.mjs";
@@ -12,8 +13,17 @@ import { assertTestManifest, fullTests, nodeArgs } from "./active-test-manifest.
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(__dirname, "..");
 
-const mcpPort = 4200 + Math.floor(Math.random() * 200);
-const adminPort = mcpPort + 1;
+async function isolatedPorts() {
+  const reservations = [net.createServer(), net.createServer()];
+  try {
+    for (const server of reservations) await new Promise((resolve, reject) => {
+      server.once("error", reject); server.listen(0, "127.0.0.1", resolve);
+    });
+    return reservations.map(server => server.address().port);
+  } finally {
+    await Promise.all(reservations.map(server => new Promise(resolve => server.close(resolve))));
+  }
+}
 
 function runNode(script, env = {}) {
   return new Promise((resolve, reject) => {
@@ -75,6 +85,7 @@ for (const script of unitScripts) {
 if (failures.length) throw new Error(`Active regression failures: ${JSON.stringify(failures)}`);
 
 console.log("\n=== Integration (spawn server) ===");
+const [mcpPort, adminPort] = await isolatedPorts();
 const integrationPluginFixtureRoot = await fs.mkdtemp(path.join(os.tmpdir(), "web-harness-test-plugins-"));
 const integrationPluginFixturePath = path.join(integrationPluginFixtureRoot, "plugins.json");
 await fs.writeFile(integrationPluginFixturePath, JSON.stringify({
@@ -110,6 +121,7 @@ server.stderr?.on("data", (d) => (serverLog += d));
 
 try {
   const health = await waitFor(`http://127.0.0.1:${mcpPort}/health`);
+  if (health.runtime?.pid !== server.pid) throw new Error("Integration endpoint is not the test-owned MCP process");
   if (health.status !== "ok" || health.toolProfile !== "slim") throw new Error("public health invalid");
   if (health.runtime?.tool_count !== 34) throw new Error(`health runtime tool count invalid: ${health.runtime?.tool_count}`);
   if (health.runtime?.stale_build !== false) throw new Error("temporary server started with stale build");
@@ -120,6 +132,7 @@ try {
   console.log(`OK  public health: profile=${health.toolProfile}, auth=${health.auth}`);
 
   const admin = await waitFor(`http://127.0.0.1:${adminPort}/health`);
+  if (admin.pid !== server.pid) throw new Error("Integration admin endpoint is not the test-owned process");
   if (!admin.instructions) throw new Error("admin health missing instructions");
   console.log("OK  admin health");
 

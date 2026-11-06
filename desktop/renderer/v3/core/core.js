@@ -175,7 +175,8 @@
   /* ---------- Electron back end (production preload) ---------- */
   function electronBackend() {
     const L = global.launcher;
-    const ACCOUNT_METHODS = new Set(["listAccounts", "createAccount", "selectAccount", "renameAccount", "removeAccount", "inspectAccountImport", "importAccount"]);
+    // Not scoped to the selected account: account management and window graphics.
+    const ACCOUNT_METHODS = new Set(["listAccounts", "createAccount", "selectAccount", "renameAccount", "removeAccount", "inspectAccountImport", "importAccount", "getGraphicsState", "restoreGraphics"]);
     const st = { info: null, accounts: null, accountId: null, config: null, status: null, logs: { mcp: [], tunnel: [], launcher: [] }, catalog: null, activity: [], drafts: null };
     const bus = makeBus();
     let epoch = 0, selecting = false, selectionQueue = Promise.resolve(), loading = null, statusRevision = 0, setupStreamed = false;
@@ -437,6 +438,9 @@
       pickFolder: current => call("pickFolder", { current }),
       pickSkillFile: () => call("pickSkillFile"),
       uninstallApp: () => call("uninstallApp"),
+      // Static-fallback state of this window; restore reloads the dynamic UI.
+      graphicsState: () => call("getGraphicsState"),
+      restoreGraphics: () => call("restoreGraphics"),
       setScenario: null, simulateCall: null
     };
     return {
@@ -471,6 +475,8 @@
       copyText: (text, what) => A.copy(String(text).split("\n").length, what || "内容"),
       pickFolder: async () => "D:\\Projects\\web-harness",
       pickSkillFile: async () => "D:\\Projects\\shared\\team-conventions\\SKILL.md",
+      graphicsState: async () => ({ safe: false, persisted: false, reason: null }),
+      restoreGraphics: async () => ({ restored: false }),
       saveConfig: async patch => { const err = validate(Object.assign({}, sim.snapshot().account.config, patch)); if (err) throw new Error(err); return A.saveConfig(patch); },
       runSetup: async patch => { const err = validate(Object.assign({}, sim.snapshot().account.config, patch)); if (err) { bus.emit("notice", { message: err, level: "error" }); throw new Error(err); } return A.runSetup(Object.assign({}, patch, { markSetup: true })); }
     });

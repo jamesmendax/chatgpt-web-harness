@@ -5,7 +5,7 @@ const fs = require("node:fs"), path = require("node:path"), Module = require("no
 const { EventEmitter } = require("node:events");
 const electron = require("electron"), { app } = electron;
 const desktop = path.resolve(__dirname, "..");
-const out = path.join(desktop, "..", ".validation", "aura-quality-tiers-20261105");
+const out = require("./lib/test-isolation.cjs").artifactRoot("aura-quality-ui");
 fs.mkdirSync(out, { recursive: true });
 const fixture = fs.mkdtempSync(path.join(out, "native-"));
 app.setPath("appData", fixture);

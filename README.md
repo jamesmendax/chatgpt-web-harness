@@ -6,7 +6,7 @@
 
 将 ChatGPT 网页端连接到本地开发环境，使用文件、终端、Git、浏览器和桌面操作能力。
 
-[下载 Web Harness 3.2.0](https://github.com/jamesmendax/chatgpt-web-harness/releases/tag/v3.2.0) · [快速开始](#快速开始) · [系统架构](#系统架构)
+[下载 Web Harness 3.2.0 r4](https://github.com/jamesmendax/chatgpt-web-harness/releases/tag/v3.2.0-r4) · [快速开始](#快速开始) · [系统架构](#系统架构)
 
 ![Windows](https://img.shields.io/badge/Windows-10%20%2F%2011%20x64-0078D4?style=flat-square)
 ![MCP](https://img.shields.io/badge/MCP-Enabled-10A37F?style=flat-square)
@@ -24,6 +24,13 @@
 - **多账户隔离** — 独立账户配置、连接和运行数据。
 - **Aura 桌面界面** — 服务管理、实时状态、主题和通知；3.2.0 新增「极致／高／普通／节能」四档画质、独立动态光幕开关。
 
+## 3.2.0 r4 修订
+
+- 修复 OAuth 身份与并发持久化、会话清理、最终调用结果和满额缓存关联。
+- 改善动态画面恢复、Windows 命令与编码、补丁和原子编辑、上下文缓存及输出队列。
+- 完成 144 项后端清单、506 项桌面 Node 测试、15 次 Electron 验证及实际 Portable UI/IPC 检查；约 20 分钟 UI 持续观察通过。真实网页、OAuth 服务和干净 Windows 的 Setup 安装卸载仍未验收。
+- GitHub 标签是 `v3.2.0-r4`，EXE 内部版本仍为 `3.2.0`。下载时以本标签和 SHA-256 区分修订。详见 [r4 发布说明](docs/RELEASE_3.2.0-r4.zh-CN.md)。
+
 ## 3.2.0 新增
 
 - 基于 3.2.0 后端和 R5 Aura 界面，保留原版光球、光幕与状态反馈，新增四档渲染质量以及独立的「动态光幕」开启／关闭选项，外观沿用原有主题，不增加说明小字。
@@ -35,12 +42,12 @@
 
 ### 1. 下载并启动
 
-从 [Releases](https://github.com/jamesmendax/chatgpt-web-harness/releases/tag/v3.2.0) 下载 Windows x64 版本：
+从 [Releases](https://github.com/jamesmendax/chatgpt-web-harness/releases/tag/v3.2.0-r4) 下载 Windows x64 版本：
 
 | 类型 | 下载 |
 | --- | --- |
-| 安装版 | [ChatGPT Web Harness Isolated-3.2.0-setup.exe](https://github.com/jamesmendax/chatgpt-web-harness/releases/download/v3.2.0/ChatGPT.Web.Harness.Isolated-3.2.0-setup.exe) |
-| 便携版 | [ChatGPT Web Harness Isolated-3.2.0-portable.exe](https://github.com/jamesmendax/chatgpt-web-harness/releases/download/v3.2.0/ChatGPT.Web.Harness.Isolated-3.2.0-portable.exe) |
+| 安装版 | [ChatGPT Web Harness Isolated-3.2.0-setup.exe](https://github.com/jamesmendax/chatgpt-web-harness/releases/download/v3.2.0-r4/ChatGPT.Web.Harness.Isolated-3.2.0-setup.exe) |
+| 便携版 | [ChatGPT Web Harness Isolated-3.2.0-portable.exe](https://github.com/jamesmendax/chatgpt-web-harness/releases/download/v3.2.0-r4/ChatGPT.Web.Harness.Isolated-3.2.0-portable.exe) |
 
 安装版按向导安装；便携版直接运行，无需安装。
 
@@ -64,6 +71,10 @@
 **ChatGPT ↔ HTTPS Tunnel ↔ MCP Gateway ↔ 本地工具与工作区**
 
 [Archify 交互式架构图](docs/architecture.html) · [架构图源文件](docs/architecture.archify.json)
+
+## 源码与构建
+
+[完整源码 ZIP](https://github.com/jamesmendax/chatgpt-web-harness/releases/download/v3.2.0-r4/Web-Harness-3.2.0-r4-source.zip) 包含本次源码和固定构建运行时。GitHub 自动生成的源码归档不包含大型二进制依赖；请按 [源码构建说明](docs/BUILD_FROM_RELEASE_SOURCE.zh-CN.md) 使用同标签附件。
 
 ## 许可证
 

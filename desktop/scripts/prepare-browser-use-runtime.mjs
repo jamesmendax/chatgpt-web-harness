@@ -207,6 +207,9 @@ if (existingRuntimeVerified()) {
   console.log(`BROWSER_USE_RUNTIME_REUSED sha256_lock=${sha256(lockPath)}`);
   process.exit(0);
 }
+if (process.argv.includes("--verify-only")) {
+  throw new Error("Pinned Browser Use runtime is missing or invalid; regression verification never installs or replaces it. Run prepare:browser-use separately when building an isolated candidate.");
+}
 fs.mkdirSync(cache, { recursive: true });
 fs.mkdirSync(wheelhouse, { recursive: true });
 if (fs.existsSync(work)) fs.rmSync(work, { recursive: true, force: true });

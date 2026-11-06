@@ -6,7 +6,13 @@ const http = require("http");
 const MAX_RESPONSE_BYTES = 2_000_000;
 
 function getJson(port, pathname, token, timeoutMs = 2500) {
-  return new Promise((resolve) => {
+  return new Promise((rawResolve) => {
+    // Settle on every outcome: a body cut off mid-stream emits "aborted" /
+    // "close" instead of "end", and an unsettled poll stalled the feed for good.
+    let settled = false;
+    const resolve = (value) => { if (settled) return; settled = true; clearTimeout(deadline); rawResolve(value); };
+    const deadline = setTimeout(() => { req.destroy(); resolve(null); }, timeoutMs + 1000);
+    deadline.unref?.();
     const req = http.request({
       host: "127.0.0.1",
       port,
@@ -33,6 +39,9 @@ function getJson(port, pathname, token, timeoutMs = 2500) {
         if (overflow || res.statusCode !== 200) return resolve(null);
         try { resolve(JSON.parse(body)); } catch { resolve(null); }
       });
+      res.on("aborted", () => resolve(null));
+      res.on("error", () => resolve(null));
+      res.on("close", () => resolve(null));
     });
     req.on("timeout", () => { req.destroy(); resolve(null); });
     req.on("error", () => resolve(null));

@@ -1,8 +1,9 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { accountProjectDir } from "./account-project-scope.js";
+import { BoundedContextCache, boundedCacheEnv } from "./bounded-context-cache.js";
 
 export type HarnessEvidenceKind = "deterministic" | "runtime" | "model_assessed" | "user_confirmed";
 
@@ -83,20 +84,77 @@ interface HarnessLogHeader {
 interface ScanResult {
   format: "none" | "legacy" | "v2" | "error";
   header: HarnessLogHeader | null;
-  events: HarnessEvent[];
+  event_count: number;
+  last_seq: number;
   healthy_end_offset: number;
   total_bytes: number;
   torn_tail: boolean;
   degraded: boolean;
+  ends_with_newline: boolean;
   error?: string;
 }
 
-const readyChains = new Map<string, Promise<void>>();
+const readyChains = new Map<string, Promise<LogState>>();
 const appendChains = new Map<string, Promise<void>>();
-const seqCaches = new Map<string, number>();
-const healthySizes = new Map<string, number>();
-const repairCounts = new Map<string, number>();
-const writeFailures = new Map<string, { count: number; last_error: string; last_at: string }>();
+const logCacheCapacity = () => boundedCacheEnv("HARNESS_EVENT_CACHE_MAX_ENTRIES", 128, 1, 4096);
+const logCacheIdleMs = () => boundedCacheEnv("HARNESS_EVENT_CACHE_IDLE_MS", 30 * 60_000, 1, 7 * 24 * 60 * 60_000);
+interface LogState {
+  ready: boolean;
+  seq: number;
+  healthySize: number;
+  repairs: number;
+  generation: number;
+  failure?: { count: number; last_error: string; last_at: string };
+}
+const logStates = new BoundedContextCache<LogState>(logCacheCapacity, logCacheIdleMs);
+let repairGeneration = 0;
+function logState(filePath: string): LogState {
+  let state = logStates.get(filePath);
+  if (!state) {
+    state = { ready: false, seq: -1, healthySize: -1, repairs: 0, generation: 0 };
+    logStates.set(filePath, state);
+  }
+  return state;
+}
+
+// File size never controls an allocation. Even damaged lines are streamed to
+// their boundary without retaining their bytes. UTF-8 is decoded after joining
+// a complete bounded line, so characters split across IO chunks stay intact.
+const LOG_READ_CHUNK_BYTES = 32 * 1024;
+const MAX_LOG_LINE_BYTES = MAX_EVENT_JSON_BYTES + 1024;
+interface LogLine { bytes: Buffer; end: number; terminated: boolean; oversized: boolean }
+async function* logLines(
+  handle: Awaited<ReturnType<typeof fs.open>>, start: number, end: number
+): AsyncGenerator<LogLine> {
+  const chunk = Buffer.alloc(LOG_READ_CHUNK_BYTES);
+  const line = Buffer.alloc(MAX_LOG_LINE_BYTES);
+  let position = start;
+  let length = 0;
+  let oversized = false;
+  while (position < end) {
+    const { bytesRead } = await handle.read(chunk, 0, Math.min(chunk.length, end - position), position);
+    if (!bytesRead) break;
+    let cursor = 0;
+    while (cursor < bytesRead) {
+      const found = chunk.indexOf(10, cursor);
+      const newline = found >= 0 && found < bytesRead ? found : -1;
+      const stop = newline < 0 ? bytesRead : newline;
+      const count = stop - cursor;
+      if (!oversized && length + count <= line.length) {
+        chunk.copy(line, length, cursor, stop);
+        length += count;
+      } else oversized = true;
+      if (newline >= 0) {
+        yield { bytes: line.subarray(0, length), end: position + newline + 1, terminated: true, oversized };
+        length = 0;
+        oversized = false;
+        cursor = newline + 1;
+      } else cursor = bytesRead;
+    }
+    position += bytesRead;
+  }
+  if (length || oversized) yield { bytes: line.subarray(0, length), end: position, terminated: false, oversized };
+}
 
 function projectSlug(workspaceRoot: string): string {
   return createHash("sha256").update(path.resolve(workspaceRoot)).digest("hex").slice(0, 12);
@@ -200,36 +258,40 @@ function convertLegacyEvent(parsed: Record<string, unknown>): HarnessEvent {
   return event as unknown as HarnessEvent;
 }
 
-async function scanLogFile(filePath: string): Promise<ScanResult> {
-  let buf: Buffer;
+async function scanLogFile(filePath: string, onEvent?: (event: HarnessEvent) => void | Promise<void>): Promise<ScanResult> {
+  let handle: Awaited<ReturnType<typeof fs.open>>;
   try {
-    buf = await fs.readFile(filePath);
+    handle = await fs.open(filePath, "r");
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
     if (code === "ENOENT") {
-      return { format: "none", header: null, events: [], healthy_end_offset: 0, total_bytes: 0, torn_tail: false, degraded: false };
+      return { format: "none", header: null, event_count: 0, last_seq: -1, healthy_end_offset: 0, total_bytes: 0, torn_tail: false, degraded: false, ends_with_newline: false };
     }
     return {
       format: "error",
       header: null,
-      events: [],
+      event_count: 0,
+      last_seq: -1,
       healthy_end_offset: 0,
       total_bytes: 0,
       torn_tail: false,
       degraded: false,
+      ends_with_newline: false,
       error: `${code ?? "ERROR"}: ${(error as Error).message}`,
     };
   }
 
-  let cursor = 0;
+  try {
+  const totalBytes = (await handle.stat()).size;
   let healthyEnd = 0;
-  const events: HarnessEvent[] = [];
+  let eventCount = 0;
   let tornTail = false;
   let degraded = false;
   let header: HarnessLogHeader | null = null;
   let format: "legacy" | "v2" = "legacy";
   let expectedSeq = 0;
   let firstLine = true;
+  let endsWithNewline = false;
 
   const fail = (message: string, isLast: boolean): void => {
     if (isLast) tornTail = true;
@@ -237,12 +299,12 @@ async function scanLogFile(filePath: string): Promise<ScanResult> {
     void message;
   };
 
-  while (cursor < buf.length) {
-    const newline = buf.indexOf(10, cursor);
-    const isLast = newline === -1;
-    const lineEnd = isLast ? buf.length : newline;
-    const raw = buf.subarray(cursor, lineEnd).toString("utf-8").trim();
-    cursor = isLast ? buf.length : newline + 1;
+  for await (const line of logLines(handle, 0, totalBytes)) {
+    const isLast = !line.terminated;
+    endsWithNewline = line.terminated;
+    if (line.oversized) throw new HarnessLogFormatError(filePath,
+      `log line exceeds the ${MAX_LOG_LINE_BYTES}-byte bounded reader limit; this may be a valid legacy line, so the log is left untouched`);
+    const raw = line.bytes.toString("utf-8").trim();
 
     if (!raw) continue;
     if (firstLine) {
@@ -252,7 +314,7 @@ async function scanLogFile(filePath: string): Promise<ScanResult> {
         if (probe && typeof probe === "object" && probe.kind === "harness-log") {
           header = parseHeaderLine(raw, filePath);
           format = "v2";
-          healthyEnd = cursor;
+          healthyEnd = line.end;
           continue;
         }
       } catch (error) {
@@ -260,6 +322,7 @@ async function scanLogFile(filePath: string): Promise<ScanResult> {
       }
     }
 
+    let accepted: HarnessEvent;
     try {
       const parsed = JSON.parse(raw) as Record<string, unknown>;
       const event = format === "v2" ? validateEventLine(parsed, filePath) : convertLegacyEvent(parsed);
@@ -268,24 +331,29 @@ async function scanLogFile(filePath: string): Promise<ScanResult> {
         break;
       }
       expectedSeq = (event.seq as number) + 1;
-      events.push(event);
-      healthyEnd = isLast ? buf.length : cursor;
+      eventCount++;
+      healthyEnd = line.end;
+      accepted = event;
     } catch (error) {
       if (error instanceof HarnessLogFormatError) throw error;
       fail((error as Error).message, isLast);
       break;
     }
+    if (onEvent) await onEvent(accepted!);
   }
 
   return {
     format,
     header,
-    events,
+    event_count: eventCount,
+    last_seq: expectedSeq - 1,
     healthy_end_offset: healthyEnd,
-    total_bytes: buf.length,
+    total_bytes: totalBytes,
     torn_tail: tornTail,
     degraded,
+    ends_with_newline: endsWithNewline,
   };
+  } finally { await handle.close(); }
 }
 
 async function atomicWrite(filePath: string, content: string): Promise<void> {
@@ -293,6 +361,53 @@ async function atomicWrite(filePath: string, content: string): Promise<void> {
   const temp = `${filePath}.${process.pid}.${Date.now()}.tmp`;
   await fs.writeFile(temp, content, "utf-8");
   await fs.rename(temp, filePath);
+}
+
+function noteRepair(state: LogState): void {
+  state.repairs++;
+  state.generation = ++repairGeneration;
+}
+
+async function preserveDamagedTail(filePath: string, from: number, end: number): Promise<void> {
+  const archive = `${filePath}.tail-${Date.now()}-${randomUUID()}`;
+  const source = await fs.open(filePath, "r");
+  let target: Awaited<ReturnType<typeof fs.open>> | undefined;
+  try {
+    target = await fs.open(archive, "wx");
+    const chunk = Buffer.alloc(LOG_READ_CHUNK_BYTES);
+    let offset = from;
+    while (offset < end) {
+      const { bytesRead } = await source.read(chunk, 0, Math.min(chunk.length, end - offset), offset);
+      if (!bytesRead) throw new Error("log changed while preserving damaged tail");
+      await target.writeFile(chunk.subarray(0, bytesRead));
+      offset += bytesRead;
+    }
+  } finally {
+    await source.close();
+    await target?.close();
+  }
+}
+
+async function migrateLegacyLog(filePath: string, workspaceRoot: string, preserveOriginal: boolean): Promise<number> {
+  const temporary = `${filePath}.${randomUUID()}.tmp`;
+  const target = await fs.open(temporary, "wx");
+  let bytes = 0;
+  const write = async (line: string): Promise<void> => {
+    await target.writeFile(line, "utf-8");
+    bytes += Buffer.byteLength(line, "utf-8");
+  };
+  try {
+    await write(`${JSON.stringify(makeHeader(workspaceRoot))}\n`);
+    await scanLogFile(filePath, async event => { await write(`${JSON.stringify(event)}\n`); });
+    await target.close();
+    if (preserveOriginal) await fs.copyFile(filePath, `${filePath}.legacy-damaged-${Date.now()}-${randomUUID()}`);
+    await fs.rename(temporary, filePath);
+    return bytes;
+  } catch (error) {
+    await target.close().catch(() => undefined);
+    await fs.unlink(temporary).catch(() => undefined);
+    throw error;
+  }
 }
 
 function makeHeader(workspaceRoot: string): HarnessLogHeader {
@@ -304,81 +419,89 @@ function makeHeader(workspaceRoot: string): HarnessLogHeader {
   };
 }
 
-async function ensureReady(filePath: string, workspaceRoot: string): Promise<void> {
+async function ensureReady(filePath: string, workspaceRoot: string): Promise<LogState> {
+  const state = logState(filePath);
   const scan = await scanLogFile(filePath);
   if (scan.format === "error") throw new Error(`harness event log unreadable: ${scan.error}`);
 
   if (scan.format === "none") {
     const headerLine = `${JSON.stringify(makeHeader(workspaceRoot))}\n`;
     await atomicWrite(filePath, headerLine);
-    seqCaches.set(filePath, -1);
-    healthySizes.set(filePath, Buffer.byteLength(headerLine, "utf-8"));
-    return;
+    state.seq = -1;
+    state.healthySize = Buffer.byteLength(headerLine, "utf-8");
+    state.ready = true;
+    return state;
   }
 
   const tailDamage = scan.torn_tail || scan.degraded || scan.healthy_end_offset < scan.total_bytes;
   if (scan.format === "legacy") {
-    const lines = [JSON.stringify(makeHeader(workspaceRoot)), ...scan.events.map((event) => JSON.stringify(event))];
-    const content = lines.map((line) => `${line}\n`).join("");
-    await atomicWrite(filePath, content);
-    if (scan.events.length) {
-      console.warn(`[harness-events] migrated legacy log to v${HARNESS_LOG_VERSION}: ${scan.events.length} event(s) at ${filePath}`);
+    const migratedBytes = await migrateLegacyLog(filePath, workspaceRoot, tailDamage);
+    if (scan.event_count) {
+      console.warn(`[harness-events] migrated legacy log to v${HARNESS_LOG_VERSION}: ${scan.event_count} event(s) at ${filePath}`);
     }
-    repairCounts.set(filePath, (repairCounts.get(filePath) ?? 0) + 1);
-    seqCaches.set(filePath, scan.events.length ? (scan.events.at(-1)!.seq as number) : -1);
-    healthySizes.set(filePath, Buffer.byteLength(content, "utf-8"));
-    return;
+    noteRepair(state);
+    state.seq = scan.last_seq;
+    state.healthySize = migratedBytes;
+    state.ready = true;
+    return state;
   }
 
   if (scan.degraded) {
     // Mid-file structural damage: truncating would silently delete every
     // possibly-valid event after the gap. Quarantine the whole file for
     // forensics and start a fresh log instead.
-    const quarantined = `${filePath}.corrupt-${Date.now()}`;
-    try {
-      await fs.rename(filePath, quarantined);
-      console.warn(`[harness-events] mid-file damage: log quarantined to ${quarantined}; starting fresh`);
-    } catch {
-      console.warn(`[harness-events] mid-file damage detected but quarantine rename failed at ${filePath}`);
-    }
+    const quarantined = `${filePath}.corrupt-${Date.now()}-${randomUUID()}`;
+    await fs.rename(filePath, quarantined);
+    console.warn(`[harness-events] mid-file damage: log quarantined to ${quarantined}; starting fresh`);
     const headerLine = `${JSON.stringify(makeHeader(workspaceRoot))}\n`;
     await atomicWrite(filePath, headerLine);
-    seqCaches.set(filePath, -1);
-    healthySizes.set(filePath, Buffer.byteLength(headerLine, "utf-8"));
-    repairCounts.set(filePath, (repairCounts.get(filePath) ?? 0) + 1);
-    return;
+    state.seq = -1;
+    state.healthySize = Buffer.byteLength(headerLine, "utf-8");
+    noteRepair(state);
+    state.ready = true;
+    return state;
   }
 
-  seqCaches.set(filePath, scan.events.length ? (scan.events.at(-1)!.seq as number) : -1);
-  healthySizes.set(filePath, scan.healthy_end_offset);
+  state.seq = scan.last_seq;
+  state.healthySize = scan.healthy_end_offset;
   if (tailDamage) {
+    await preserveDamagedTail(filePath, scan.healthy_end_offset, scan.total_bytes);
     await fs.truncate(filePath, scan.healthy_end_offset);
-    repairCounts.set(filePath, (repairCounts.get(filePath) ?? 0) + 1);
+    noteRepair(state);
     console.warn(`[harness-events] truncated damaged tail (${scan.total_bytes - scan.healthy_end_offset} bytes) at ${filePath}`);
   }
+  if (!tailDamage && scan.total_bytes > 0 && !scan.ends_with_newline) {
+    await fs.appendFile(filePath, "\n", "utf-8");
+    state.healthySize++;
+  }
+  state.ready = true;
+  return state;
 }
 
 // Tail damage can appear at any time (crash mid-write, foreign writer), long
 // after the cached init promise resolved — re-scan whenever the file size no
 // longer matches the last known healthy size.
-async function syncIfTailChanged(filePath: string, workspaceRoot: string): Promise<void> {
-  const expected = healthySizes.get(filePath);
+async function syncIfTailChanged(filePath: string, workspaceRoot: string): Promise<LogState> {
+  const state = logState(filePath);
+  const expected = state.healthySize;
   let size = -1;
   try {
     size = (await fs.stat(filePath)).size;
   } catch {}
-  if (size !== expected) {
-    readyChains.delete(filePath);
-    await getReady(filePath, workspaceRoot);
+  if (!state.ready || size !== expected) {
+    state.ready = false;
+    return getReady(filePath, workspaceRoot);
   }
+  return state;
 }
 
-function getReady(filePath: string, workspaceRoot: string): Promise<void> {
+function getReady(filePath: string, workspaceRoot: string): Promise<LogState> {
   const existing = readyChains.get(filePath);
   if (existing) return existing;
-  const ready = ensureReady(filePath, workspaceRoot).catch((error) => {
-    readyChains.delete(filePath);
-    throw error;
+  const state = logStates.get(filePath);
+  if (state?.ready) return Promise.resolve(state);
+  const ready = ensureReady(filePath, workspaceRoot).finally(() => {
+    if (readyChains.get(filePath) === ready) readyChains.delete(filePath);
   });
   readyChains.set(filePath, ready);
   return ready;
@@ -390,7 +513,6 @@ export async function appendHarnessEvent(workspaceRoot: string, input: HarnessEv
     if (!EVENT_TYPES.has(input.type)) throw new Error(`unknown harness event type: ${input.type}`);
     assertJsonData(input.data, "data", new Set());
 
-    await getReady(filePath, workspaceRoot);
     const previous = appendChains.get(filePath) ?? Promise.resolve();
     let release: () => void = () => {};
     const gate = new Promise<void>((resolve) => { release = resolve; });
@@ -398,8 +520,8 @@ export async function appendHarnessEvent(workspaceRoot: string, input: HarnessEv
     appendChains.set(filePath, chain);
     await previous.catch(() => undefined);
     try {
-      await syncIfTailChanged(filePath, workspaceRoot);
-      const seq = (seqCaches.get(filePath) ?? -1) + 1;
+      const state = await syncIfTailChanged(filePath, workspaceRoot);
+      const seq = state.seq + 1;
       const event: HarnessEvent = {
         type: input.type,
         seq,
@@ -419,19 +541,20 @@ export async function appendHarnessEvent(workspaceRoot: string, input: HarnessEv
       }
       await fs.mkdir(path.dirname(filePath), { recursive: true });
       await fs.appendFile(filePath, `${line}\n`, "utf-8");
-      seqCaches.set(filePath, seq);
-      healthySizes.set(filePath, (healthySizes.get(filePath) ?? 0) + bytes + 1);
+      state.seq = seq;
+      state.healthySize += bytes + 1;
       return event;
     } finally {
       release();
       if (appendChains.get(filePath) === chain) appendChains.delete(filePath);
     }
   } catch (error) {
-    const failure = writeFailures.get(filePath) ?? { count: 0, last_error: "", last_at: "" };
+    const state = logState(filePath);
+    const failure = state.failure ?? { count: 0, last_error: "", last_at: "" };
     failure.count += 1;
     failure.last_error = (error as Error).message;
     failure.last_at = new Date().toISOString();
-    writeFailures.set(filePath, failure);
+    state.failure = failure;
     console.warn(`[harness-events] append failed (#${failure.count}): ${failure.last_error}`);
     throw error;
   }
@@ -466,7 +589,8 @@ export interface HarnessEventLogHealth {
 
 export async function getHarnessEventLogHealth(workspaceRoot: string): Promise<HarnessEventLogHealth> {
   const filePath = harnessEventLogPath(workspaceRoot);
-  const failures = writeFailures.get(filePath);
+  const state = logStates.get(filePath);
+  const failures = state?.failure;
   const base: HarnessEventLogHealth = {
     path: filePath,
     exists: false,
@@ -476,7 +600,7 @@ export async function getHarnessEventLogHealth(workspaceRoot: string): Promise<H
     last_seq: -1,
     torn_tail: false,
     degraded: false,
-    repairs: repairCounts.get(filePath) ?? 0,
+    repairs: state?.repairs ?? 0,
     dropped_writes: failures?.count ?? 0,
     ...(failures?.last_error ? { last_write_error: failures.last_error, last_write_at: failures.last_at } : {}),
   };
@@ -490,8 +614,8 @@ export async function getHarnessEventLogHealth(workspaceRoot: string): Promise<H
       exists: scan.format !== "none",
       format: scan.format,
       header_version: scan.header?.version ?? null,
-      events: scan.events.length,
-      last_seq: scan.events.length ? (scan.events.at(-1)!.seq as number) : -1,
+      events: scan.event_count,
+      last_seq: scan.last_seq,
       torn_tail: scan.torn_tail,
       degraded: scan.degraded,
     };
@@ -504,55 +628,55 @@ export async function getHarnessEventLogHealth(workspaceRoot: string): Promise<H
 }
 
 /**
- * Incremental tail read: returns every complete event line appended after
- * `fromOffset` (a byte offset previously returned here). Lenient by design —
+ * Incremental tail read: streams complete lines after `fromOffset`, retaining
+ * only the requested last matching window (1000 maximum). Lenient by design —
  * damaged lines are skipped, contiguity is not enforced; the strict reader
  * (readHarnessEvents) remains the authority. `next_offset` always lands on a
- * line boundary; a shrunken log triggers one full rescan (reset=true).
+ * line boundary; a shrunken/replaced log triggers a streaming rescan (reset=true).
  */
-function parseTailBuffer(buf: Buffer, baseOffset: number, filePath: string): { events: HarnessEvent[]; next_offset: number } {
-  const lastNewline = buf.lastIndexOf(10);
-  if (lastNewline === -1) return { events: [], next_offset: baseOffset };
-  const text = buf.subarray(0, lastNewline + 1).toString("utf-8");
-  const events: HarnessEvent[] = [];
-  for (const raw of text.split(/\r?\n/)) {
-    if (!raw.trim()) continue;
-    try {
-      const parsed = JSON.parse(raw) as Record<string, unknown>;
-      if (parsed && typeof parsed === "object" && parsed.kind === "harness-log") continue;
-      events.push(validateEventLine(parsed, filePath));
-    } catch {
-      // Lenient: skip damaged or foreign lines; the tail is an optimization read.
-    }
-  }
-  return { events, next_offset: baseOffset + lastNewline + 1 };
-}
-
 export async function readHarnessEventTail(
   workspaceRoot: string,
-  fromOffset: number
-): Promise<{ events: HarnessEvent[]; next_offset: number; reset: boolean }> {
+  fromOffset: number,
+  options: ReadHarnessEventsOptions & { file_identity?: string } = {}
+): Promise<{ events: HarnessEvent[]; next_offset: number; reset: boolean; file_identity?: string; matched_events: number; windowed: boolean; oversized_lines: number }> {
   const filePath = harnessEventLogPath(workspaceRoot);
   let handle: Awaited<ReturnType<typeof fs.open>>;
   try {
     handle = await fs.open(filePath, "r");
   } catch {
-    return { events: [], next_offset: 0, reset: fromOffset > 0 };
+    return { events: [], next_offset: 0, reset: fromOffset > 0, matched_events: 0, windowed: false, oversized_lines: 0 };
   }
   try {
     const stat = await handle.stat();
-    if (fromOffset > stat.size) {
-      // Log shrank (repair/quarantine) — one bounded full rescan.
-      const full = Buffer.alloc(stat.size);
-      if (stat.size > 0) await handle.read(full, 0, stat.size, 0);
-      return { ...parseTailBuffer(full, 0, filePath), reset: true };
+    const fileIdentity = `${stat.dev}:${stat.ino}:${stat.birthtimeMs}`;
+    const reset = !Number.isSafeInteger(fromOffset) || fromOffset < 0 || fromOffset > stat.size ||
+      Boolean(options.file_identity && options.file_identity !== fileIdentity);
+    const start = reset ? 0 : fromOffset;
+    let nextOffset = start;
+    let matched = 0;
+    let oversized = 0;
+    const events: HarnessEvent[] = [];
+    const matches = eventMatcher(options);
+    const limit = eventLimit(options.limit ?? 1000);
+    for await (const line of logLines(handle, start, stat.size)) {
+      if (!line.terminated) break;
+      nextOffset = line.end;
+      if (line.oversized) { oversized++; continue; }
+      const raw = line.bytes.toString("utf-8").trim();
+      if (!raw) continue;
+      try {
+        const parsed = JSON.parse(raw) as Record<string, unknown>;
+        if (parsed?.kind === "harness-log") continue;
+        const event = validateEventLine(parsed, filePath);
+        if (!matches(event)) continue;
+        matched++;
+        if (events.length === limit) events.shift();
+        events.push(event);
+      } catch {
+        // Lenient optimization; strict scan remains the history authority.
+      }
     }
-    if (fromOffset === stat.size) return { events: [], next_offset: fromOffset, reset: false };
-    // Read only the tail from the byte offset; UTF-8 continuation bytes never
-    // equal 0x0A, so newline scanning stays multi-byte safe.
-    const tail = Buffer.alloc(stat.size - fromOffset);
-    await handle.read(tail, 0, tail.length, fromOffset);
-    return { ...parseTailBuffer(tail, fromOffset, filePath), reset: false };
+    return { events, next_offset: nextOffset, reset, file_identity: fileIdentity, matched_events: matched, windowed: matched > limit, oversized_lines: oversized };
   } finally {
     await handle.close();
   }
@@ -560,7 +684,7 @@ export async function readHarnessEventTail(
 
 /** Repair-generation counter: evidence windows reset when the log is rewritten. */
 export function harnessRepairCount(workspaceRoot: string): number {
-  return repairCounts.get(harnessEventLogPath(workspaceRoot)) ?? 0;
+  return logStates.get(harnessEventLogPath(workspaceRoot))?.generation ?? 0;
 }
 
 export interface ReadHarnessEventsOptions {
@@ -570,6 +694,28 @@ export interface ReadHarnessEventsOptions {
   goal_id?: string;
   project_root?: string;
   from_seq?: number;
+  require_evidence_kind?: boolean;
+}
+
+function eventLimit(limit?: number): number {
+  return Number.isFinite(limit) ? Math.max(1, Math.min(Math.floor(limit!), 1000)) : 100;
+}
+
+function eventMatcher(options: ReadHarnessEventsOptions): (event: HarnessEvent) => boolean {
+  const projectRoot = options.project_root ? path.resolve(options.project_root) : undefined;
+  const projectKey = projectRoot ? (process.platform === "win32" ? projectRoot.toLowerCase() : projectRoot) : undefined;
+  return event => {
+    if (options.type && event.type !== options.type) return false;
+    if (options.task_id && event.task_id !== options.task_id) return false;
+    if (options.goal_id && event.goal_id !== options.goal_id) return false;
+    if (options.from_seq !== undefined && event.seq < options.from_seq) return false;
+    if (options.require_evidence_kind && !event.evidence_kind) return false;
+    if (projectKey && !event.project_roots?.some(root => {
+      const resolved = path.resolve(root);
+      return (process.platform === "win32" ? resolved.toLowerCase() : resolved) === projectKey;
+    })) return false;
+    return true;
+  };
 }
 
 export async function readHarnessEvents(
@@ -577,22 +723,13 @@ export async function readHarnessEvents(
   options: ReadHarnessEventsOptions = {}
 ): Promise<HarnessEvent[]> {
   const filePath = harnessEventLogPath(workspaceRoot);
-  const scan = await scanLogFile(filePath);
-  if (scan.format === "error") return [];
-
-  const projectRoot = options.project_root ? path.resolve(options.project_root) : undefined;
-  const projectKey = projectRoot ? (process.platform === "win32" ? projectRoot.toLowerCase() : projectRoot) : undefined;
   const events: HarnessEvent[] = [];
-  for (const event of scan.events) {
-    if (options.type && event.type !== options.type) continue;
-    if (options.task_id && event.task_id !== options.task_id) continue;
-    if (options.goal_id && event.goal_id !== options.goal_id) continue;
-    if (options.from_seq !== undefined && (event.seq as number) < options.from_seq) continue;
-    if (projectKey && !event.project_roots?.some((root) => {
-      const resolved = path.resolve(root);
-      return (process.platform === "win32" ? resolved.toLowerCase() : resolved) === projectKey;
-    })) continue;
+  const matches = eventMatcher(options);
+  const limit = eventLimit(options.limit);
+  const scan = await scanLogFile(filePath, event => {
+    if (!matches(event)) return;
+    if (events.length === limit) events.shift();
     events.push(event);
-  }
-  return events.slice(-Math.max(1, Math.min(options.limit ?? 100, 1000)));
+  });
+  return scan.format === "error" ? [] : events;
 }

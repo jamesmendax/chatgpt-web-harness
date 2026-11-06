@@ -1,16 +1,18 @@
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { bootstrapIsolatedTestEnv, assertAuditFixture } from "./lib/isolated-test-env.mjs";
 
-const dist = path.resolve(process.argv[2] || "dist");
-const root = await fs.mkdtemp(path.join(os.tmpdir(), "wh-v32-process-"));
-process.env.CODEX_HOME = path.join(root, "codex");
-process.env.CHECKPOINT_PATH = path.join(root, "checkpoints");
+const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const dist = path.resolve(process.argv.slice(2).find(value => !value.startsWith("--")) || path.join(repo, "dist"));
+const fixture = await bootstrapIsolatedTestEnv("v32-process");
+const root = fixture.root;
 const moduleAt = file => import(pathToFileURL(path.join(dist, file)).href);
+await assertAuditFixture(fixture, await moduleAt("lib/audit.js"), "v32-process");
+if (process.argv.includes("--isolation-only")) process.exit(0);
 const { setDefaultCwd } = await moduleAt("lib/path-security.js");
 const { registerShellTools } = await moduleAt("tools/shell.js");
 const { runWithRuntimeScope } = await moduleAt("lib/runtime-scope.js");

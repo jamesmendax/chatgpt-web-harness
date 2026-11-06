@@ -3,7 +3,7 @@ import { physicalPromises as fs } from "./physical-fs.js";
 import physicalFs from "./physical-fs.js";
 const { createReadStream } = physicalFs;
 import { createHash, randomUUID } from "node:crypto";
-import { withCanonicalFileLock } from "./safe-text-write.js";
+import { publishNewFile, withCanonicalFileLock } from "./safe-text-write.js";
 
 type Meta = { version: 1; target: string; size: number; expectedHash: string | null; baseline: string | null; stagingIdentity: string; finalHash?: string };
 type Input = { target: string; buffer: Buffer; offset: number; truncate: boolean; expectedSize: number; expectedHash?: string; transferId?: string; checkpoint: (target: string) => Promise<string | undefined> };
@@ -108,8 +108,8 @@ export async function writeStagedBinary(input: Input) {
           await fs.rename(nextMetadata, metadata);
         } finally { await fs.unlink(nextMetadata).catch(() => undefined); }
         if (meta.baseline === null) {
-          try { await fs.link(stage, target); }
-          catch (e) { if ((e as NodeJS.ErrnoException).code === "EEXIST") throw new Error("WRITE_CONFLICT: target created during publication"); throw e; }
+          // Hard link, or an exclusive copy on volumes without links (FAT32/exFAT).
+          await publishNewFile(stage, target);
           await fs.unlink(stage).catch(() => undefined);
         } else await fs.rename(stage, target);
         finalized = true;

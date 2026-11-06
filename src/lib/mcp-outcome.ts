@@ -1,4 +1,5 @@
 import type { CallToolResult, RequestId } from "@modelcontextprotocol/sdk/types.js";
+import { randomUUID } from "node:crypto";
 import { toolFailureDiagnostic, type ToolFailureDiagnostic } from "./tool-diagnostics.js";
 import { getMcpRequestIdentity } from "./mcp-request-identity.js";
 
@@ -42,14 +43,14 @@ function observationKey(requestId: RequestId | undefined, tool: string, requestI
   return JSON.stringify([owner, typeof requestId, requestId, tool]);
 }
 
-function prune(now = Date.now()): void {
+function prune(now = Date.now(), incoming = 0): void {
   for (const [key, queue] of observations) {
     const fresh = queue.filter((entry) => now - entry.stored_at_ms <= OUTCOME_TTL_MS);
     observationCount -= queue.length - fresh.length;
     if (fresh.length > 0) observations.set(key, fresh);
     else observations.delete(key);
   }
-  while (observationCount >= MAX_OBSERVATIONS) {
+  while (observationCount > MAX_OBSERVATIONS - incoming) {
     const firstKey = observations.keys().next().value as string | undefined;
     if (!firstKey) break;
     const queue = observations.get(firstKey);
@@ -67,7 +68,8 @@ function store(requestId: RequestId | undefined, tool: string, outcome: McpOutco
   const key = observationKey(requestId, tool);
   if (!key) return;
   const now = Date.now();
-  prune(now);
+  // Only insertion reserves a slot; reads and replacement lookup keep a full store intact.
+  prune(now, 1);
   const queue = observations.get(key) ?? [];
   const identity = getMcpRequestIdentity();
   queue.push({ outcome: { ...outcome,
@@ -123,6 +125,50 @@ export function observeMcpInvocationFailure(opts: {
     observed_at: new Date().toISOString(),
     ...(opts.failure ? { failure: opts.failure } : {}),
   });
+}
+
+/** The SDK may reject input before, or output after, the gateway callback. */
+export function observeMcpFinalOutcome(opts: {
+  requestId?: RequestId;
+  tool: string;
+  result?: CallToolResult;
+  rpcError?: boolean;
+}): { outcome: McpOutcomeObservation; previous?: McpOutcomeObservation } | undefined {
+  const key = observationKey(opts.requestId, opts.tool);
+  if (!key) return undefined;
+  prune();
+  const queue = observations.get(key);
+  const previous = queue?.at(-1)?.outcome;
+  let failure = opts.result ? toolFailureDiagnostic(opts.result) : undefined;
+  const rejected = opts.rpcError === true || (opts.result && classifyToolResult(opts.result) === "error");
+  if (rejected && (!opts.result?.structuredContent || opts.rpcError)) {
+    // SDK validation text can include argument values. Keep only bounded,
+    // argument-free diagnostics, preserving richer gateway failure metadata.
+    failure = previous?.failure ?? {
+      outcome_kind: "execution_error",
+      error_code: previous ? "MCP_RESULT_REJECTED" : "MCP_CALL_REJECTED",
+      failure_phase: previous ? "postprocessing" : "validation",
+      error_summary: previous
+        ? "The MCP SDK rejected the result after the tool returned."
+        : "The MCP SDK rejected the tool call.",
+      ...(previous ? { operation_started: true } : {}),
+      retry_policy: "inspect_original_result",
+    };
+  }
+  const outcome: McpOutcomeObservation = {
+    rpc_result_status: opts.rpcError ? "error" : "success",
+    tool_result_status: opts.rpcError ? "error" : classifyToolResult(opts.result!),
+    client_delivery: "unknown",
+    invocation_id: previous?.invocation_id ?? randomUUID(),
+    observed_at: new Date().toISOString(),
+    ...(failure ? { failure } : {}),
+  };
+  // One HTTP request consumes one final outcome. Provisional gateway/journal
+  // observations must not leave an earlier success at the front of its queue.
+  observationCount -= queue?.length ?? 0;
+  observations.delete(key);
+  store(opts.requestId, opts.tool, outcome);
+  return { outcome, previous };
 }
 
 export function consumeMcpOutcome(

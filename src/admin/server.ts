@@ -5,6 +5,7 @@ import type { Server } from "http";
 import type { McpUpstreamManager } from "../lib/mcp-upstream-manager.js";
 import { createAdminRouter } from "./routes.js";
 import { adminAuth, localhostOnly } from "./localhost-guard.js";
+import { createBrowserRequestGuard } from "../lib/browser-request-guard.js";
 import { recoveryNonMcpHttpFence } from "../lib/recovery-non-mcp-fence.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -35,6 +36,10 @@ export function startAdminServer(options: AdminServerOptions): Server {
   })[char]!);
   app.use(express.json({ limit: "5mb" }));
   app.use(localhostOnly);
+  // A DNS-rebound page passes the socket-address check (it connects from
+  // 127.0.0.1); its Origin gives it away. The admin UI's loopback origin, the
+  // Browser Companion's extension origin and OAuth redirects (no Origin) pass.
+  app.use(createBrowserRequestGuard(() => false, "Admin"));
 
   // Product action approval routes are retired, including legacy env opt-ins.
 

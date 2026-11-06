@@ -12,7 +12,7 @@ const electron = require("electron");
 const { app } = electron;
 const desktop = path.resolve(__dirname, "..");
 const repo = path.resolve(desktop, "..");
-const artifacts = path.join(repo, ".validation", "aura-ui");
+const artifacts = require("./lib/test-isolation.cjs").artifactRoot("aura-ui");
 fs.mkdirSync(artifacts, { recursive: true });
 const fixture = fs.mkdtempSync(path.join(artifacts, "run-"));
 const workspace = path.join(fixture, "workspace");

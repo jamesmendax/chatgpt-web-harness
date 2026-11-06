@@ -3,6 +3,8 @@ import fs from "node:fs";
 import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { createRequire } from "node:module";
+import { spawnSync } from "node:child_process";
 
 import {
   MAX_ZIP_ENTRIES,
@@ -61,7 +63,22 @@ try {
   fs.symlinkSync(outside, linked, "junction");
   assert.throws(() => assertExtractedTreeContained(root), /符号链接|真实路径/);
   fs.unlinkSync(linked);
-  console.log("zip-safety: traversal, ADS/invalid Win32 names, reserved devices, expansion budget, and post-extract realpath containment OK");
+  // PowerShell also closes a single-quoted literal at ‘ ’ ‚ ‛ (U+2018–U+201B);
+  // a downloaded zip named skill’+$(…)+’.zip must stay a file name.
+  if (process.platform === "win32") {
+    const { psQuote } = createRequire(import.meta.url)("../src/shell-util.js");
+    const name = "skill\u2019+$(Write-Output INJECTED)+\u2019.zip";
+    const echo = quoted => spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command",
+      `[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new(); Write-Output '${quoted}'`], { encoding: "utf8", windowsHide: true }).stdout.trim();
+    const unsafe = echo(name.replace(/'/g, "''"));
+    assert.match(unsafe, /INJECTED/, "control: ASCII-only escaping lets the subexpression run");
+    assert.doesNotMatch(unsafe, /Write-Output/, "control: ASCII-only escaping lets the subexpression run");
+    assert.equal(echo(psQuote(name)), name, "psQuote keeps the whole name literal");
+    // Errors come back whole and readable: UTF-8 instead of the console code page, read until "close".
+    const { runPowershell } = createRequire(import.meta.url)("../src/shell-util.js");
+    await assert.rejects(runPowershell("throw '压缩包校验失败：条目过多'"), /压缩包校验失败：条目过多/);
+  }
+  console.log("zip-safety: traversal, ADS/invalid Win32 names, reserved devices, expansion budget, post-extract realpath containment and PowerShell quoting OK");
 } finally {
   await fsp.rm(tmp, { recursive: true, force: true });
 }

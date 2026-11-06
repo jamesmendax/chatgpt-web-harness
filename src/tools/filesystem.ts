@@ -6,7 +6,9 @@ import { lookup } from "dns/promises";
 import { isIP } from "net";
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { validatePath } from "../lib/path-security.js";
+import { getDefaultCwd, validatePath } from "../lib/path-security.js";
+import { assertWritable, decodeText, encodeText, type DecodedText } from "../lib/text-codec.js";
+import { createLineMatcher, replaceWithDeadline } from "../lib/regex-budget.js";
 import { audit } from "../lib/audit.js";
 import { requireWriteAllowed } from "../lib/permissions.js";
 import { applyMultiFilePatch, applyUnifiedPatchToText, buildSimpleDiff, isMultiFilePatch, parseMultiFilePatch } from "../lib/patch.js";
@@ -17,9 +19,38 @@ import { toolResult } from "../lib/tool-result.js";
 import { globFiles } from "../lib/glob-search.js";
 import { grepSearchPage } from "../lib/grep-search.js";
 import { loadPathRulesForFile } from "../lib/path-rules.js";
-import { writeTextFileCas, withCanonicalFileLock } from "../lib/safe-text-write.js";
+import { readFileForEdit, writeFileBytesCas, writeTextFileCas, withCanonicalFileLock } from "../lib/safe-text-write.js";
 import { fetchFileResponse, resolveFileProxy } from "../lib/file-download-network.js";
 import { writeAll, writeStagedBinary } from "../lib/binary-upload.js";
+
+// Edited text goes back in the file's own encoding (GBK stays GBK, UTF-16
+// keeps its BOM). Encode before any checkpoint or write, so a refused edit
+// (unknown bytes, a character GBK cannot hold) changes nothing.
+function editedBytes(decoded: DecodedText, next: string, filePath: string): Buffer {
+  assertWritable(decoded, filePath);
+  return encodeText(next, decoded.encoding);
+}
+
+function encodingNote(decoded: DecodedText): Record<string, string | boolean> {
+  return decoded.encoding === "utf-8" && !decoded.lossy ? {} : { encoding: decoded.encoding, ...(decoded.lossy ? { encoding_lossy: true } : {}) };
+}
+
+async function publishEditWithCheckpoint(tool: string, requestedPath: string, validPath: string,
+  snapshot: Awaited<ReturnType<typeof readFileForEdit>>, output: Buffer | null, dryRun: boolean) {
+  if (!output) return checkpointBeforeDetailed(tool, [validPath], { dry_run: dryRun });
+  let checkpoint: Awaited<ReturnType<typeof checkpointBeforeDetailed>> | undefined;
+  await writeFileBytesCas(validPath, output, {
+    expectedRevision: snapshot.revision,
+    beforePublish: async () => { checkpoint = await checkpointBeforeDetailed(tool, [validPath]); },
+    beforeCommit: async () => {
+      requireWriteAllowed();
+      const fresh = await validatePath(requestedPath);
+      const comparable = (value: string) => process.platform === "win32" ? path.resolve(value).toLowerCase() : path.resolve(value);
+      if (comparable(fresh) !== comparable(validPath)) throw new Error("WRITE_CONFLICT: edit target path changed before publication");
+    },
+  });
+  return checkpoint!;
+}
 
 const MAX_BINARY_CHUNK_BYTES = 1024 * 1024;
 const MAX_BASE64_CHARS = Math.ceil(MAX_BINARY_CHUNK_BYTES / 3) * 4;
@@ -293,7 +324,10 @@ async function fetchChatGptFile(downloadUrl: string, signal: AbortSignal,
   for (let redirects = 0; redirects <= MAX_DOWNLOAD_REDIRECTS; redirects++) {
     signal.throwIfAborted();
     const route = await resolveFileProxy(new URL(current), { signal });
-    const safeUrl = await assertPublicHttpsUrl(current, signal, route.mode === "proxy");
+    // Fake-IP DNS (Clash/Surge/sing-box TUN mode, 198.18.0.0/15) answers every
+    // name with a benchmark-range address even without a system proxy; no real
+    // private service lives there, and refusing it failed every download.
+    const safeUrl = await assertPublicHttpsUrl(current, signal, true);
     signal.throwIfAborted();
     const response = await fetchResponse(safeUrl, signal, route);
 
@@ -376,29 +410,45 @@ export function describeChatGptTransferError(error: unknown): { message: string;
   return { code: codes.at(-1) || "DOWNLOAD_FAILED", message: [...new Set(messages)].join("; ") || "File transfer failed" };
 }
 
-function fallbackFileName(file: ChatGptFileRef): string {
+export function fallbackFileName(file: ChatGptFileRef): string {
   const candidate = file.file_name ?? file.name;
   if (!candidate) throw new Error("No destination path was provided and ChatGPT did not provide a file name");
-  const base = path.basename(candidate.trim());
-  if (!base || base === "." || base === "..") throw new Error("ChatGPT provided an invalid file name");
+  // On Windows a ":" in the name wrote into an NTFS alternate data stream of
+  // another file, and * ? " < > | made the write fail; replace them, and keep
+  // names off reserved devices (CON, NUL, COM1 …) and trailing dots/spaces.
+  let base = path.basename(candidate.trim()).replace(/[<>:"|?*\u0000-\u001f]/g, "_").replace(/[. ]+$/, "");
+  if (/^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\..*)?$/i.test(base)) base = "_" + base;
+  if (!base || base === "." || base === ".." || /^_+$/.test(base)) throw new Error("ChatGPT provided an invalid file name");
   return base;
 }
 
 
 
+// Per file, not per search: a slow tree is fine, a pattern that cannot finish
+// one file in this time is catastrophic backtracking.
+const SEARCH_FILE_REGEX_BUDGET_MS = 10_000;
+
 async function searchDirectory(
   dir: string,
-  regex: RegExp,
+  match: (lines: string[], timeoutMs: number) => number[],
   globPattern: string,
   results: string[],
   maxResults: number,
   offset: number,
-  state: { seen: number; hasMore: boolean }
+  state: { seen: number; hasMore: boolean; skipped: number },
+  isRoot = false
 ): Promise<void> {
   if (state.hasMore) return;
 
-  const entries = (await fs.readdir(dir, { withFileTypes: true }))
-    .sort((left, right) => left.name.localeCompare(right.name));
+  let entries;
+  try { entries = await fs.readdir(dir, { withFileTypes: true }); }
+  catch (error) {
+    // One unreadable subfolder (EPERM, EBUSY) used to abort the whole search.
+    if (isRoot) throw error;
+    state.skipped++;
+    return;
+  }
+  entries.sort((left, right) => left.name.localeCompare(right.name));
 
   for (const entry of entries) {
     if (state.hasMore) break;
@@ -407,23 +457,22 @@ async function searchDirectory(
     if (entry.name.startsWith(".") || entry.name === "node_modules") continue;
 
     if (entry.isDirectory()) {
-      await searchDirectory(fullPath, regex, globPattern, results, maxResults, offset, state);
+      await searchDirectory(fullPath, match, globPattern, results, maxResults, offset, state);
     } else if (matchesGlob(entry.name, globPattern)) {
-      try {
-        const content = await fs.readFile(fullPath, "utf-8");
-        const lines = content.split("\n");
-        for (let idx = 0; idx < lines.length; idx++) {
-          if (!regex.test(lines[idx])) continue;
-          const row = state.seen++;
-          if (row < offset) continue;
-          if (results.length < maxResults) {
-            results.push(`${fullPath}:${idx + 1}: ${lines[idx].trim()}`);
-          } else {
-            state.hasMore = true;
-            break;
-          }
+      let lines: string[];
+      try { lines = (await fs.readFile(fullPath, "utf-8")).split("\n"); }
+      catch { state.skipped++; continue; }
+      // The pattern is the model's; never let it run without a deadline.
+      for (const idx of match(lines, SEARCH_FILE_REGEX_BUDGET_MS)) {
+        const row = state.seen++;
+        if (row < offset) continue;
+        if (results.length < maxResults) {
+          results.push(`${fullPath}:${idx + 1}: ${lines[idx].trim()}`);
+        } else {
+          state.hasMore = true;
+          break;
         }
-      } catch {}
+      }
     }
   }
 }
@@ -434,18 +483,19 @@ export async function searchDirectoryPage(
   globPattern = "*",
   offset = 0,
   maxResults = 50
-): Promise<{ matches: string[]; offset: number; next_offset: number | null; complete: boolean; truncated: boolean }> {
+): Promise<{ matches: string[]; offset: number; next_offset: number | null; complete: boolean; truncated: boolean; unreadable_skipped?: number }> {
   const matches: string[] = [];
   const normalizedOffset = Math.max(0, Math.floor(offset));
   const limit = Math.max(1, Math.min(500, Math.floor(maxResults)));
-  const state = { seen: 0, hasMore: false };
-  await searchDirectory(dir, new RegExp(pattern, "i"), globPattern, matches, limit, normalizedOffset, state);
+  const state = { seen: 0, hasMore: false, skipped: 0 };
+  await searchDirectory(dir, createLineMatcher(new RegExp(pattern, "i")), globPattern, matches, limit, normalizedOffset, state, true);
   return {
     matches,
     offset: normalizedOffset,
     next_offset: state.hasMore ? normalizedOffset + matches.length : null,
     complete: !state.hasMore,
     truncated: state.hasMore,
+    ...(state.skipped ? { unreadable_skipped: state.skipped } : {}),
   };
 }
 
@@ -532,7 +582,11 @@ export function registerFilesystemTools(server: McpServer, workspaceRoot: string
           `Text file is ${stat.size} bytes, above READ_TEXT_MAX_FILE_BYTES=${MAX_TEXT_FILE_BYTES}. Use grep, read_file_base64 chunks, or run_command with targeted extraction instead of loading the whole file.`
         );
       }
-      const content = await fs.readFile(validPath, "utf-8");
+      const decoded = decodeText(await fs.readFile(validPath));
+      const content = decoded.text;
+      // Edits keep this encoding; tell the model when it is not plain UTF-8.
+      const encodingData = decoded.encoding !== "utf-8" || decoded.lossy
+        ? { encoding: decoded.encoding, ...(decoded.lossy ? { encoding_lossy: true } : {}) } : {};
       const lines = content.split("\n");
       if (character_offset !== undefined && character_offset > (lines[(offset ?? 1) - 1]?.length ?? 0)) {
         throw new Error("character_offset is past the end of the starting line; use the continuation offsets from the preceding read.");
@@ -567,6 +621,7 @@ export function registerFilesystemTools(server: McpServer, workspaceRoot: string
           next_offset: bounded.next_offset,
           next_character_offset: bounded.next_character_offset,
           single_line_truncated: bounded.single_line_truncated,
+          ...encodingData,
           ...instructionData,
         });
       }
@@ -582,6 +637,7 @@ export function registerFilesystemTools(server: McpServer, workspaceRoot: string
           total_lines: lines.length,
           truncated: bounded.truncated,
           start_offset: bounded.start_offset,
+          ...encodingData,
         });
       }
 
@@ -598,6 +654,7 @@ export function registerFilesystemTools(server: McpServer, workspaceRoot: string
         next_offset: bounded.next_offset,
         next_character_offset: bounded.next_character_offset,
         single_line_truncated: bounded.single_line_truncated,
+        ...encodingData,
         ...instructionData,
       });
     }
@@ -953,15 +1010,18 @@ export function registerFilesystemTools(server: McpServer, workspaceRoot: string
     async ({ path: filePath, old_text, new_text, replace_all, dry_run }) => {
       requireWriteAllowed();
       const validPath = await validatePath(filePath);
-      const content = await fs.readFile(validPath, "utf-8");
+      const snapshot = await readFileForEdit(validPath);
+      const decoded = decodeText(snapshot.bytes);
+      const content = decoded.text;
       if (!content.includes(old_text)) throw new Error("old_text not found in file. Ensure exact match.");
-      const newContent = replace_all ? content.split(old_text).join(new_text) : content.replace(old_text, new_text);
+      // A replacer function keeps "$&", "$'" and "$$" in new_text literal.
+      const newContent = replace_all ? content.split(old_text).join(new_text) : content.replace(old_text, () => new_text);
       const diff = buildSimpleDiff(content, newContent);
-      const checkpoint = await checkpointBeforeDetailed("edit_file", [validPath], { dry_run });
+      const output = dry_run ? null : editedBytes(decoded, newContent, validPath);
+      const checkpoint = await publishEditWithCheckpoint("edit_file", filePath, validPath, snapshot, output, dry_run);
       const checkpointId = checkpoint.id;
-      if (!dry_run) await fs.writeFile(validPath, newContent, "utf-8");
       await audit({ tool: "edit_file", action: "edit", target: validPath, status: dry_run ? "dry-run" : "ok" });
-      const data = await enrichAfterEdit({ path: validPath, diff, dry_run, checkpoint_id: checkpointId, checkpoint }, [validPath], dry_run);
+      const data = await enrichAfterEdit({ path: validPath, diff, dry_run, checkpoint_id: checkpointId, checkpoint, ...encodingNote(decoded) }, [validPath], dry_run);
       return toolResult("edit_file", data, { summary: dry_run ? `dry-run ${validPath}` : `edited ${validPath}` });
     }
   );
@@ -982,19 +1042,21 @@ export function registerFilesystemTools(server: McpServer, workspaceRoot: string
     async ({ path: filePath, edits, dry_run }) => {
       requireWriteAllowed();
       const validPath = await validatePath(filePath);
-      const original = await fs.readFile(validPath, "utf-8");
+      const snapshot = await readFileForEdit(validPath);
+      const decoded = decodeText(snapshot.bytes);
+      const original = decoded.text;
       let next = original;
       for (const edit of edits) {
         if (!next.includes(edit.old_text)) throw new Error(`old_text not found: ${edit.old_text.slice(0, 120)}`);
-        next = edit.replace_all ? next.split(edit.old_text).join(edit.new_text) : next.replace(edit.old_text, edit.new_text);
+        next = edit.replace_all ? next.split(edit.old_text).join(edit.new_text) : next.replace(edit.old_text, () => edit.new_text);
       }
       const diff = buildSimpleDiff(original, next);
-      const checkpoint = await checkpointBeforeDetailed("multi_edit", [validPath], { dry_run });
+      const output = dry_run ? null : editedBytes(decoded, next, validPath);
+      const checkpoint = await publishEditWithCheckpoint("multi_edit", filePath, validPath, snapshot, output, dry_run);
       const checkpointId = checkpoint.id;
-      if (!dry_run) await fs.writeFile(validPath, next, "utf-8");
       await audit({ tool: "multi_edit", action: "edit", target: validPath, status: dry_run ? "dry-run" : "ok", details: { edits: edits.length } });
       const data = await enrichAfterEdit(
-        { path: validPath, diff, edits: edits.length, dry_run, checkpoint_id: checkpointId, checkpoint },
+        { path: validPath, diff, edits: edits.length, dry_run, checkpoint_id: checkpointId, checkpoint, ...encodingNote(decoded) },
         [validPath],
         dry_run
       );
@@ -1014,16 +1076,19 @@ export function registerFilesystemTools(server: McpServer, workspaceRoot: string
     async ({ path: filePath, pattern, replacement, flags, dry_run }) => {
       requireWriteAllowed();
       const validPath = await validatePath(filePath);
-      const original = await fs.readFile(validPath, "utf-8");
+      const snapshot = await readFileForEdit(validPath);
+      const decoded = decodeText(snapshot.bytes);
+      const original = decoded.text;
       const regex = new RegExp(pattern, flags);
-      const next = original.replace(regex, replacement);
+      // A catastrophic pattern must fail this call, not freeze the server.
+      const next = replaceWithDeadline(original, regex, replacement, 10_000);
       if (next === original) throw new Error("Regex made no changes.");
       const diff = buildSimpleDiff(original, next);
-      const checkpoint = await checkpointBeforeDetailed("replace_regex", [validPath], { dry_run });
+      const output = dry_run ? null : editedBytes(decoded, next, validPath);
+      const checkpoint = await publishEditWithCheckpoint("replace_regex", filePath, validPath, snapshot, output, dry_run);
       const checkpointId = checkpoint.id;
-      if (!dry_run) await fs.writeFile(validPath, next, "utf-8");
       await audit({ tool: "replace_regex", action: "edit", target: validPath, status: dry_run ? "dry-run" : "ok" });
-      return toolResult("replace_regex", { path: validPath, diff, dry_run, checkpoint_id: checkpointId, checkpoint });
+      return toolResult("replace_regex", { path: validPath, diff, dry_run, checkpoint_id: checkpointId, checkpoint, ...encodingNote(decoded) });
     }
   );
 
@@ -1044,17 +1109,30 @@ export function registerFilesystemTools(server: McpServer, workspaceRoot: string
     async ({ path: filePath, patch, dry_run }) => {
       requireWriteAllowed();
 
-      if (isMultiFilePatch(patch)) {
-        let baseDir: string | undefined;
+      // A unified diff with ---/+++ headers addressed to one named file is a
+      // single-file patch on that file, whatever prefix its headers use.
+      let singleFileTarget = false;
+      if (filePath && isMultiFilePatch(patch) && !/^\*\*\* /m.test(patch)) {
+        const stat = await fs.stat(await validatePath(filePath)).catch(() => null);
+        const sections = stat?.isFile() ? parseMultiFilePatch(patch) : [];
+        singleFileTarget = sections.length === 1 && sections[0].operation === "update" && !sections[0].moveTo;
+      }
+
+      if (isMultiFilePatch(patch) && !singleFileTarget) {
+        // Relative patch paths are workspace paths, never the server's own
+        // process folder (the desktop runtime directory with .env and profiles).
+        let baseDir: string = getDefaultCwd();
         if (filePath) {
           const validPath = await validatePath(filePath);
           const stat = await fs.stat(validPath);
           baseDir = stat.isDirectory() ? validPath : path.dirname(validPath);
         }
-        const patchPaths = parseMultiFilePatch(patch, baseDir).map((op) => op.path);
+        const patchPaths = parseMultiFilePatch(patch, baseDir).flatMap((op) => op.moveTo ? [op.path, op.moveTo] : [op.path]);
+        for (const target of patchPaths) await validatePath(target);
         const checkpoint = await checkpointBeforeDetailed("apply_patch", patchPaths, { dry_run });
-      const checkpointId = checkpoint.id;
-        const results = await applyMultiFilePatch(patch, { base_dir: baseDir, dry_run });
+        const checkpointId = checkpoint.id;
+        const results = await applyMultiFilePatch(patch, { base_dir: baseDir, dry_run,
+          before_commit: async target => { requireWriteAllowed(); await validatePath(target); } });
         const failed = results.filter((r) => !r.ok);
         await audit({
           tool: "apply_patch",
@@ -1077,14 +1155,16 @@ export function registerFilesystemTools(server: McpServer, workspaceRoot: string
 
       if (!filePath) throw new Error("path is required for single-file patches");
       const validPath = await validatePath(filePath);
-      const original = await fs.readFile(validPath, "utf-8");
+      const snapshot = await readFileForEdit(validPath);
+      const decoded = decodeText(snapshot.bytes);
+      const original = decoded.text;
       const next = applyUnifiedPatchToText(original, patch);
       const diff = buildSimpleDiff(original, next);
-      const checkpoint = await checkpointBeforeDetailed("apply_patch", [validPath], { dry_run });
+      const output = dry_run ? null : editedBytes(decoded, next, validPath);
+      const checkpoint = await publishEditWithCheckpoint("apply_patch", filePath, validPath, snapshot, output, dry_run);
       const checkpointId = checkpoint.id;
-      if (!dry_run) await fs.writeFile(validPath, next, "utf-8");
       await audit({ tool: "apply_patch", action: "patch", target: validPath, status: dry_run ? "dry-run" : "ok" });
-      const data = await enrichAfterEdit({ path: validPath, diff, dry_run, checkpoint_id: checkpointId, checkpoint }, [validPath], dry_run);
+      const data = await enrichAfterEdit({ path: validPath, diff, dry_run, checkpoint_id: checkpointId, checkpoint, ...encodingNote(decoded) }, [validPath], dry_run);
       return toolResult("apply_patch", data);
     }
   );

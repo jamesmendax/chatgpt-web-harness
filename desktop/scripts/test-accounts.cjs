@@ -125,6 +125,30 @@ test("configuration rejects cross-account ports, tunnel identity and overlapping
   assert.throws(() => f.manager.validateConfig(b.id, { ...second, tunnelPort: NaN }), /端口/);
 });
 
+test("an offline sibling workspace or a missing sibling config never blocks another account", async (t) => {
+  const f = fixture(t);
+  const a = await f.manager.create({ name: "A" }); const b = await f.manager.create({ name: "B" });
+  const second = f.manager.readConfig(b.id);
+  if (process.platform === "win32") {
+    // Account A's workspace is on a drive that is not mounted right now.
+    const letter = "ZYXWVUTSRQPONMLKJIHGF".split("").find((l) => !fs.existsSync(`${l}:\\`));
+    if (letter) {
+      const offline = f.manager.readConfig(a.id);
+      offline.workspacePath = `${letter}:\\offline-drive\\project`;
+      f.manager.run(a.id, () => f.config.save(offline));
+      assert.doesNotThrow(() => f.manager.validateConfig(b.id, second), "an unmounted sibling drive must not block B");
+    }
+  }
+  // A's config file disappears: B still validates, the list shows the error on A's row, and A can be removed.
+  fs.unlinkSync(path.join(a.dataDir, "config.json"));
+  assert.doesNotThrow(() => f.manager.validateConfig(b.id, second));
+  const row = f.manager.list().accounts.find((item) => item.id === a.id);
+  assert.equal(row.config, null);
+  assert.match(row.configError, /配置缺失/);
+  await f.manager.remove(a.id);
+  assert.equal(f.manager.list().accounts.some((item) => item.id === a.id), false);
+});
+
 test("occupied port candidates are skipped without touching the listener", async (t) => {
   const f = fixture(t); const probed = [];
   f.manager.portFree = async (port) => { probed.push(port); return port >= 3410; };

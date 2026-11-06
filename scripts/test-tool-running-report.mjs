@@ -115,7 +115,7 @@ try {
   const done = lines(/\[MCP\] \[(?:ok|transport_ok)\] tools\/call run_command /);
   assert.equal(done.length, 1, output);
   const canonicalDone = lines(/\[TOOL\] \[ok\] run_command /);
-  assert.equal(canonicalDone.length, 1);
+  assert.equal(canonicalDone.length, 1, output);
   assert.equal(/ call=(\S+)/.exec(done[0])?.[1], / call=(\S+)/.exec(canonicalDone[0])[1], "HTTP success keeps canonical invocation ID");
   assert.equal(/ call=(\S+)/.exec(canonicalDone[0])[1], / call=(\S+)/.exec(running[0])[1]);
   assert.match(done[0], new RegExp(` conv=${short}$`), "completion keeps the conversation");
@@ -128,17 +128,27 @@ try {
   await delay(150);
   const finished = lines(/\[MCP\] \[(?:ok|transport_ok)\] tools\/call run_command /);
   assert.equal(finished.length, 3, output);
+  assert.equal(lines(/\[TOOL\] \[ok\] run_command /).length, 3, output);
   assert.doesNotMatch(finished[1], / conv=/);
   assert.doesNotMatch(finished[2], / conv=/);
   const failure=await post({jsonrpc:'2.0',id:5,method:'tools/call',params:{name:'read_text_file',arguments:{path:path.join(workspace,'missing-correlation-fixture.txt')},_meta:{'openai/session':'running-report-fixture'}}},sessionId);
   assert.equal(failure.status,200,failure.text);await delay(150);
   const canonicalError=lines(/\[TOOL\] \[error\] read_text_file /),httpError=lines(/\[MCP ERROR\] HTTP 200 tools\/call read_text_file /);
-  assert.equal(canonicalError.length,1);assert.equal(httpError.length,1);
+  assert.equal(canonicalError.length,1,output);assert.equal(httpError.length,1,output);
   const failureId=/ call=(\S+)/.exec(canonicalError[0])[1];assert.equal(/ call=(\S+)/.exec(httpError[0])?.[1],failureId,'HTTP error keeps exact canonical invocation ID');
   assert.match(httpError[0],new RegExp(' conv='+short+'$'));
   console.log(`tool-running-report: ok (${running.length} running reports; HTTP success/error IDs correlated)`);
 } finally {
+  try {
+  if (process.env.HARNESS_TEST_CAPTURE_ROOT) {
+    const capture = path.resolve(process.env.HARNESS_TEST_CAPTURE_ROOT);
+    assert.ok(capture.split(path.sep).includes(".validation"), "diagnostic output must be in an isolated validation fixture");
+    await fs.mkdir(capture, { recursive: true });
+    await fs.writeFile(path.join(capture, "server-output.log"), output, "utf8");
+  }
+  } finally {
   child.kill();
   await delay(200);
   for (const dir of [workspace, codexHome, runtime]) await fs.rm(dir, { recursive: true, force: true }).catch(() => {});
+  }
 }

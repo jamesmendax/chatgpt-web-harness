@@ -14,7 +14,7 @@ const node = process.env.SystemRoot ? path.join(process.env.ProgramFiles || "C:\
 if (!fs.existsSync(entry)) throw new Error(`Missing built MCP entry: ${entry}`);
 if (!fs.existsSync(node)) throw new Error(`Missing Node executable: ${node}`);
 
-const artifacts = path.join(repo, ".codex", "isolation", "multi-process");
+const artifacts = require("./lib/test-isolation.cjs").artifactRoot("multi-process");
 fs.mkdirSync(artifacts, { recursive: true });
 const runRoot = fs.mkdtempSync(path.join(artifacts, "run-"));
 const children = [];

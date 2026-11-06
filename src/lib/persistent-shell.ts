@@ -25,10 +25,13 @@ export interface ShellExecResult {
   decode_anomaly?: boolean;
   raw_stdout_path?: string;
   raw_stderr_path?: string;
+  /** The command exited while a background descendant still held its output pipes. */
+  stdio_held_by_descendant?: boolean;
 }
 
 import { loadGlobalShellState, saveGlobalShellState } from "./global-shell-state.js";
 import { childProcessEnv } from "./child-env.js";
+import { windowsLaunch } from "./windows-launch.js";
 
 let sessionCwd: string | null = null;
 let sessionInitializedAt: string | null = null;
@@ -43,6 +46,10 @@ const MAX_COMMAND_LOG_FILES = Math.max(
   20,
   Number.parseInt(process.env.COMMAND_LOG_MAX_FILES || "120", 10) || 120
 );
+// After the command itself exits, wait this long for its pipes to drain. A
+// background descendant (Start-Process, `start /b`, adb's server) inherits the
+// pipes and may hold them open indefinitely; it must not hold the command slot.
+export const STDIO_LINGER_MS = 1_500;
 
 function commandLogDir(root: string): string {
   const base = process.env.CODEX_HOME || path.join(os.homedir(), ".codex");
@@ -180,7 +187,9 @@ export function resetShellSession(cwd: string): void {
   sessionCwd = path.resolve(cwd);
   sessionInitializedAt = new Date().toISOString();
   if (persistenceRoot) {
-    void saveGlobalShellState(persistenceRoot, sessionCwd, undefined, null);
+    // An unhandled rejection here would terminate the whole MCP server.
+    saveGlobalShellState(persistenceRoot, sessionCwd, undefined, null)
+      .catch((error) => console.warn("[shell] Could not persist the reset working folder:", error?.message || error));
   }
 }
 
@@ -193,14 +202,54 @@ export function getShellStatus() {
   };
 }
 
-function stripQuotes(value: string): string {
-  return value.trim().replace(/^['"]|['"]$/g, "");
-}
-
-function resolveCdTarget(current: string, target: string): string {
-  const cleaned = stripQuotes(target);
-  if (cleaned === "-" || cleaned === "~") return current;
-  return path.isAbsolute(cleaned) ? path.resolve(cleaned) : path.resolve(current, cleaned);
+// One leading cd / chdir / Set-Location / sl / pushd whose target this parser
+// can resolve exactly: a literal (quoted or plain) path, ~, or $env:NAME.
+// Anything else ($var, (expr), wildcards, `cd -`) returns null: the command
+// then runs unchanged and the shell resolves it; only the saved folder stays.
+function parseLeadingCd(rest: string, current: string): { cwd: string | null; length: number } | null {
+  const head = /^(?:cd|chdir|set-location|sl|pushd)(?=\s|;|&&|$)/i.exec(rest);
+  if (!head) return null;
+  let i = head[0].length;
+  const skipSpace = (): void => { while (i < rest.length && /\s/.test(rest[i])) i++; };
+  skipSpace();
+  const parameter = /^(?:-(?:literalpath|path|lp)|\/d)(?=\s)/i.exec(rest.slice(i));
+  if (parameter) { i += parameter[0].length; skipSpace(); }
+  let target: string | null = null;
+  if (i < rest.length && rest[i] !== ";" && !rest.startsWith("&&", i)) {
+    const quote = rest[i];
+    if (quote === "'" || quote === '"') {
+      const end = rest.indexOf(quote, i + 1);
+      if (end < 0) return null;
+      target = rest.slice(i + 1, end);
+      if (quote === '"' && /[$`]/.test(target)) return null;
+      i = end + 1;
+    } else {
+      const word = /^[^\s;&|<>(){}`'"]+/.exec(rest.slice(i));
+      if (!word) return null;
+      target = word[0];
+      i += word[0].length;
+      const variable = /^\$(?:env:|\{env:)([A-Za-z_][\w]*)\}?(?:([\\/].*))?$/i.exec(target);
+      if (variable) {
+        const value = process.env[variable[1]] ?? Object.entries(process.env).find(([key]) => key.toLowerCase() === variable[1].toLowerCase())?.[1];
+        if (!value) return null;
+        target = value + (variable[2] ?? "");
+      } else if (/^~(?:[\\/]|$)/.test(target)) {
+        target = os.homedir() + target.slice(1);
+      } else if (/[$*?[\]@%]/.test(target) || target === "-" || target === "+") {
+        return null;
+      }
+    }
+    if (!target) return null;
+  }
+  skipSpace();
+  if (i < rest.length) {
+    if (rest[i] === ";") i++;
+    else if (rest.startsWith("&&", i)) i += 2;
+    else return null;
+  }
+  skipSpace();
+  const cwd = target === null ? null : path.isAbsolute(target) ? path.resolve(target) : path.resolve(current, target);
+  return { cwd, length: i };
 }
 
 /** Cập nhật cwd khi gặp cd / Set-Location ở đầu command (giống Bash persistent). */
@@ -209,31 +258,38 @@ export function applyCwdDirectives(currentCwd: string, command: string): { cwd: 
   let rest = command.trim();
 
   for (let i = 0; i < 8; i++) {
-    const psMatch = rest.match(/^(?:Set-Location|sl)\s+(.+?)(?:\s*;\s*|\s*&&\s*|$)/i);
-    if (psMatch) {
-      cwd = resolveCdTarget(cwd, psMatch[1]);
-      rest = rest.slice(psMatch[0].length).trim();
-      continue;
-    }
-
-    const cdMatch = rest.match(/^cd(?:\s+(.+?))?(?:\s*;\s*|\s*&&\s*|$)/i);
-    if (cdMatch) {
-      if (cdMatch[1]) cwd = resolveCdTarget(cwd, cdMatch[1]);
-      rest = rest.slice(cdMatch[0].length).trim();
-      continue;
-    }
-
-    const pushdMatch = rest.match(/^pushd\s+(.+?)(?:\s*;\s*|\s*&&\s*|$)/i);
-    if (pushdMatch) {
-      cwd = resolveCdTarget(cwd, pushdMatch[1]);
-      rest = rest.slice(pushdMatch[0].length).trim();
-      continue;
-    }
-
-    break;
+    const directive = parseLeadingCd(rest, cwd);
+    if (!directive) break;
+    if (directive.cwd) cwd = directive.cwd;
+    rest = rest.slice(directive.length).trim();
   }
 
   return { cwd, command: rest || "pwd" };
+}
+
+const POWERSHELL_CODE_PAGES: Readonly<Record<string, number>> = {
+  gbk: 936, gb18030: 54936, big5: 950, shift_jis: 932, "euc-jp": 51932, "euc-kr": 949,
+  "utf-16le": 1200, "utf-16be": 1201, "iso-8859-1": 28591, "koi8-r": 20866,
+};
+
+function powershellEncoding(encoding: string): string {
+  let canonical = "utf-8";
+  try { canonical = new TextDecoder(encoding).encoding; } catch { /* validated by the caller */ }
+  const windows = /^windows-(\d{3,4})$/.exec(canonical);
+  const codePage = POWERSHELL_CODE_PAGES[canonical] ?? (windows ? Number(windows[1]) : undefined);
+  return codePage ? `[System.Text.Encoding]::GetEncoding(${codePage})` : "[System.Text.UTF8Encoding]::new()";
+}
+
+/**
+ * PowerShell decodes native output with [Console]::OutputEncoding and writes
+ * its own output with it, so the requested encoding must be set in PowerShell
+ * as well; GBK output was otherwise already lost there. The trailer reports a
+ * failing native exit code (robocopy 8, git 128) instead of -Command's generic
+ * 1, while success still follows PowerShell's rule: the last statement's $?.
+ */
+export function wrapPowerShellCommand(command: string, encoding = "utf-8"): string {
+  return `$OutputEncoding = [Console]::OutputEncoding = ${powershellEncoding(encoding)}; $global:LASTEXITCODE = 0; ${command}\n`
+    + "if (-not $?) { if ($LASTEXITCODE) { exit $LASTEXITCODE } else { exit 1 } }";
 }
 
 export function transpileCompoundOperators(cmd: string): string {
@@ -290,7 +346,7 @@ export function transpileCompoundOperators(cmd: string): string {
     }
   }
 
-  return `${result}; if (-not $__localCoderSuccess) { exit 1 }`;
+  return `${result}; if (-not $__localCoderSuccess) { if ($LASTEXITCODE) { exit $LASTEXITCODE } else { exit 1 } }`;
 }
 
 export function getWinShell(): { shell: string; isPwsh: boolean } {
@@ -331,24 +387,43 @@ function runOnce(command: string, cwd: string, timeoutMs: number, direct?: { exe
       if (!winShellInfo.isPwsh) {
         effectiveCommand = transpileCompoundOperators(command);
       }
-      effectiveCommand = "$OutputEncoding = [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new(); " + effectiveCommand;
+      effectiveCommand = wrapPowerShellCommand(effectiveCommand, encoding);
       args = ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", effectiveCommand];
     }
 
-    if (direct) { shell = direct.executable; args = direct.args; }
-    const child = spawn(shell, args, {
-      shell: false,
-      cwd,
-      windowsHide: true,
-      env: {
-        ...childProcessEnv(),
-        CI: "true",
-        PAGER: "cat",
-        GIT_PAGER: "cat",
-        NO_COLOR: "1",
-        npm_config_yes: "true",
-      },
-    });
+    const env = {
+      ...childProcessEnv(),
+      CI: "true",
+      PAGER: "cat",
+      GIT_PAGER: "cat",
+      NO_COLOR: "1",
+      npm_config_yes: "true",
+    };
+    let verbatim = false;
+    if (direct) {
+      const launch = windowsLaunch(direct.executable, direct.args, env, cwd);
+      shell = launch.file; args = launch.args; verbatim = launch.windowsVerbatimArguments === true;
+    }
+    let child: ChildProcess;
+    try {
+      child = spawn(shell, args, {
+        shell: false,
+        cwd,
+        windowsHide: true,
+        windowsVerbatimArguments: verbatim,
+        env,
+      });
+    } catch (error) {
+      // Node throws synchronously for some launch errors (EINVAL, ENAMETOOLONG).
+      // Report them like an asynchronous spawn error instead of leaking the log.
+      const message = spawnErrorMessage(error, cwd);
+      log.stream?.end(`\n# spawn_error: ${message}\n`);
+      resolve({ command, cwd, stdout: "", stderr: message, exit_code: null, timed_out: false, operation_started: false,
+        duration_ms: Date.now() - startedAt, ...(log.path ? { full_output_path: log.path } : {}),
+        stdout_chars: 0, stderr_chars: message.length, stdout_truncated: false, stderr_truncated: false,
+        execution_mode: direct ? "argv" : "shell", output_encoding: encoding });
+      return;
+    }
 
     if (child.stdin) {
       child.stdin.end();
@@ -399,6 +474,7 @@ function runOnce(command: string, cwd: string, timeoutMs: number, direct?: { exe
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      clearTimeout(lingerTimer);
       rawStdout?.end(); rawStderr?.end();
       result.execution_mode = direct ? "argv" : "shell";
       result.operation_started = Boolean(child.pid);
@@ -436,15 +512,21 @@ function runOnce(command: string, cwd: string, timeoutMs: number, direct?: { exe
       rawStderr?.write(d);
       appendStderr(stderrDecoder.decode(d, { stream: true }));
     });
-    child.on("close", (code) => {
+    let lingerTimer: ReturnType<typeof setTimeout> | undefined;
+    let stdioHeld = false;
+    const completeRun = (code: number | null): void => {
+      if (settled) return;
+      clearTimeout(lingerTimer);
       flushDecoders();
       const durationMs = Date.now() - startedAt;
       const timeoutMessage = timedOut ? `Command timed out after ${timeoutMs / 1000}s` : "";
+      const heldMessage = stdioHeld ? "[command exited; a background process it started still holds its output, which is not captured here]" : "";
+      const notes = [timeoutMessage, heldMessage].filter(Boolean).join("\n");
       finish({
           command,
           cwd,
           stdout: `${stdoutTruncated ? `[output truncated to last ${MAX_COMMAND_OUTPUT_CHARS} chars]\n` : ""}${stdout.trim()}`,
-          stderr: `${stderrTruncated ? `[output truncated to last ${MAX_COMMAND_OUTPUT_CHARS} chars]\n` : ""}${stderr.trim()}${timeoutMessage ? `${stderr.trim() ? "\n" : ""}${timeoutMessage}` : ""}`,
+          stderr: `${stderrTruncated ? `[output truncated to last ${MAX_COMMAND_OUTPUT_CHARS} chars]\n` : ""}${stderr.trim()}${notes ? `${stderr.trim() ? "\n" : ""}${notes}` : ""}`,
           exit_code: timedOut ? null : code,
           timed_out: timedOut,
           duration_ms: durationMs,
@@ -453,12 +535,26 @@ function runOnce(command: string, cwd: string, timeoutMs: number, direct?: { exe
           stderr_chars: stderrChars,
           stdout_truncated: stdoutTruncated,
           stderr_truncated: stderrTruncated,
-        }, `\n# ${timedOut ? "timed_out: true" : `exit: ${code}`}\n# duration_ms: ${durationMs}\n`);
+          ...(stdioHeld ? { stdio_held_by_descendant: true } : {}),
+        }, `\n# ${timedOut ? "timed_out: true" : `exit: ${code}`}${stdioHeld ? "\n# stdio_held_by_descendant: true" : ""}\n# duration_ms: ${durationMs}\n`);
+    };
+    // "close" waits for every holder of the pipes. Report this command once
+    // it exits and its pipes drain, or after STDIO_LINGER_MS; the descendant
+    // keeps running untouched (it is often a server the caller just started).
+    child.on("exit", (code) => {
+      if (settled) return;
+      lingerTimer = setTimeout(() => {
+        stdioHeld = true;
+        child.stdout?.destroy();
+        child.stderr?.destroy();
+        completeRun(code);
+      }, STDIO_LINGER_MS);
     });
+    child.on("close", (code) => completeRun(code));
     child.on("error", (err) => {
       flushDecoders();
       const durationMs = Date.now() - startedAt;
-      const message = err instanceof Error ? err.message : String(err);
+      const message = spawnErrorMessage(err, cwd);
       finish({
         command,
         cwd,
@@ -502,6 +598,13 @@ async function execInShellSessionInner(
   outputEncoding = "utf-8"
 ): Promise<ShellExecResult> {
   if (!sessionCwd) initShellSession(defaultCwd);
+  // A saved working folder that was deleted or moved would otherwise fail every
+  // later command with a misleading "spawn …powershell.exe ENOENT".
+  let cwdFallbackFrom: string | undefined;
+  if (!workingDirectory && !(await isDirectory(sessionCwd!))) {
+    cwdFallbackFrom = sessionCwd!;
+    sessionCwd = path.resolve(defaultCwd);
+  }
   const persistentCwd = sessionCwd!;
   const executionBase = workingDirectory ? path.resolve(workingDirectory) : persistentCwd;
   const { cwd, command: effective } = applyCwdDirectives(executionBase, command);
@@ -510,21 +613,41 @@ async function execInShellSessionInner(
   if (history.length > MAX_HISTORY) history.shift();
 
   const result = await runOnce(effective, cwd, timeoutMs, undefined, outputEncoding);
+  if (cwdFallbackFrom) result.stderr = `${result.stderr}${result.stderr ? "\n" : ""}[saved working folder ${cwdFallbackFrom} no longer exists; using ${persistentCwd}]`;
   // Commit the session cwd only after a successful run: a failed `cd` (or a
   // failing command after cd) must not poison every later call in the session.
   if (!workingDirectory && result.exit_code === 0) sessionCwd = cwd;
 
   if (persistenceRoot) {
-    const prev = await loadGlobalShellState(persistenceRoot, defaultCwd);
-    await saveGlobalShellState(
-      persistenceRoot,
-      workingDirectory ? persistentCwd : result.exit_code === 0 ? cwd : persistentCwd,
-      effective,
-      prev
-    );
+    // The command already ran; a state-file failure must not turn its result
+    // into an error that invites a repeat of its side effects.
+    try {
+      const prev = await loadGlobalShellState(persistenceRoot, defaultCwd);
+      await saveGlobalShellState(
+        persistenceRoot,
+        workingDirectory ? persistentCwd : result.exit_code === 0 ? cwd : persistentCwd,
+        effective,
+        prev
+      );
+    } catch (error) {
+      console.warn("[shell] Could not persist the working folder:", (error as Error)?.message || error);
+    }
   }
 
   return result;
+}
+
+// Node reports a missing working folder as "spawn …powershell.exe ENOENT",
+// which reads as if PowerShell itself were missing.
+function spawnErrorMessage(error: unknown, cwd: string): string {
+  const message = error instanceof Error ? error.message : String(error);
+  return (error as NodeJS.ErrnoException)?.code === "ENOENT" && !fs.existsSync(cwd)
+    ? `${message} (the working folder ${cwd} does not exist; nothing ran)`
+    : message;
+}
+
+async function isDirectory(target: string): Promise<boolean> {
+  try { return (await fs.promises.stat(target)).isDirectory(); } catch { return false; }
 }
 
 export async function execArgvInShellSession(executable: string, args: string[], defaultCwd: string, timeoutMs: number, workingDirectory?: string, encoding = "utf-8"): Promise<ShellExecResult> {

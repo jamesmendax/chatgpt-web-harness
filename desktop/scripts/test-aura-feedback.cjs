@@ -3,7 +3,7 @@
 const assert = require("node:assert/strict"), fs = require("node:fs"), path = require("node:path"), net = require("node:net"), Module = require("node:module"), { EventEmitter } = require("node:events");
 const electron = require("electron"), { app } = electron;
 const desktop = path.resolve(__dirname, ".."), repo = path.resolve(desktop, "..");
-const out = path.join(repo, ".validation", "aura-feedback"); fs.mkdirSync(out, { recursive: true });
+const out = require("./lib/test-isolation.cjs").artifactRoot("aura-feedback"); fs.mkdirSync(out, { recursive: true });
 const fixture = fs.mkdtempSync(path.join(out, "run-")), workspace = path.join(fixture, "workspace"); fs.mkdirSync(workspace);
 const archiveIndex = process.argv.indexOf("--baseline-archive"), archive = archiveIndex >= 0 ? process.argv[archiveIndex + 1] : null;
 let rendererIndex = null;

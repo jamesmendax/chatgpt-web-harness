@@ -18,6 +18,8 @@ const computerUseRuntime = require("./computer-use-runtime");
 const MCP_PATTERN = /dist[\\/]index\.js/i;
 const TUNNEL_PATTERN = /tunnel-client(\.exe)?/i;
 const SETUP_MCP = Symbol("temporary setup MCP");
+// Returned by a waitFor check to stop waiting at once (child gone, start cancelled).
+const WAIT_ABORTED = Symbol("wait aborted");
 
 // Every account managed by AccountManager owns its process pair. Reusing or
 // terminating a process discovered only by port/command-line heuristics would
@@ -43,6 +45,9 @@ class Services extends EventEmitter {
     }
     // 控制平面认证诊断：只从当前隧道进程的日志推导，进程重启时清空。
     this.tunnelDiagnostics = [];
+    // Latest successful control-plane poll ever observed; a probe of a crashed
+    // tunnel reports none, so the status snapshot alone cannot tell.
+    this.tunnelPollSuccessAt = 0;
     this.tunnel.on("log", (line) => {
       const item = parseManagedDiagnostic(line);
       if (item) {
@@ -62,8 +67,7 @@ class Services extends EventEmitter {
         name,
         isAlive: () => this[name].isAlive(),
         isBusy: () => this.busy || this.startingServices.size > 0,
-        isBlocked: () => this.shuttingDown || (name === "tunnel" &&
-          this.tunnelDiagnostics.some((item) => item.kind === "authError")),
+        isBlocked: () => this.shuttingDown || (name === "tunnel" && this.tunnelAuthBlocksRecovery()),
         restart: (guard) => this.startManaged(name, guard),
         note: (text) => this.note(text),
       });
@@ -168,7 +172,7 @@ class Services extends EventEmitter {
         ready: tunnelProbe.ready,
         // Cloud state comes from real poll metrics plus scoped errors, including external daemons.
         cloudState: tunnelProbe.cloudState,
-        lastPollSuccessAt: tunnelProbe.lastPollSuccessAt,
+        lastPollSuccessAt: this.notePollSuccess(tunnelProbe.lastPollSuccessAt),
         instanceId: tunnelProbe.instanceId,
         proxyRoute: tunnelProbe.proxyRoute,
         authError: tunnelProbe.authError,
@@ -221,7 +225,9 @@ class Services extends EventEmitter {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
       if (this.shuttingDown) return false;
-      if (await check()) return true;
+      const result = await check();
+      if (result === WAIT_ABORTED) return false;
+      if (result) return true;
       await sleep(500);
     }
     this.note(`等待 ${label} 超时（${Math.round(timeoutMs / 1000)}s）`);
@@ -320,17 +326,25 @@ class Services extends EventEmitter {
     const spec = harness.mcpSpawnSpec(cfg);
     if (!guard()) throw new Error("MCP startup cancelled before spawn.");
     const pid = this.mcp.start(spec);
+    const spawned = this.mcp.child;
     if (onCreated) onCreated(this.mcp.child);
     this.note(`MCP 已启动，PID ${pid}，等待 /health ...`);
+    // A child that already died (e.g. EADDRINUSE on the Admin port) or a
+    // cancelled start ends the wait now, not after 45 seconds that also hold
+    // the start slot against a user's Restart.
+    const exited = () => this.mcp.child !== spawned || !this.mcp.isAlive();
     const ok = await this.waitFor(async () => {
+      if (exited() || !guard()) return WAIT_ABORTED;
       const health = await status.probeMcp(cfg.mcpPort);
       return Boolean(health && (mode !== SETUP_MCP || health.runtime?.pid === pid));
     }, 45000, "MCP /health");
-    if (!ok) {
-      if (mode !== SETUP_MCP && this.mcp.isAlive()) await this.mcp.stop();
+    if (!ok || !guard() || exited()) {
+      // Never leave a cancelled child owned and stuck in "starting".
+      if (mode !== SETUP_MCP && !exited()) await this.mcp.stop();
+      if (!guard() || this.shuttingDown) throw new Error("MCP startup cancelled.");
+      if (exited()) throw new Error("MCP 进程在就绪前退出，请查看 MCP 日志。");
       throw new Error("MCP 未在 45 秒内就绪，请查看 MCP 日志。");
     }
-    if (!guard() || !this.mcp.isAlive()) throw new Error("MCP startup cancelled or process exited.");
     this.mcp.markRunning();
     const h = await status.probeMcp(cfg.mcpPort);
     if (h && h.runtime) {
@@ -364,22 +378,26 @@ class Services extends EventEmitter {
     if (this.shuttingDown) throw new Error("程序正在退出，已取消隧道启动。");
     if (!guard()) throw new Error("Tunnel startup cancelled before spawn.");
     const pid = this.tunnel.start(spec);
+    const spawned = this.tunnel.child;
     this.note(`Tunnel 已启动，PID ${pid}，等待 /readyz ...`);
     let startupAuthError = null;
+    const exited = () => this.tunnel.child !== spawned || !this.tunnel.isAlive();
     const ok = await this.waitFor(async () => {
       startupAuthError = [...this.tunnelDiagnostics].reverse().find((item) => item.kind === "authError") || null;
       if (startupAuthError) return true;
+      if (exited() || !guard()) return WAIT_ABORTED;
       return (await status.probeTunnel(cfg.tunnelPort)).ready;
     }, 60000, "Tunnel /readyz");
     if (startupAuthError) {
       if (this.tunnel.isAlive()) await this.tunnel.stop();
       throw new Error("Tunnel 控制平面认证失败（401/403）；请检查 Tunnel ID 与 Runtime API Key。");
     }
-    if (!ok) {
-      if (this.tunnel.isAlive()) await this.tunnel.stop();
+    if (!ok || !guard() || exited()) {
+      if (!exited()) await this.tunnel.stop();
+      if (!guard() || this.shuttingDown) throw new Error("Tunnel startup cancelled.");
+      if (exited()) throw new Error("Tunnel 进程在就绪前退出，请查看 Tunnel 日志。");
       throw new Error("Tunnel 未在 60 秒内就绪，请检查 Tunnel 日志（常见原因：Tunnel ID / Runtime Key 错误或网络不通）。");
     }
-    if (!guard() || !this.tunnel.isAlive()) throw new Error("Tunnel startup cancelled or process exited.");
     this.tunnel.markRunning();
     // This short settle may surface an auth failure; it is not cloud-success evidence.
     await sleep(2500);
@@ -428,18 +446,38 @@ class Services extends EventEmitter {
     this.revokeMcpCapabilities();
   }
 
+  notePollSuccess(at) {
+    if (Number.isFinite(at) && at > this.tunnelPollSuccessAt) this.tunnelPollSuccessAt = at;
+    return at;
+  }
+
+  // An authentication error stops automatic tunnel restarts only while it is
+  // still the latest word from the control plane. A successful poll after it
+  // proves the credentials; a later crash (proxy hiccup, client bug) must recover.
+  tunnelAuthBlocksRecovery() {
+    let latest = 0;
+    for (const item of this.tunnelDiagnostics) if (item.kind === "authError" && item.at > latest) latest = item.at;
+    return latest > 0 && !(this.tunnelPollSuccessAt > latest);
+  }
+
   async stopAll() {
     this.recovery.tunnel.disarm();
     this.recovery.mcp.disarm();
     return this.withBusy(async () => {
-      await this.stopTunnel();
-      await this.stopMcp();
+      // Stop MCP even if the tunnel refuses to exit; one failure must not
+      // leave the other service running unnoticed.
+      try { await this.stopTunnel(); }
+      finally { await this.stopMcp(); }
     });
   }
 
   async restartMcp() {
     this.recovery.mcp.disarm("explicit_restart");
     return this.withBusy(async () => {
+      // Disarming cancels an automatic recovery attempt; let it unwind (its
+      // wait now aborts within a poll) instead of failing this restart with
+      // "already in progress" and leaving MCP down with recovery off.
+      await this.waitFor(async () => !this.startingServices.has("mcp"), 15000, "previous MCP start");
       if (this.mcp.isAlive()) await this.mcp.stop();
       this.revokeMcpCapabilities();
       await this.startMcp();
@@ -498,9 +536,13 @@ class Services extends EventEmitter {
     this.shuttingDown = true;
     this.recovery.tunnel.disarm("shutdown");
     this.recovery.mcp.disarm("shutdown");
-    if (this.tunnel.isAlive()) await this.tunnel.stop(5000);
-    if (this.mcp.isAlive()) await this.mcp.stop(5000);
-    this.revokeMcpCapabilities();
+    // A tunnel that "did not exit" must not skip stopping MCP: its descendants
+    // (browser, shells, long commands) would survive the app.
+    try { if (this.tunnel.isAlive()) await this.tunnel.stop(5000); }
+    finally {
+      try { if (this.mcp.isAlive()) await this.mcp.stop(5000); }
+      finally { this.revokeMcpCapabilities(); }
+    }
   }
 
   /** doctor validates local preflight; only successful polling proves remote authentication. */

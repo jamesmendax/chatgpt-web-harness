@@ -6,8 +6,7 @@ import { createHash } from 'node:crypto';
 const fixture = await fs.mkdtemp(path.join(os.tmpdir(), 'wh-v32-skills-'));
 const workspace = path.join(fixture,'workspace'); const registry = path.join(fixture,'plugins.json');
 const root = path.resolve('skills/anthropic-official-skills');
-// Historical upstream bytes are optional and require an explicit local snapshot.
-const original = process.env.WH_SKILL_BASELINE || null;
+const original = process.env.WH_SKILL_BASELINE || path.resolve('.validation/skill-baseline/skills/anthropic-official-skills');
 process.env.CHATGPT_PLUGINS_CONFIG=registry; process.env.CODEX_HOME=path.join(fixture,'home'); process.env.AUDIT_LOG_PATH=path.join(fixture,'audit.jsonl');
 const sha = b => createHash('sha256').update(b).digest('hex');
 try {

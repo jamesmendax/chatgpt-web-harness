@@ -35,6 +35,7 @@ import {
   readProcessHostState,
   readTextTail,
   sendProcessControl,
+  sweepFinishedProcessFolders,
   waitForProcessHostState,
   waitForProcessHostExit,
   writeProcessHostSpec,
@@ -57,6 +58,7 @@ import {
   resetShellSession,
   getWinShell,
   transpileCompoundOperators,
+  wrapPowerShellCommand,
 } from "../lib/persistent-shell.js";
 
 interface ManagedProcess {
@@ -534,12 +536,13 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
         if (!winShellInfo.isPwsh) {
           effectiveCommand = transpileCompoundOperators(command);
         }
-        effectiveCommand = "$OutputEncoding = [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new(); " + effectiveCommand;
+        effectiveCommand = wrapPowerShellCommand(effectiveCommand, encoding);
         args = ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", effectiveCommand];
       }
       if (executable !== undefined) { shell = executable; args = argv ?? []; }
 
       const id = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+      void sweepFinishedProcessFolders(defaultCwd).catch(() => undefined);
       const fullOutputPath = createCommandLogPath(defaultCwd);
       if (!fullOutputPath) throw new Error("PROCESS_LOG_UNAVAILABLE: unable to reserve persistent command log");
       const control = processControlPaths(defaultCwd, id);
@@ -602,7 +605,17 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
           recovery: "Inspect the original host state and logs; do not repeat the operation without determining its outcome.",
         }, { ok: false });
       }
-      if (!hostState.child_pid) throw new Error("PROCESS_HOST_START_FAILED: child pid missing");
+      if (!hostState.child_pid) {
+        // The host reported a definite launch failure (ENOENT, EINVAL): nothing ran.
+        return toolResult("start_process", {
+          id, ...processOwnershipMetadata(processScope), host_pid: host.pid, command, cwd,
+          execution_mode: executable === undefined ? "shell" : "argv", output_encoding: encoding,
+          full_output_path: fullOutputPath, error: hostState.spawn_error || "child process did not start",
+          error_code: "PROCESS_SPAWN_FAILED", outcome_kind: "execution_error", failure_phase: "execution",
+          failure_step: "spawn", operation_started: false, may_have_partially_completed: false,
+          retryable: true, retry_policy: "retry_with_changed_args",
+        }, { ok: false });
+      }
       const [processStartIdentity, hostStartIdentity] = await Promise.all([
         hostState.child_start_identity === undefined ? readProcessStartIdentity(hostState.child_pid) : hostState.child_start_identity,
         hostState.host_start_identity === undefined ? readProcessStartIdentity(host.pid) : hostState.host_start_identity,

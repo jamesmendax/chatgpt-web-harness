@@ -12,7 +12,7 @@ const { app } = electron;
 app.getVersion = () => require("../package.json").version;
 const desktop = path.resolve(__dirname, "..");
 const repo = path.resolve(desktop, "..");
-const artifacts = path.join(repo, ".codex", "isolation");
+const artifacts = require("./lib/test-isolation.cjs").artifactRoot("isolated-ui");
 fs.mkdirSync(artifacts, { recursive: true });
 const fixture = fs.mkdtempSync(path.join(artifacts, "ui-run-"));
 if (!path.resolve(fixture).startsWith(path.resolve(artifacts) + path.sep)) throw new Error("Unsafe UI fixture");
@@ -20,6 +20,8 @@ const userData = path.join(fixture, "chatgpt-web-harness-isolated");
 fs.mkdirSync(userData, { recursive: true });
 app.setPath("appData", fixture);
 app.setPath("userData", userData);
+assert.equal(fs.existsSync(path.join(userData, "config.json")), false, "fresh UI fixture must not seed a legacy default config before real AccountManager initialization");
+assert.equal(fs.existsSync(path.join(userData, "accounts.json")), false, "fresh UI fixture must not synthesize an account registry");
 app.disableHardwareAcceleration();
 app.commandLine.appendSwitch("force-device-scale-factor", "1");
 // Deliberately inject synthetic legacy overrides; the real main entry must scrub them.
@@ -94,7 +96,9 @@ const timeout = setTimeout(() => { console.error("FAIL isolated UI hard deadline
   assert.equal(info.result.legacyTunnelId, ""); assert.equal(info.result.legacyWorkspace, "");
   assert.equal(config.result.setupDone, false); assert.equal(config.result.autoStart, false);
   assert.equal(config.result.workspacePath, ""); assert.equal(config.result.hasApiKey, false);
-  assert.deepEqual([config.result.mcpPort, config.result.adminPort, config.result.tunnelPort], [3300, 3301, 8380]);
+  const initialPorts = require("./lib/test-isolation.cjs").initialPorts();
+  assert.deepEqual([config.result.mcpPort, config.result.adminPort, config.result.tunnelPort], initialPorts);
+  assert.deepEqual(require("../src/config").DEFAULTS.mcpPort, 3300, "production default remains independently asserted");
   const takeover = await js("window.launcher.stopExternal()");
   assert.equal(takeover.ok, false); assert.match(takeover.error, /隔离版不接管或终止外部进程/);
   assert.equal(await js("document.querySelector('#btn-external').hidden && document.querySelector('#btn-external').disabled"), true);
@@ -124,7 +128,7 @@ const timeout = setTimeout(() => { console.error("FAIL isolated UI hard deadline
   assert.equal(await js("window.__harness.core.snapshot().account.name"), "第二账号（验收）");
   await js("window.__harness.core.act.selectAccount('default')");
   const returnedConfig = await js("window.launcher.getConfig()");
-  assert.deepEqual([returnedConfig.result.mcpPort, returnedConfig.result.adminPort, returnedConfig.result.tunnelPort], [3300, 3301, 8380]);
+  assert.deepEqual([returnedConfig.result.mcpPort, returnedConfig.result.adminPort, returnedConfig.result.tunnelPort], initialPorts);
   assert.equal(returnedConfig.result.hasApiKey, false);
   for (const key of ["DOTENV_CONFIG_PATH", "DOTENV_CONFIG_OVERRIDE", "ADMIN_TOKEN", "MCP_TOKEN"]) assert.equal(process.env[key], undefined);
   assert.equal(process.env.CLC_RUNTIME_DIR, path.join(userData, "runtime"));
@@ -145,7 +149,9 @@ const timeout = setTimeout(() => { console.error("FAIL isolated UI hard deadline
   fs.writeFileSync(path.join(artifacts, "isolated-ui-result.json"), JSON.stringify({
     passed: true, renderer: "aura", configPath: info.result.configPath, runtimeDir: info.result.runtimeDir,
     managedServiceAutoStart: false, externalTakeoverRejected: true, inheritedOverridesScrubbed: true,
-    protectedFixtureUnchanged: true, multiAccount: { secondId, ports: secondPorts, noCopiedApiKey: true, returnedToDefault: true }
+    protectedFixtureUnchanged: true, freshBeforeMain: { configExisted: false, registryExisted: false },
+    initialAccountName: initialAccounts.result.accounts[0].name,
+    multiAccount: { secondId, ports: secondPorts, noCopiedApiKey: true, returnedToDefault: true }
   }, null, 2));
   console.log("PASS real Aura Electron main/preload isolation, inherited override scrubbing, protected legacy data and separate accounts");
   clearTimeout(timeout); app.quit();

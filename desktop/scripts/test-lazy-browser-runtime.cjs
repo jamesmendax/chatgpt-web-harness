@@ -8,7 +8,7 @@ const vm = require("node:vm");
 const { createRequire } = require("node:module");
 const { runPowershell, psQuote } = require("../src/shell-util");
 const { archiveDescriptor, materializeBrowserRuntime } = require("../src/lazy-browser-runtime");
-const base = path.resolve(__dirname, "../../.codex");
+const base = require("./lib/test-isolation.cjs").artifactRoot("lazy-browser-runtime");
 const digest = value => crypto.createHash("sha256").update(value).digest("hex");
 
 async function fixture(t, longEntry = false) {

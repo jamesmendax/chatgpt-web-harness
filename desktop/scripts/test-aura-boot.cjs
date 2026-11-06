@@ -2,7 +2,7 @@
 // Real hidden native window: requestAnimationFrame starvation must not gate UI reveal.
 const assert=require("node:assert/strict"),fs=require("node:fs"),path=require("node:path"),Module=require("node:module"),{EventEmitter}=require("node:events");
 const electron=require("electron"),{app}=electron;
-const desktop=path.resolve(__dirname,".."),out=path.join(desktop,"..",".validation","aura-boot");fs.mkdirSync(out,{recursive:true});
+const desktop=path.resolve(__dirname,".."),out=require("./lib/test-isolation.cjs").artifactRoot("aura-boot");fs.mkdirSync(out,{recursive:true});
 const fixture=fs.mkdtempSync(path.join(out,"run-"));
 app.setPath("appData",fixture);app.setPath("userData",path.join(fixture,"chatgpt-web-harness-isolated"));app.getVersion=()=>require("../package.json").version;
 let resolveWindow,win;const ready=new Promise(resolve=>{resolveWindow=resolve;});
@@ -28,20 +28,21 @@ const timer=setTimeout(()=>{console.error("AURA_BOOT_DEADLINE",fixture);app.exit
  await win.webContents.executeJavaScript("document.querySelector('#nav [data-view=settings]').click()");
  report.settingsWorks=await win.webContents.executeJavaScript("document.body.dataset.view==='settings'&&!document.querySelector('#view-settings').hidden");assert.equal(report.settingsWorks,true);assert.equal(report.services.mcp,false);assert.equal(report.services.tunnel,false);
  const project=path.join(fixture,"workspace");fs.mkdirSync(project);
- const configReply=await win.webContents.executeJavaScript(`window.launcher.saveConfig(${JSON.stringify({mcpPort:44200,adminPort:44201,tunnelPort:44202,workspacePath:project})})`);
+ const [firstMcp,firstAdmin,firstTunnel,secondMcp,secondAdmin,secondTunnel]=await require("./lib/test-isolation.cjs").privatePorts(6);
+ const configReply=await win.webContents.executeJavaScript(`window.launcher.saveConfig(${JSON.stringify({mcpPort:firstMcp,adminPort:firstAdmin,tunnelPort:firstTunnel,workspacePath:project})})`);
  assert.equal(configReply.ok,true,"Synthetic config save failed: "+String(configReply.error||"unknown"));
  const saved=await win.webContents.executeJavaScript("window.launcher.getConfig()");
- assert.equal(saved.result.mcpPort,44200);
+ assert.equal(saved.result.mcpPort,firstMcp);
  assert.equal(saved.result.workspacePath,project);
  report.syntheticConfigSaveWorks=true;
- await win.webContents.executeJavaScript(`(()=>{for(const [key,value] of Object.entries(${JSON.stringify({mcpPort:44210,adminPort:44211,tunnelPort:44212,workspacePath:project})})){const el=document.querySelector('#f-'+key);el.value=String(value);el.dispatchEvent(new Event('input',{bubbles:true}));}document.querySelector('#btn-save-only').click()})()`);
+ await win.webContents.executeJavaScript(`(()=>{for(const [key,value] of Object.entries(${JSON.stringify({mcpPort:secondMcp,adminPort:secondAdmin,tunnelPort:secondTunnel,workspacePath:project})})){const el=document.querySelector('#f-'+key);el.value=String(value);el.dispatchEvent(new Event('input',{bubbles:true}));}document.querySelector('#btn-save-only').click()})()`);
  let last;
  for(let i=0;i<60;i++) {
    last=await win.webContents.executeJavaScript("({port:window.__harness.core.snapshot().account.config.mcpPort,status:document.querySelector('#form-status').textContent,draft:window.__harness.core.snapshot().account.config.workspacePath})");
-   if(last.port===44210)break;
+   if(last.port===secondMcp)break;
    await pause(100);
  }
- assert.equal(last.port,44210,"Aura UI save failed: "+JSON.stringify(last));
+ assert.equal(last.port,secondMcp,"Aura UI save failed: "+JSON.stringify(last));
  report.syntheticFormSaveWorks=true;
  const audio=await win.webContents.executeJavaScript("window.launcher.getNotificationSounds()");
  assert.equal(audio.ok,true);

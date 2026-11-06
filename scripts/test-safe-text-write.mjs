@@ -5,9 +5,11 @@ import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { writeTextFileCas } from '../dist/lib/safe-text-write.js';
-import { mutateUpstreamConfig, loadUpstreamConfig } from '../dist/lib/mcp-upstream-config.js';
-import { McpUpstreamManager } from '../dist/lib/mcp-upstream-manager.js';
+const runtime = process.env.HARNESS_TEST_SOURCE === '1' ? '../src/' : '../dist/';
+const suffix = process.env.HARNESS_TEST_SOURCE === '1' ? '.ts' : '.js';
+const { writeTextFileCas, writeFileBytesCas, readFileForEdit } = await import(runtime + 'lib/safe-text-write' + suffix);
+const { mutateUpstreamConfig, loadUpstreamConfig } = await import(runtime + 'lib/mcp-upstream-config' + suffix);
+const { McpUpstreamManager } = await import(runtime + 'lib/mcp-upstream-manager' + suffix);
 
 const sha = value => createHash('sha256').update(value).digest('hex');
 const self = fileURLToPath(import.meta.url);
@@ -29,9 +31,11 @@ if (process.argv[2] === '--child') {
   }
 }
 
-const fixture = await fs.mkdtemp(path.join(os.tmpdir(), 'wh-cas-concurrency-'));
+const fixtureBase = path.resolve(process.env.HARNESS_TEST_TMP_ROOT || path.join(path.dirname(self), '../.validation/safe-text-write'));
+await fs.mkdir(fixtureBase, { recursive: true });
+const fixture = await fs.mkdtemp(path.join(fixtureBase, 'wh-cas-concurrency-'));
 function child(mode, file, value) {
-  const processHandle = spawn(process.execPath, [self, '--child', mode, file, value], { windowsHide: true, stdio: ['ignore', 'ignore', 'pipe'] });
+  const processHandle = spawn(process.execPath, [...process.execArgv, self, '--child', mode, file, value], { windowsHide: true, stdio: ['ignore', 'ignore', 'pipe'] });
   let error = '';
   processHandle.stderr.on('data', d => { error += d; });
   const timer = setTimeout(() => processHandle.kill(), 15000);
@@ -41,6 +45,18 @@ function child(mode, file, value) {
   });
 }
 try {
+  const encodedTarget = path.join(fixture, 'encoded.txt');
+  const oldBytes = Buffer.from([0xff, 0xfe, 0x41, 0x00, 0x0a, 0x00]);
+  const newBytes = Buffer.from([0xff, 0xfe, 0x42, 0x00, 0x0a, 0x00]);
+  await fs.writeFile(encodedTarget, oldBytes);
+  const revision = await readFileForEdit(encodedTarget);
+  await writeFileBytesCas(encodedTarget, newBytes, { expectedRevision: revision.revision });
+  assert.deepEqual(await fs.readFile(encodedTarget), newBytes, 'byte publisher does not transcode a UTF-16 BOM');
+  await assert.rejects(writeFileBytesCas(encodedTarget, oldBytes, { expectedRevision: revision.revision }), /WRITE_CONFLICT/);
+  const fresh = await readFileForEdit(encodedTarget);
+  await assert.rejects(writeFileBytesCas(encodedTarget, oldBytes, { expectedRevision: fresh.revision,
+    beforeCommit: () => fs.writeFile(encodedTarget, Buffer.from('external-before-rename')) }), /WRITE_CONFLICT/);
+  assert.equal(await fs.readFile(encodedTarget, 'utf8'), 'external-before-rename', 'commit hook is followed by a fresh CAS check');
   if (process.platform === 'win32') {
     const rename = fs.rename;
     const retryTarget = path.join(fixture, 'sharing-retry.txt');
@@ -146,4 +162,7 @@ try {
   const leftovers = (await fs.readdir(fixture, { recursive: true })).filter(name => /\.cas-tmp$|\.lock$/.test(name));
   assert.deepEqual(leftovers, []);
   console.log('safe-text-write: cross-process CAS/create-only, canonical alias, external change, failed checkpoint, concurrent config merge, stale manager and corrupt config PASS');
-} finally { await fs.rm(fixture, { recursive: true, force: true }); }
+} finally {
+  assert.ok(path.dirname(path.resolve(fixture)) === fixtureBase && path.basename(fixture).startsWith('wh-cas-concurrency-'));
+  await fs.rm(fixture, { recursive: true, force: true });
+}

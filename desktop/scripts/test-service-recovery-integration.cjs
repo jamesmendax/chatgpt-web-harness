@@ -147,3 +147,45 @@ test("missing bundled tunnel executable fails closed instead of silently downloa
   const h = setup({ bundleExists: false });
   await assert.rejects(h.service.downloadTunnelClient(), /不会自动下载旧版客户端/);
 });
+
+test("a stale tunnel authentication error does not block recovery once a later poll succeeded", async () => {
+  const h = setup(); await h.service.startAll();
+  h.service.tunnelDiagnostics.push({ kind: "authError", at: Date.now() - 60_000 });
+  h.service.notePollSuccess(Date.now() - 1_000);
+  h.service.tunnel.crash();
+  assert.equal(h.timers.size, 1, "recovery must be scheduled after the credentials were proven");
+  await h.fire(); assert.equal(h.service.tunnel.isAlive(), true);
+  // An authentication error newer than every successful poll still blocks automatic restarts.
+  h.service.tunnelDiagnostics.push({ kind: "authError", at: Date.now() + 1 });
+  h.service.tunnel.crash();
+  assert.equal(h.timers.size, 0);
+  await h.service.shutdown();
+});
+test("an MCP child that dies before it is healthy fails at once and frees the start slot", async () => {
+  const h = setup();
+  h.service.waitFor = Object.getPrototypeOf(h.service).waitFor; // the real loop; sleep is a no-op here
+  const start = h.service.mcp.start.bind(h.service.mcp);
+  h.service.mcp.start = (spec) => { const pid = start(spec); h.service.mcp.alive = false; h.service.mcp.state = "error"; return pid; };
+  const started = Date.now();
+  await assert.rejects(h.service.startMcp(), /就绪前退出/);
+  assert.ok(Date.now() - started < 3_000, "no 45 s wait for a dead child");
+  assert.equal(h.service.startingServices.size, 0);
+  await h.service.shutdown();
+});
+test("stopAll and shutdown still stop MCP and revoke its capabilities when the tunnel refuses to exit", async () => {
+  const refuse = async () => { throw new Error("tunnel did not exit"); };
+  const h = setup(); await h.service.startAll();
+  const stop = h.service.tunnel.stop.bind(h.service.tunnel);
+  h.service.tunnel.stop = refuse;
+  await assert.rejects(h.service.stopAll(), /tunnel did not exit/);
+  assert.equal(h.service.mcp.isAlive(), false, "stopAll stopped MCP");
+  h.service.tunnel.stop = stop; await h.service.shutdown();
+  const g = setup(); await g.service.startAll();
+  const gStop = g.service.tunnel.stop.bind(g.service.tunnel);
+  g.service.tunnel.stop = refuse;
+  const revoked = g.revocations.length;
+  await assert.rejects(g.service.shutdown(), /tunnel did not exit/);
+  assert.equal(g.service.mcp.isAlive(), false, "shutdown stopped MCP");
+  assert.ok(g.revocations.length > revoked, "shutdown revoked MCP capabilities");
+  await gStop();
+});

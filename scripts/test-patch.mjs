@@ -25,10 +25,14 @@ test("codex-style patch without line numbers", () => {
 
 test("unified diff with line numbers", () => {
   const original = "line1\nline2\nline3\nline4\n";
-  const patch = "@@ -2,2 +2,3 @@\n line2\n-old\n+new\n+extra\n line4\n";
-  const result = applyUnifiedPatchToText(original, patch);
-  if (!result.includes("new")) throw new Error("replacement missing");
-  if (result.includes("old")) throw new Error("old line still present");
+  const patch = "@@ -2,3 +2,4 @@\n line2\n-line3\n+new\n+extra\n line4\n";
+  assert.equal(applyUnifiedPatchToText(original, patch), "line1\nline2\nnew\nextra\nline4\n");
+});
+
+test("a numbered hunk whose removed line is not in the file is rejected, not applied by position", () => {
+  // The previous version of the test above removed a nonexistent "old" line
+  // and still "succeeded" by overwriting whatever sat at line 3.
+  assert.throws(() => applyUnifiedPatchToText("line1\nline2\nline3\nline4\n", "@@ -2,2 +2,3 @@\n line2\n-old\n+new\n line4\n"), /Patch context not found/);
 });
 
 test("crlf preserved", () => {

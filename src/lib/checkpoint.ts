@@ -71,6 +71,22 @@ function getMaxFileBytes(): number {
   return Number.isFinite(n) && n > 0 ? n : DEFAULT_MAX_FILE_BYTES;
 }
 
+// One checkpoint had no total limit: deleting a node_modules tree copied every
+// file of 5 MiB or less into the store, blew the call deadline, and listed
+// every skipped junction in the result until it exceeded the transport budget
+// after the delete had already happened. Bound the copy and the reported list.
+const DEFAULT_MAX_TOTAL_BYTES = 512 * 1024 * 1024;
+const DEFAULT_MAX_TOTAL_FILES = 20_000;
+const MAX_REPORTED_SKIPS = 100;
+function getMaxTotalBytes(): number {
+  const n = parseInt(process.env.CHECKPOINT_MAX_TOTAL_BYTES || String(DEFAULT_MAX_TOTAL_BYTES), 10);
+  return Number.isFinite(n) && n > 0 ? n : DEFAULT_MAX_TOTAL_BYTES;
+}
+function getMaxTotalFiles(): number {
+  const n = parseInt(process.env.CHECKPOINT_MAX_TOTAL_FILES || String(DEFAULT_MAX_TOTAL_FILES), 10);
+  return Number.isFinite(n) && n > 0 ? n : DEFAULT_MAX_TOTAL_FILES;
+}
+
 function checkpointDir(id: string): string {
   return path.join(getStoreRoot(), "data", id);
 }
@@ -285,7 +301,7 @@ export function getCheckpointConfig(): Record<string, unknown> {
   };
 }
 
-export interface CheckpointAttempt { id: string | null; complete: boolean; skipped: Array<{ path: string; reason: string }>; error?: string }
+export interface CheckpointAttempt { id: string | null; complete: boolean; skipped: Array<{ path: string; reason: string }>; skipped_count?: number; error?: string }
 export async function checkpointBeforeDetailed(
   tool: string, paths: string[], options?: { summary?: string; dry_run?: boolean }
 ): Promise<CheckpointAttempt> {
@@ -302,16 +318,22 @@ export async function checkpointBeforeDetailed(
   const id = `cp_${randomUUID().replace(/-/g, "").slice(0, 12)}`;
   const dir = checkpointDir(id);
   const skipped: Array<{ path: string; reason: string }> = [];
+  let skippedCount = 0;
   let entries: Awaited<ReturnType<typeof fs.open>> | undefined;
   try {
     await fs.mkdir(path.join(dir, "blobs"), { recursive: true });
     entries = await fs.open(path.join(dir, "entries.jsonl"), "wx");
-    let sequence = 0;
+    let sequence = 0, copiedBytes = 0, exhausted = false;
+    const maxBytes = getMaxTotalBytes(), maxFiles = getMaxTotalFiles();
     const record = async (entry: CheckpointFileSnapshot) => {
-      if (entry.skipped) skipped.push({ path: entry.path, reason: entry.skip_reason || "unknown" });
+      if (entry.skipped) {
+        skippedCount++;
+        if (skipped.length < MAX_REPORTED_SKIPS) skipped.push({ path: entry.path, reason: entry.skip_reason || "unknown" });
+      }
       await entries!.writeFile(JSON.stringify(entry) + "\n");
     };
     const walk = async (filePath: string, depth: number): Promise<void> => {
+      if (exhausted) return;
       let stat: Awaited<ReturnType<typeof fs.lstat>>;
       try { stat = await fs.lstat(filePath); }
       catch (error) {
@@ -328,8 +350,14 @@ export async function checkpointBeforeDetailed(
       }
       if (!stat.isFile() || stat.size > getMaxFileBytes()) return record({ path: filePath, existed: true, skipped: true,
         skip_reason: stat.isFile() ? `file exceeds CHECKPOINT_MAX_FILE_BYTES (${stat.size} bytes)` : "unsupported file type" });
+      if (sequence >= maxFiles || copiedBytes + stat.size > maxBytes) {
+        // Stop the whole walk: the rest of the tree is reported once, not per file.
+        exhausted = true;
+        return record({ path: filePath, existed: true, skipped: true,
+          skip_reason: `checkpoint budget reached (${sequence} files, ${copiedBytes} bytes; CHECKPOINT_MAX_TOTAL_FILES / CHECKPOINT_MAX_TOTAL_BYTES); the rest of the tree is not captured` });
+      }
       const blob = `blobs/${sequence++}`;
-      try { await fs.copyFile(filePath, path.join(dir, blob)); await record({ path: filePath, existed: true, blob }); }
+      try { await fs.copyFile(filePath, path.join(dir, blob)); copiedBytes += stat.size; await record({ path: filePath, existed: true, blob }); }
       catch (error) { await record({ path: filePath, existed: true, skipped: true, skip_reason: String(error) }); }
     };
     for (const item of uniquePaths) await walk(item, 0);
@@ -339,13 +367,13 @@ export async function checkpointBeforeDetailed(
     await fs.writeFile(manifestPath(id), JSON.stringify(manifest), "utf8");
     await withIndexLock(async () => {
       const index = await readIndex();
-      index.checkpoints.push({ ...buildSummary(manifest), complete: skipped.length === 0, skipped });
+      index.checkpoints.push({ ...buildSummary(manifest), complete: skippedCount === 0, skipped });
       await writeIndex(await pruneCheckpoints(index));
     });
-    return { id, complete: skipped.length === 0, skipped };
+    return { id, complete: skippedCount === 0, skipped, ...(skippedCount > skipped.length ? { skipped_count: skippedCount } : {}) };
   } catch (error) {
     await entries?.close().catch(() => undefined);
-    return { id: null, complete: false, skipped, error: String(error) };
+    return { id: null, complete: false, skipped, ...(skippedCount > skipped.length ? { skipped_count: skippedCount } : {}), error: String(error) };
   }
 }
 export async function checkpointBefore(tool: string, paths: string[], options?: { summary?: string; dry_run?: boolean }): Promise<string | null> {

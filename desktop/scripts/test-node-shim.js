@@ -23,7 +23,7 @@ async function main() {
   if (!fs.existsSync(shim)) throw new Error("node.cmd was not created");
   const content = fs.readFileSync(shim, "utf8");
   if (!content.includes("ELECTRON_RUN_AS_NODE=1") || !content.includes(process.execPath)) throw new Error("node.cmd does not forward Electron Node safely");
-  const env = { ...process.env, ELECTRON_RUN_AS_NODE: undefined };
+  const env = { ...process.env, ELECTRON_RUN_AS_NODE: undefined, HARNESS_NODE_EXE: undefined };
   const version = spawnSync(shim, ["--version"], { env, shell: true, windowsHide: true, encoding: "utf8" });
   if (version.status !== 0 || !/^v\d+\./.test((version.stdout || "").trim())) throw new Error("node.cmd --version failed");
   const script = spawnSync(shim, ["-e", "process.stdout.write(process.cwd())"], { cwd: tmp, env, shell: true, windowsHide: true, encoding: "utf8" });
@@ -34,6 +34,16 @@ async function main() {
   const powershell = path.join(process.env.SystemRoot || "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
   const spacedRun = spawnSync(powershell, ["-NoProfile", "-NonInteractive", "-Command", spacedCommand], { cwd: tmp, env, windowsHide: true, encoding: "utf8" });
   if (spacedRun.status !== 0 || spacedRun.stdout.trim() !== spaced) throw new Error("node.cmd space path forwarding failed: status=" + spacedRun.status + " stdout=" + JSON.stringify(spacedRun.stdout) + " stderr=" + JSON.stringify(spacedRun.stderr));
+  // cmd.exe reads node.cmd in the console code page, so a non-ASCII install
+  // path written into it failed; the launcher hands the executable over in
+  // HARNESS_NODE_EXE instead. Run a copied system program from such a folder.
+  if (!content.includes("%HARNESS_NODE_EXE%")) throw new Error("node.cmd does not prefer HARNESS_NODE_EXE");
+  const unicodeDir = path.join(tmp, "张三 測試");
+  fs.mkdirSync(unicodeDir);
+  const unicodeExe = path.join(unicodeDir, "hostname.exe");
+  fs.copyFileSync(path.join(process.env.SystemRoot || "C:\Windows", "System32", "hostname.exe"), unicodeExe);
+  const unicodeRun = spawnSync(shim, [], { env: { ...env, HARNESS_NODE_EXE: unicodeExe }, shell: true, windowsHide: true, encoding: "utf8" });
+  if (unicodeRun.status !== 0 || unicodeRun.stdout.trim().toLowerCase() !== os.hostname().toLowerCase()) throw new Error("node.cmd non-ASCII executable path failed: status=" + unicodeRun.status + " stdout=" + JSON.stringify(unicodeRun.stdout) + " stderr=" + JSON.stringify(unicodeRun.stderr));
   // Use an explicitly encrypted synthetic credential, never a borrowed
   // process-level Admin token or a newly generated production credential.
   env.ADMIN_TOKEN = "phase4-admin-test-only";
@@ -47,7 +57,7 @@ async function main() {
     if (previousAdminToken === undefined) delete process.env.ADMIN_TOKEN;
     else process.env.ADMIN_TOKEN = previousAdminToken;
   }
-  console.log("node-shim: PATH forwarding, arguments, exit status, space paths, no recursion and explicit MCP executable OK");
+  console.log("node-shim: PATH forwarding, arguments, exit status, space paths, non-ASCII executable path, no recursion and explicit MCP executable OK");
   fs.rmSync(tmp, { recursive: true, force: true });
   app.exit(0);
 }

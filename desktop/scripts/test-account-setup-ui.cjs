@@ -6,7 +6,7 @@ const fs = require("node:fs"), path = require("node:path"), net = require("node:
 const { EventEmitter } = require("node:events");
 const electron = require("electron"), { app } = electron;
 const desktop = path.resolve(__dirname, "..");
-const artifacts = path.resolve(desktop, "../.validation/account-setup-ui");
+const artifacts = require("./lib/test-isolation.cjs").artifactRoot("account-setup-ui");
 fs.mkdirSync(artifacts, { recursive: true });
 const fixture = fs.mkdtempSync(path.join(artifacts, "run-")), workspace = path.join(fixture, "workspace");
 fs.mkdirSync(workspace); fs.writeFileSync(path.join(workspace, "keep.txt"), "workspace retained");
@@ -16,6 +16,8 @@ app.commandLine.appendSwitch("force-device-scale-factor", "1");
 let resolveWindow, win, client, doctorCalls = 0;
 const ready = new Promise(resolve => { resolveWindow = resolve; });
 const checks = [], screenshots = [], errors = [];
+// Exercise real clipboard IPC/redaction against a local sink; never touch the OS clipboard.
+let copiedText = "";
 class Window extends electron.BrowserWindow {
   constructor(options) {
     super({ ...options, show: false, webPreferences: { ...options.webPreferences, offscreen: true, backgroundThrottling: false } });
@@ -27,6 +29,7 @@ class Tray extends EventEmitter { setToolTip() {} setContextMenu() {} destroy() 
 const load = Module._load;
 Module._load = function(request, parent, isMain) {
   if (request === "electron" && parent?.filename.startsWith(desktop)) return { ...electron, BrowserWindow: Window, Tray,
+    clipboard: { writeText(text) { copiedText = String(text); } },
     dialog: { ...electron.dialog, showErrorBox: (title, message) => errors.push(`${title}: ${message}`) } };
   return load.call(this, request, parent, isMain);
 };
@@ -96,7 +99,7 @@ const deadline = setTimeout(async () => { console.error("FAIL hard deadline"); a
   assert.match(diagnostic.checks, /本机 MCP 连接：ECONNREFUSED fixture local refusal/); assert.doesNotMatch(diagnostic.checks, /optional_web/);
   assert.match(diagnostic.next, /MCP.*端口/); assert.equal(diagnostic.collapsed, true);
   await click("#setup-copy"); await pause(100);
-  const copied = electron.clipboard.readText(); assert.match(copied, /ECONNREFUSED fixture local refusal/); assert.match(copied, /LOCAL_MCP_UNREACHABLE/); assert.doesNotMatch(copied, /sk-fixture-account-ui-secret/);
+  const copied = copiedText; assert.match(copied, /ECONNREFUSED fixture local refusal/); assert.match(copied, /LOCAL_MCP_UNREACHABLE/); assert.doesNotMatch(copied, /sk-fixture-account-ui-secret/);
   for (const theme of ["light", "dark"]) await layout("#dlg-setup", ["#setup-copy", "#setup-retry", "#setup-done"], theme);
   await click("#setup-details summary"); assert.equal(await js("document.querySelector('#setup-details').open"), true);
   await click("#setup-retry"); await wait("document.querySelector('#setup-title').textContent === '初始化完成' && !document.querySelector('#setup-done').disabled", "replay retry");

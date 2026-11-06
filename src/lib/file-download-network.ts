@@ -1,4 +1,6 @@
 import { execFile } from "node:child_process";
+import { readFile } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { Agent, request } from "node:https";
 import { Readable } from "node:stream";
@@ -30,8 +32,13 @@ export function fileProxyBypass(hostname: string, port: string, value: string): 
     return hostname === token || hostname.endsWith("." + token);
   });
 }
-export function parseWindowsFileProxy(settings: FileProxySettings, url: URL): FileProxyRoute {
-  if (settings.pac.trim()) throw new Error("FILE_PROXY_PAC_UNSUPPORTED: configure an explicit HTTP/HTTPS file-download proxy; PAC is not evaluated by this Node downloader");
+export function parseWindowsFileProxy(settings: FileProxySettings, url: URL, pacProxy?: string): FileProxyRoute {
+  // A PAC script is not evaluated here, and refusing outright failed every
+  // download for anyone whose proxy tool publishes one (Clash, v2rayN in PAC
+  // mode). Those PACs send foreign hosts such as the ChatGPT file host through
+  // the local proxy they name, so use that proxy; otherwise use the manual
+  // proxy, or go direct and let the transfer report its own network error.
+  if (settings.pac.trim() && pacProxy) return { mode: "proxy", source: "windows-pac", url: validateFileProxy(pacProxy) };
   if (!settings.enabled || !settings.server.trim() || fileProxyBypass(url.hostname, url.port || "443", settings.bypass)) {
     return { mode: "direct", source: "windows-system" };
   }
@@ -51,6 +58,7 @@ async function readWindowsProxy(signal?: AbortSignal): Promise<FileProxySettings
 export async function resolveFileProxy(url: URL, options: {
   env?: NodeJS.ProcessEnv; platform?: string; signal?: AbortSignal;
   readSystem?: () => Promise<FileProxySettings>;
+  readPacProxy?: (pacUrl: string, signal?: AbortSignal) => Promise<string | undefined>;
 } = {}): Promise<FileProxyRoute> {
   const env = options.env || process.env;
   const explicit = env.HARNESS_FILE_DOWNLOAD_PROXY?.trim();
@@ -60,7 +68,27 @@ export async function resolveFileProxy(url: URL, options: {
   const inherited = envValue(env, "HTTPS_PROXY") || envValue(env, "HTTP_PROXY");
   if (inherited) return { mode: "proxy", source: "environment", url: validateFileProxy(inherited) };
   if ((options.platform || process.platform) !== "win32") return { mode: "direct", source: "default" };
-  return parseWindowsFileProxy(await (options.readSystem ? options.readSystem() : readWindowsProxy(options.signal)), url);
+  const settings = await (options.readSystem ? options.readSystem() : readWindowsProxy(options.signal));
+  const pacProxy = settings.pac.trim()
+    ? await (options.readPacProxy ?? pacProxyHint)(settings.pac.trim(), options.signal).catch(() => undefined)
+    : undefined;
+  return parseWindowsFileProxy(settings, url, pacProxy);
+}
+
+/** The first PROXY/HTTPS directive of a PAC script, read as text (never executed). */
+export async function pacProxyHint(pacUrl: string, signal?: AbortSignal): Promise<string | undefined> {
+  const url = new URL(pacUrl);
+  let text: string;
+  if (url.protocol === "file:") {
+    text = (await readFile(fileURLToPath(url))).subarray(0, 1024 * 1024).toString("utf8");
+  } else if (url.protocol === "http:" || url.protocol === "https:") {
+    const timeout = AbortSignal.timeout(3000);
+    const response = await fetch(url, { signal: signal ? AbortSignal.any([signal, timeout]) : timeout, redirect: "follow" });
+    if (!response.ok) return undefined;
+    text = (await response.text()).slice(0, 1024 * 1024);
+  } else return undefined;
+  const match = /\b(PROXY|HTTPS)\s+(\[[0-9a-f:.]+\]|[A-Za-z0-9.-]+):(\d{1,5})\b/i.exec(text);
+  return match ? `${match[1].toUpperCase() === "HTTPS" ? "https" : "http"}://${match[2]}:${match[3]}` : undefined;
 }
 
 /** Download-only routing. No global agent, Windows settings, Tunnel config,

@@ -2,7 +2,7 @@
 // Production main + preload + Aura; only native picker/window/tray are replaced.
 const assert=require('node:assert/strict'), fs=require('node:fs'),path=require('node:path'),net=require('node:net'),Module=require('node:module');
 const {EventEmitter}=require('node:events'),electron=require('electron'),{app}=electron;
-const desktop=path.resolve(__dirname,'..'), artifacts=path.resolve(desktop,'../.validation/account-import-ui');fs.mkdirSync(artifacts,{recursive:true});
+const desktop=path.resolve(__dirname,'..'), artifacts=require('./lib/test-isolation.cjs').artifactRoot('account-import-ui');fs.mkdirSync(artifacts,{recursive:true});
 const fixture=fs.mkdtempSync(path.join(artifacts,'run-')),workspace=path.join(fixture,'workspace'),oldData=path.join(fixture,'Old Harness.exe.data'),oldProfile=path.join(oldData,'appdata','chatgpt-web-harness-isolated');
 fs.mkdirSync(workspace);fs.writeFileSync(path.join(workspace,'keep.txt'),'untouched workspace');fs.mkdirSync(oldProfile,{recursive:true});
 app.setPath('appData',fixture);app.setPath('userData',path.join(fixture,'isolated'));app.getVersion=()=>require('../package.json').version;app.commandLine.appendSwitch('force-device-scale-factor','1');

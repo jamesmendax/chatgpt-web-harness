@@ -1545,13 +1545,26 @@ async function removeUnresolvedTransition(directory: string): Promise<void> {
   await syncDirectory(directory);
 }
 
-async function assertCapacity(directory: string, target: string, next: OperationReceipt): Promise<void> {
-  const limits = journalLimits();
-  const names = await fs.readdir(directory);
+// A terminal receipt protects against a retried request re-running its side
+// effect. ChatGPT retries arrive within minutes, and Goal-less identities embed
+// the per-call transport session, so receipts finished more than a week ago
+// (or more than an hour ago once a directory is large) protect nothing. Keeping
+// them forever filled the journal: after 16,384 calls every mutating tool was
+// refused with OPERATION_JOURNAL_CAPACITY_EXHAUSTED, and each admission
+// stat()ed every receipt. Unresolved receipts are never pruned.
+const RECEIPT_NAME_RE = /^operation-[a-f0-9]{64}\.json$/i;
+const PRUNE_TRIGGER_ENTRIES = 1_024;
+const PRUNE_TARGET_ENTRIES = 512;
+const PRUNE_COOLDOWN_MS = 60_000;
+const TERMINAL_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+const TERMINAL_MIN_RETENTION_MS = 60 * 60 * 1000;
+const lastPruneAt = new Map<string, number>();
+
+async function receiptUsage(directory: string, names: readonly string[]): Promise<{ entries: number; totalBytes: number }> {
   let entries = 0;
   let totalBytes = 0;
   for (const name of names) {
-    if (!/^operation-[a-f0-9]{64}\.json$/i.test(name)) continue;
+    if (!RECEIPT_NAME_RE.test(name)) continue;
     const file = path.join(directory, name);
     const stat = await fs.stat(file).catch(() => {
       throw new JournalFailure("OPERATION_JOURNAL_UNAVAILABLE");
@@ -1564,6 +1577,52 @@ async function assertCapacity(directory: string, target: string, next: Operation
     // receipts become unreachable only under their own opaque identity hash.
     entries++;
     totalBytes += stat.size;
+  }
+  return { entries, totalBytes };
+}
+
+/** Delete expired terminal receipts, then the oldest ones over an hour old while above the target size. */
+async function pruneTerminalReceipts(directory: string, names: readonly string[], keepName: string, limits: JournalLimits): Promise<number> {
+  const now = Date.now();
+  const candidates: { file: string; finished: number }[] = [];
+  let receipts = 0;
+  for (const name of names) {
+    if (!RECEIPT_NAME_RE.test(name)) continue;
+    receipts++;
+    if (name === keepName) continue;
+    const file = path.join(directory, name);
+    // Unreadable receipts stay (fail closed); so does any identity being worked on.
+    const receipt = await readReceipt(file).catch(() => null);
+    if (!receipt || !isTerminal(receipt.state)) continue;
+    const finished = Date.parse(receipt.finished_at ?? receipt.started_at ?? receipt.accepted_at ?? receipt.created_at);
+    if (!Number.isFinite(finished) || now - finished < TERMINAL_MIN_RETENTION_MS) continue;
+    if (fsSync.existsSync(file.replace(/\.json$/i, ".lock"))) continue;
+    candidates.push({ file, finished });
+  }
+  candidates.sort((a, b) => a.finished - b.finished);
+  let excess = receipts - Math.max(1, Math.min(PRUNE_TARGET_ENTRIES, Math.floor(limits.maxEntries / 2)));
+  let removed = 0;
+  for (const candidate of candidates) {
+    if (now - candidate.finished < TERMINAL_RETENTION_MS && excess <= 0) break;
+    try { await fs.rm(candidate.file, { force: true }); } catch { continue; }
+    removed++;
+    excess--;
+  }
+  return removed;
+}
+
+async function assertCapacity(directory: string, target: string, next: OperationReceipt): Promise<void> {
+  const limits = journalLimits();
+  let names = await fs.readdir(directory);
+  let { entries, totalBytes } = await receiptUsage(directory, names);
+  const nearLimit = entries >= limits.maxEntries * 0.9 || totalBytes >= limits.maxBytes * 0.9;
+  const large = entries >= Math.min(PRUNE_TRIGGER_ENTRIES, limits.maxEntries) || totalBytes >= limits.maxBytes / 2;
+  if (large && (nearLimit || Date.now() - (lastPruneAt.get(directory) ?? 0) >= PRUNE_COOLDOWN_MS)) {
+    lastPruneAt.set(directory, Date.now());
+    if (await pruneTerminalReceipts(directory, names, path.basename(target), limits) > 0) {
+      names = await fs.readdir(directory);
+      ({ entries, totalBytes } = await receiptUsage(directory, names));
+    }
   }
   const serialized = serializeReceipt(next);
   const nextBytes = Buffer.byteLength(serialized, "utf8");

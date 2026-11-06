@@ -129,6 +129,8 @@ test("Aura safety hooks are present and protected services are untouched", () =>
   assert.match(main, /forcefullyCrashRenderer\(\)/);
   assert.match(main, /safeGraphics:\s*"1"/);
   assert.match(main, /rendererMemoryTimer = setInterval\(inspectRendererMemory, 3_000\)/);
+  assert.match(main, /appendSwitch\("js-flags", "--max-old-space-size=1024"\)/, "renderer V8 heap backstop between samples");
+  assert.match(main, /gpuMemoryGuard\.reset\(\)/, "restoring dynamic graphics re-arms the GPU guard");
   assert.match(app, /graphicsBlocked = params\.has\("safeGraphics"\)/);
   assert.match(app, /sceneOwner\.enable\(!graphicsBlocked && qualityChoice !== "static"\)/);
   assert.match(app, /globalThis\.AuraMemoryGuard/);

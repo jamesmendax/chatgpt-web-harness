@@ -247,13 +247,27 @@ export function checkDependencies(packageRoot: string): DependencyCheckResult {
   return { warnings };
 }
 
+const isValidSkillId = (value: string | undefined): value is string => {
+  if (!value) return false;
+  try { validateSkillId(value); return true; } catch { return false; }
+};
+const skillIdSlug = (value: string | undefined): string | undefined => value
+  ?.toLowerCase().replace(/[^a-z0-9._-]+/g, "-").replace(/^[-._]+/, "").replace(/[-. ]+$/, "").slice(0, 64) || undefined;
+
 export function deriveSkillId(packageRoot: string, sourceRoot: string, skillText: string): string {
   const frontmatter = parseSkillFrontmatter(skillText);
   let base = path.basename(packageRoot === sourceRoot ? sourceRoot : packageRoot);
   if (frontmatter.name && base !== frontmatter.name) {
     base = base.replace(/-(?:main|master|v\d+(?:\.\d+){0,2}(?:-[0-9A-Za-z.]+)?)$/i, "");
   }
-  return base;
+  // A zip whose SKILL.md sits at its root extracts into ".staging-extract-<hex>",
+  // and a folder named "MySkill" has capitals: neither is a valid ID, so both
+  // used to be refused. Fall back to the lowercased folder, then SKILL.md's name.
+  const staging = /^\.staging-/i.test(base);
+  const candidates = staging
+    ? [frontmatter.name, skillIdSlug(frontmatter.name)]
+    : [base, base.toLowerCase(), frontmatter.name, skillIdSlug(frontmatter.name), skillIdSlug(base)];
+  return candidates.find(isValidSkillId) ?? base;
 }
 
 export interface SkillPackageInspection {

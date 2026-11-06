@@ -27,7 +27,10 @@ if (!['root','desktop'].includes(mode)) throw new Error('Expected root or deskto
 const runRoot = fs.mkdtempSync(path.join(taskRoot, `${mode}-`));
 const workspace = path.join(runRoot, 'workspace');
 const runtime = path.join(runRoot, 'runtime');
-for (const dir of [workspace, runtime, path.join(runtime,'profiles')]) fs.mkdirSync(dir,{recursive:true});
+const privateTemp = path.join(runRoot, 'tmp');
+const privateAppData = path.join(runtime, 'appdata');
+const privateLocalAppData = path.join(runtime, 'localappdata');
+for (const dir of [workspace, runtime, path.join(runtime,'profiles'), privateTemp, privateAppData, privateLocalAppData]) fs.mkdirSync(dir,{recursive:true});
 fs.writeFileSync(path.join(runRoot,'empty.env'),'# No production environment\n');
 fs.writeFileSync(path.join(runtime,'profiles','plugins.json'), JSON.stringify({schema_version:2,computer_use:{enabled:false},skills:[]}));
 fs.writeFileSync(path.join(runtime,'profiles','mcp-upstream.json'), JSON.stringify({version:1,servers:[]}));
@@ -37,6 +40,7 @@ for(const [key,value] of Object.entries(process.env)) if(allowed.test(key)) env[
 for(const key of Object.keys(env)) if(key.toLowerCase()==='path') delete env[key];
 env.PATH = 'C:\\Windows\\System32;C:\\Windows;C:\\Windows\\System32\\WindowsPowerShell\\v1.0;C:\\Program Files\\nodejs;C:\\Program Files\\Git\\cmd;' + (process.env.PATH || process.env.Path || '');
 Object.assign(env, {
+  TEMP:privateTemp, TMP:privateTemp, APPDATA:privateAppData, LOCALAPPDATA:privateLocalAppData,
   HOST:'127.0.0.1', WORKSPACE_PATH:workspace, FULL_DISK_ACCESS:'false',
   CODEX_HOME:path.join(runtime,'.codex'), MCP_SHELL_STATE_DIR:path.join(runtime,'.mcp-state'),
   AUDIT_LOG_PATH:path.join(runtime,'audit.log'), CHECKPOINT_PATH:path.join(runtime,'checkpoints'),
@@ -75,6 +79,9 @@ async function run(label,args,cwd,timeoutMs) {
     const receipts=fs.readFileSync(log,'utf8').split(/\r?\n/).filter(line=>line.startsWith('TEST_RECEIPT ')).map(line=>JSON.parse(line.slice('TEST_RECEIPT '.length)));
     if(receipts.length!==fullTests.length || receipts.some((receipt,index)=>receipt.test!==fullTests[index] || receipt.exit_code!==0)) throw new Error('Root test receipts do not match the mandatory full manifest');
     row.tests=receipts;
+  }
+  if(label==='desktop-all' && row.passed) {
+    row.components=require('../desktop/scripts/lib/electron-test-completion.cjs').verifyDesktopCompletionLog(fs.readFileSync(log,'utf8'));
   }
   results.push(row);
   fs.writeFileSync(path.join(runRoot,'results.json'),JSON.stringify({mode,source_sha256:before.sha256,results,complete:false},null,2));

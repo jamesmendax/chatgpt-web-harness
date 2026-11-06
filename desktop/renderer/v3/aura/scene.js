@@ -288,6 +288,9 @@ void main() {
     let program = null, buffer = null, ready = false, disposed = false, compileTimer = 0;
     let observer = null, frozen = null, cssWidth = 1, cssHeight = 1, sizeDirty = true;
     const started = performance.now();
+    // Shader time is float32: after ~3 days its step exceeds a frame. The
+    // owner restarts this base where the jump is invisible (see rebase).
+    let clockBase = started;
     let draws = 0, resizes = 0;
     const attempt = fn => { try { fn(); } catch (_) {} };
     const onResize = () => { sizeDirty = true; };
@@ -295,7 +298,10 @@ void main() {
       if (disposed) return;
       event.preventDefault?.();
       dispose();
-      global.AuraMemoryGuard?.disable();
+      // A lost context is usually transient (GPU process restart, driver
+      // reset, sleep/resume); the owner decides whether to rebuild one.
+      const guard = global.AuraMemoryGuard;
+      if (guard?.contextLost) guard.contextLost(); else guard?.disable();
     };
     function dispose() {
       if (disposed) return;
@@ -363,7 +369,13 @@ void main() {
       max: MAXM,
       whenReady(fn) { if (disposed) return () => {}; if (ready) fn(); else pendingReady.add(fn); return () => pendingReady.delete(fn); },
       freeze(t) { frozen = t; },
-      stats: () => ({ ready, disposed, draws, resizes, pixels: canvas.width * canvas.height, pending: pendingReady.size, compilePending: !!compileTimer }),
+      clock: () => (performance.now() - clockBase) / 1000,
+      rebase(limit = 0) {
+        if (disposed || (performance.now() - clockBase) / 1000 <= limit) return false;
+        clockBase = performance.now();
+        return true;
+      },
+      stats: () => ({ ready, disposed, draws, resizes, pixels: canvas.width * canvas.height, pending: pendingReady.size, compilePending: !!compileTimer, clock: (performance.now() - clockBase) / 1000 }),
       draw(s) {
         if (!ready || disposed || gl.isContextLost?.()) return false;
         if (sizeDirty || !observer) { cssWidth=Math.max(1,canvas.clientWidth); cssHeight=Math.max(1,canvas.clientHeight); sizeDirty=false; }
@@ -389,7 +401,7 @@ void main() {
         gl.uniform1f(uniform("uUltra"),ultra ? 1 : 0);
         gl.uniform4fv(uniform("uMotion"),s.motion?.values || quietMotion);
         gl.uniform4fv(uniform("uOrbit"),s.motion?.orbit || quietOrbit);
-        const clock = frozen != null ? frozen : ultra && s.motion ? s.motion.orbit[2] : (performance.now()-started)/1000;
+        const clock = frozen != null ? frozen : ultra && s.motion ? s.motion.orbit[2] : (performance.now()-clockBase)/1000;
         gl.uniform1f(uniform("uTime"),clock*(visual?.speed ?? 1));
         gl.uniform1f(uniform("uCurtainTime"),clock);
         gl.uniform1f(uniform("uOn"),s.on);gl.uniform1f(uniform("uActive"),s.active);gl.uniform1f(uniform("uPulse"),s.pulse);gl.uniform1f(uniform("uDim"),s.dim);gl.uniform1f(uniform("uNight"),s.night||0);

@@ -1,214 +1,147 @@
+import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-
-if (process.platform !== "win32") {
-  console.log("office-visual-review: SKIP (Windows Office automation is unavailable)");
-  process.exit(0);
-}
+import { createOfficeFixtures } from "./lib/office-test-fixtures.mjs";
+import { runOfficeContracts, runOfficePowerShell } from "./lib/office-test-contracts.mjs";
+import { officePixelWitness } from "./lib/office-test-pixels.mjs";
 
 process.env.CHATGPT_TOOL_PROFILE = "slim";
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const root = path.resolve(__dirname, "..");
-const tmpRoot = path.join(root, ".tool-test-tmp", "office-visual-review");
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const evidenceBase = process.env.OFFICE_TEST_EVIDENCE_DIR || path.join(root, ".tool-test-tmp");
+await fs.mkdir(evidenceBase, { recursive: true });
+const tmpRoot = await fs.mkdtemp(path.join(evidenceBase, "office-visual-review-"));
 const workspace = path.join(tmpRoot, "workspace");
+const processTemp = path.join(tmpRoot, "temp");
+await fs.mkdir(processTemp);
+process.env.TEMP = processTemp;
+process.env.TMP = processTemp;
 process.env.CODEX_HOME = path.join(tmpRoot, "codex-home");
-let powerShellSequence = 0;
-
-function runPowerShell(script, timeoutMs = 90_000) {
-  const scriptPath = path.join(tmpRoot, `office-fixture-${process.pid}-${++powerShellSequence}.ps1`);
-  return fs.writeFile(scriptPath, script, "utf8").then(() => new Promise((resolve, reject) => {
-    const child = spawn("powershell.exe", ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", scriptPath], {
-      windowsHide: true,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    let stdout = "";
-    let stderr = "";
-    const timer = setTimeout(() => {
-      child.kill();
-      reject(new Error(`PowerShell timeout after ${timeoutMs}ms`));
-    }, timeoutMs);
-    child.stdout.on("data", (chunk) => { stdout += chunk.toString(); });
-    child.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
-    child.on("error", (error) => {
-      clearTimeout(timer);
-      void fs.rm(scriptPath, { force: true });
-      reject(error);
-    });
-    child.on("close", (code) => {
-      clearTimeout(timer);
-      void fs.rm(scriptPath, { force: true });
-      if (code === 0) resolve(stdout.trim());
-      else reject(new Error(`PowerShell exit ${code}\nstdout: ${stdout.trim()}\nstderr: ${stderr.trim()}`));
-    });
-  }));
-}
-
-async function processIds(name) {
-  const raw = await runPowerShell(`(Get-Process ${name} -ErrorAction SilentlyContinue).Id -join ','`, 10_000).catch(() => "");
-  return String(raw).split(",").map((value) => Number.parseInt(value, 10)).filter(Number.isFinite);
-}
-
-async function cleanupNewProcesses(name, before) {
-  const old = new Set(before);
-  for (const pid of await processIds(name)) {
-    if (!old.has(pid)) {
-      await runPowerShell(`Stop-Process -Id ${pid} -Force -ErrorAction SilentlyContinue`, 10_000).catch(() => undefined);
-    }
-  }
-}
-
-function psQuote(value) {
-  return `'${String(value).replaceAll("'", "''")}'`;
-}
-
-function data(result) {
-  if (!result?.structuredContent?.ok) throw new Error(JSON.stringify(result?.structuredContent || result));
-  return result.structuredContent.data;
-}
-
-function imageBlocks(result) {
-  return (result.content || []).filter((block) => block.type === "image");
-}
+const runtimeRoot = process.env.OFFICE_TEST_RUNTIME_ROOT || root;
+const receipt = { test: "office-visual-review", evidence: tmpRoot, contracts: null, guards: {}, native: {}, native_complete: false, passed: false };
 
 const TEST_INTENT = JSON.stringify({
   intent_revision: 1,
   objective: "Exercise isolated Office visual-review rendering fixtures",
-  scope: ["temporary PowerPoint/Word fixture files and test-owned Office processes"],
-  out_of_scope: ["pre-existing user Office sessions"],
-  deliverables: ["Office render pixels and safety-guard assertions"],
-  success_criteria: ["test-owned Office documents render while existing user sessions remain protected"],
-  constraints: [], protected_resources: ["any Office process that existed before this test"],
-  known_facts: ["fixture files are confined to tmpRoot"],
-  assumptions: [], delegated_decisions: [], remaining_nonblocking_uncertainties: [],
-  closure_items: [], ambiguities: [], clarification_round: 0, questions_in_round: 0,
-  resolution_mode: "none",
+  scope: ["unique temporary Office fixture files and explicitly owned private-desktop processes"],
+  out_of_scope: ["user Office sessions", "global Office settings", "system input and clipboard"],
+  deliverables: ["Office render pixels and process-lifetime safety assertions"],
+  success_criteria: ["native rendering binds only an explicitly launched process and preserves other processes"],
+  constraints: [], protected_resources: ["all processes outside the exact owned Office Job"],
+  known_facts: ["fixture construction uses OOXML ZIP only"], assumptions: [], delegated_decisions: [],
+  remaining_nonblocking_uncertainties: [], closure_items: [], ambiguities: [], clarification_round: 0,
+  questions_in_round: 0, resolution_mode: "none",
 });
 
-function callVisualReview(arguments_) {
-  return client.callTool({
-    name: "visual_review",
-    arguments: { ...arguments_, _intent: TEST_INTENT },
-  });
+async function inspectOfficeProcesses(name) {
+  const result = await runOfficePowerShell(`$ErrorActionPreference='Stop'\n@((Get-Process ${name} -ErrorAction SilentlyContinue)|ForEach-Object{@{pid=$_.Id;started=$_.StartTime.ToUniversalTime().ToString('o')}})|ConvertTo-Json -Compress`, tmpRoot, `inspect-${name}-${Date.now()}`, 10_000);
+  const parsed = result.stdout ? JSON.parse(result.stdout) : [];
+  return Array.isArray(parsed) ? parsed : [parsed];
 }
 
-await fs.rm(tmpRoot, { recursive: true, force: true });
-await fs.mkdir(workspace, { recursive: true });
-
-const beforePowerPoint = await processIds("POWERPNT");
-const beforeWord = await processIds("WINWORD");
-let server;
-let client;
-
-try {
-  const { createMcpServer } = await import("../dist/server-factory.js");
-  server = createMcpServer(workspace, 30_000, [workspace], true);
-  client = new Client({ name: "office-visual-review-test", version: "1" });
-  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
-  await server.connect(serverTransport);
-  await client.connect(clientTransport);
-
-  if (beforePowerPoint.length === 0) {
-    const pptxPath = path.join(workspace, "sample.pptx");
-    try {
-      await runPowerShell(`
-$ErrorActionPreference='Stop'
-$app=$null;$presentation=$null
-try {
-  $app=New-Object -ComObject PowerPoint.Application
-  $presentation=$app.Presentations.Add()
-  $slide=$presentation.Slides.Add(1,12)
-  $shape=$slide.Shapes.AddTextbox(1,90,80,760,130)
-  $shape.TextFrame.TextRange.Text='Universal Visual Review'
-  $shape.TextFrame.TextRange.Font.Size=34
-  $panel=$slide.Shapes.AddShape(1,100,240,700,220)
-  $panel.Fill.ForeColor.RGB=0x55AA33
-  $presentation.SaveAs(${psQuote(pptxPath)},24)
-} finally {
-  # Some Office builds disconnect the COM presentation object after SaveAs;
-  # teardown errors are non-fatal only because the exported file is verified below.
-  if($presentation){try{$presentation.Close()}catch{}}
-  if($app){try{$app.Quit()}catch{}}
-}`, 90_000);
-      const pptxStat = await fs.stat(pptxPath);
-      if (!pptxStat.isFile() || pptxStat.size === 0) throw new Error("PowerPoint COM export is missing or empty");
-      await new Promise((resolve) => setTimeout(resolve, 500));
-      await cleanupNewProcesses("POWERPNT", beforePowerPoint);
-      const reviewed = await callVisualReview({ target: pptxPath, pages: [1], width: 1200, height: 675, timeout_ms: 90_000 });
-      const reviewedData = data(reviewed);
-      if (reviewedData.kind !== "pptx" || reviewedData.page_paths.length !== 1 || imageBlocks(reviewed).length < 1) {
-        throw new Error("PowerPoint visual review did not return a rendered slide");
-      }
-      console.log("OK PowerPoint COM export -> visual_review pixels");
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      if (/invalid class string|class not registered|cannot create activex/i.test(message)) {
-        console.log(`office-visual-review: SKIP PowerPoint (${message.slice(0, 160)})`);
-      } else {
-        throw error;
-      }
-    } finally {
-      await cleanupNewProcesses("POWERPNT", beforePowerPoint);
-    }
-  } else {
-    console.log("office-visual-review: SKIP PowerPoint (user PowerPoint session is already running)");
-  }
-
-  if (beforeWord.length > 0) {
-    const docxPath = path.join(workspace, "busy-word.docx");
-    await fs.writeFile(docxPath, Buffer.from("not opened because the safety guard runs first"));
-    const refused = await callVisualReview({ target: docxPath, timeout_ms: 20_000 });
-    if (refused.structuredContent?.ok !== false || !JSON.stringify(refused).includes("WINWORD is already running")) {
-      throw new Error("DOCX visual review did not protect the existing Word session");
-    }
-    console.log("OK Word safety guard refused to attach to an existing user session");
-  } else {
-    const docxPath = path.join(workspace, "sample.docx");
-    try {
-      await runPowerShell(`
-$ErrorActionPreference='Stop'
-$app=$null;$document=$null
-try {
-  $app=New-Object -ComObject Word.Application
-  $app.Visible=$false
-  $app.DisplayAlerts=0
-  $document=$app.Documents.Add()
-  $document.Content.Text='Universal Visual Review' + [Environment]::NewLine + 'Word page rendering evidence.'
-  $document.SaveAs2(${psQuote(docxPath)},16)
-} finally {
-  if($document){try{$document.Close($false)}catch{}}
-  if($app){try{$app.Quit()}catch{}}
-}`, 90_000);
-      const docxStat = await fs.stat(docxPath);
-      if (!docxStat.isFile() || docxStat.size === 0) throw new Error("Word COM export is missing or empty");
-      await new Promise((resolve) => setTimeout(resolve, 500));
-      await cleanupNewProcesses("WINWORD", beforeWord);
-      const reviewed = await callVisualReview({ target: docxPath, pages: [1], width: 1000, height: 1000, timeout_ms: 90_000 });
-      const reviewedData = data(reviewed);
-      if (reviewedData.kind !== "docx" || reviewedData.page_paths.length !== 1 || imageBlocks(reviewed).length < 1) {
-        throw new Error("Word visual review did not return a rendered page");
-      }
-      console.log("OK Word COM -> PDF -> visual_review pixels");
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      if (/invalid class string|class not registered|cannot create activex/i.test(message)) {
-        console.log(`office-visual-review: SKIP Word (${message.slice(0, 160)})`);
-      } else {
-        throw error;
-      }
-    } finally {
-      await cleanupNewProcesses("WINWORD", beforeWord);
-    }
-  }
-} finally {
-  await client?.close().catch(() => undefined);
-  await server?.close().catch(() => undefined);
-  await cleanupNewProcesses("POWERPNT", beforePowerPoint);
-  await cleanupNewProcesses("WINWORD", beforeWord);
-  await fs.rm(tmpRoot, { recursive: true, force: true });
+function reviewData(result) {
+  if (!result?.structuredContent?.ok) throw new Error(JSON.stringify(result?.structuredContent || result));
+  return result.structuredContent.data;
 }
 
-console.log("office-visual-review: Office rendering/safety behavior OK");
+async function assertNativePixels(result, kind, sourcePath) {
+  const data = reviewData(result);
+  assert.equal(data.kind, kind);
+  assert.equal(data.page_paths.length, 1);
+  assert.equal(result.content[0]?.type, "image");
+  const blocks = result.content.filter(block => block.type === "image");
+  assert.ok(blocks.length >= 1);
+  const bytes = await fs.readFile(data.page_paths[0]);
+  assert.ok(bytes.length > 2000, "Native Office returned an empty/trivial image");
+  assert.equal(bytes.subarray(0, 8).toString("hex"), "89504e470d0a1a0a");
+  assert.ok(bytes.readUInt32BE(16) >= 320 && bytes.readUInt32BE(20) >= 240);
+  assert.ok(blocks.some(block => Buffer.from(block.data, "base64").equals(bytes)), "Returned pixels do not match the actual rendered page");
+  const pixels = officePixelWitness(bytes, kind);
+  assert.match(String(data.renderer), kind === "pptx" ? /powerpoint/i : /word/i);
+  const ownershipPath = path.join(path.dirname(kind === "pptx" ? path.dirname(data.page_paths[0]) : data.diagnostics.exported_pdf), "office-process.json");
+  const ownership = JSON.parse(await fs.readFile(ownershipPath, "utf8"));
+  assert.equal(ownership.ownership, "explicit-process-private-desktop-job");
+  assert.equal(ownership.binding, "exact-owned-window-and-input-copy");
+  assert.equal(ownership.status, "closed");
+  assert.equal(ownership.result, "rendered");
+  const sourceBytes = await fs.readFile(sourcePath);
+  return { status: "passed", renderer: data.renderer, page: data.page_paths[0], ownership, pixels, png_sha256: createHash("sha256").update(bytes).digest("hex"), source_sha256: createHash("sha256").update(sourceBytes).digest("hex"), width: bytes.readUInt32BE(16), height: bytes.readUInt32BE(20) };
+}
+
+let client, server;
+try {
+  const fixtures = await createOfficeFixtures(workspace);
+  receipt.contracts = await runOfficeContracts(root, tmpRoot);
+  console.log("OK deterministic OOXML fixtures and exact owned-process lifetime contracts");
+  if (process.argv.includes("--contracts-only") || process.platform !== "win32") {
+    receipt.native = { pptx: { status: "not_exercised" }, docx: { status: "not_exercised" } };
+    receipt.passed = true;
+  } else {
+    const { createMcpServer } = await import(pathToFileURL(path.join(runtimeRoot, "dist/server-factory.js")).href);
+    server = createMcpServer(workspace, 30_000, [workspace], true);
+    client = new Client({ name: "office-visual-review-test", version: "2" });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await server.connect(serverTransport); await client.connect(clientTransport);
+
+    const requestedKind = process.argv.find(value => value.startsWith("--kind="))?.slice(7);
+    if (requestedKind && !["pptx", "docx"].includes(requestedKind)) throw new Error("--kind must be pptx or docx");
+    for (const [kind, name, sourcePath, dimensions] of [
+      ["pptx", "POWERPNT", fixtures.pptxPath, { width: 1200, height: 675 }],
+      ["docx", "WINWORD", fixtures.docxPath, { width: 1000, height: 1000 }],
+    ]) {
+      if (requestedKind && requestedKind !== kind) { receipt.native[kind] = { status: "not_exercised" }; continue; }
+      const guardDirectory = path.join(tmpRoot, `guard-${name}`);
+      await fs.mkdir(guardDirectory);
+      const guardExecutable = path.join(guardDirectory, `${name}.EXE`);
+      await fs.copyFile(path.join(tmpRoot, "office-test-host.exe"), guardExecutable);
+      const guardProcess = spawn(guardExecutable, [], { windowsHide: true, stdio: "ignore" });
+      await new Promise((resolve, reject) => { guardProcess.once("spawn", resolve); guardProcess.once("error", reject); });
+      try {
+        const guarded = await client.callTool({ name: "visual_review", arguments: { target: sourcePath, timeout_ms: 20_000, _intent: TEST_INTENT } });
+        assert.equal(guarded.structuredContent?.ok, false);
+        assert.ok(JSON.stringify(guarded).includes(`${name} is already running`));
+        assert.equal(guardProcess.exitCode, null, "Renderer terminated the existing process used to exercise its safety guard");
+        receipt.guards[kind] = { status: "passed", coverage: "real process guard with test-owned non-Office executable", process_pid: guardProcess.pid };
+      } finally {
+        guardProcess.kill();
+        await new Promise(resolve => { if (guardProcess.exitCode !== null) resolve(); else guardProcess.once("close", resolve); });
+      }
+      if (process.argv.includes("--guards-only")) { receipt.native[kind] = { status: "not_exercised" }; continue; }
+      const before = await inspectOfficeProcesses(name);
+      if (before.length === 0) {
+        const memory = await runOfficePowerShell("$ErrorActionPreference='Stop'\n(Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory", tmpRoot, `memory-${kind}`, 10_000);
+        const freeKiB = Number(memory.stdout);
+        assert.ok(Number.isFinite(freeKiB) && freeKiB >= 2_621_440, `OFFICE_NATIVE_NOT_STARTED: ${kind} requires 2560 MiB free physical memory; observed ${freeKiB} KiB`);
+      }
+      const sourceHash = createHash("sha256").update(await fs.readFile(sourcePath)).digest("hex");
+      const result = await client.callTool({ name: "visual_review", arguments: { target: sourcePath, pages: [1], ...dimensions, timeout_ms: 90_000, _intent: TEST_INTENT } });
+      if (before.length > 0) {
+        assert.equal(result.structuredContent?.ok, false);
+        assert.ok(JSON.stringify(result).includes(`${name} is already running`), "Renderer did not protect an existing Office session");
+        const after = await inspectOfficeProcesses(name);
+        for (const previous of before) assert.ok(after.some(current => current.pid === previous.pid && current.started === previous.started), "Existing Office process identity was lost");
+        receipt.native[kind] = { status: "protected_existing_session", native_rendering: "not_exercised" };
+        console.log(`OK ${name} existing-session guard; native ${kind} coverage remains pending`);
+      } else {
+        receipt.native[kind] = await assertNativePixels(result, kind, sourcePath);
+        assert.equal(createHash("sha256").update(await fs.readFile(sourcePath)).digest("hex"), sourceHash, "Office changed the source fixture");
+        console.log(`OK ${kind} actual Office -> visual_review pixels`);
+      }
+    }
+    receipt.native_complete = Object.values(receipt.native).every(value => value.status === "passed");
+    receipt.passed = true;
+  }
+} catch (error) {
+  receipt.error = error instanceof Error ? error.stack : String(error);
+  throw error;
+} finally {
+  await client?.close().catch(() => undefined); await server?.close().catch(() => undefined);
+  await fs.writeFile(path.join(tmpRoot, "receipt.json"), JSON.stringify(receipt, null, 2));
+  console.log(`OFFICE_TEST_RECEIPT ${JSON.stringify(receipt)}`);
+}
+
+console.log(receipt.native_complete ? "office-visual-review: native Office rendering and safety PASS" : "office-visual-review: safety contracts PASS; native Office acceptance not complete (see receipt)");

@@ -21,6 +21,7 @@ import {
 } from "./lib/mcp-session-manager.js";
 import { initUpstreamManager } from "./lib/mcp-upstream-manager.js";
 import { startAdminServer } from "./admin/server.js";
+import { createBrowserRequestGuard } from "./lib/browser-request-guard.js";
 import {
   activityConversationId,
   logMcpHttpEvent,
@@ -166,6 +167,8 @@ const sessionManager = createSessionManager({
 });
 
 const app = express();
+// Before CORS: a refused DNS-rebinding request must not run at all.
+app.use(createBrowserRequestGuard((origin) => MCP_CORS_ALLOW_ALL || MCP_CORS_ORIGINS.has(origin), "MCP"));
 app.use(cors({
   origin(origin, callback) {
     if (!origin || MCP_CORS_ALLOW_ALL || MCP_CORS_ORIGINS.has(origin)) {

@@ -4,12 +4,14 @@ import fs from "node:fs";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { createIsolatedTestEnv } from "./lib/isolated-test-env.mjs";
 // These sources exercise retired product contracts. Keep them for historical
 // reproduction; current direct-execution and shared-safety coverage is below.
 export const historicalTests = Object.freeze([
   // v3.2 retires readiness-score and _intent-reference admission; test-v32-execution.ts
   // covers direct execution, legacy metadata tolerance, operation dedupe and account isolation.
   "scripts/test-requirement-readiness.mjs", "scripts/test-intent-reference.mjs",
+  "scripts/test-recovery-non-mcp-ingress.mjs",
   // v3.2 replaces the retired numeric/order/iteration visual gates with test-v32-visual.ts.
   "scripts/test-visual-review.mjs",
   "scripts/test-relay-goal-scope.mjs", "scripts/test-relay-foundation.mjs",
@@ -21,6 +23,9 @@ export const historicalTests = Object.freeze([
 ]);
 export const fullTests = Object.freeze([
   "scripts/test-v32-execution.ts",
+  "scripts/test-v32-defect-repairs.mjs",
+  "scripts/test-v32-oauth-isolation.mjs",
+  "scripts/test-v32-session-lifecycle.mjs",
   "scripts/test-v32-identity.ts",
   "scripts/test-v32-skills.mjs",
   "scripts/test-v32-tooling.ts",
@@ -112,6 +117,11 @@ export const fullTests = Object.freeze([
   "scripts/test-gateway-goal-isolation.mjs",
   "scripts/test-mcp-outcome-log.mjs",
   "scripts/test-mcp-outcome-correlation.mjs",
+  "scripts/test-mcp-final-outcome.mjs",
+  "scripts/test-context-broker-bounded.mjs",
+  "scripts/test-harness-events-bounded.mjs",
+  "scripts/test-atomic-edits.mjs",
+  "scripts/test-process-output-backpressure.mjs",
   "scripts/test-recovery-v2.mjs",
   "scripts/test-process-recovery.mjs",
   "scripts/test-process-goal-scope.mjs",
@@ -158,7 +168,15 @@ export const fullTests = Object.freeze([
   "desktop/scripts/test-ipc-source.cjs"
 ]);
 export const dailyTests = Object.freeze([
+  "scripts/test-mcp-final-outcome.mjs",
+  "scripts/test-context-broker-bounded.mjs",
+  "scripts/test-harness-events-bounded.mjs",
+  "scripts/test-atomic-edits.mjs",
+  "scripts/test-process-output-backpressure.mjs",
   "scripts/test-v32-execution.ts",
+  "scripts/test-v32-defect-repairs.mjs",
+  "scripts/test-v32-oauth-isolation.mjs",
+  "scripts/test-v32-session-lifecycle.mjs",
   "scripts/test-v32-identity.ts",
   "scripts/test-v32-skills.mjs",
   "scripts/test-v32-process.mjs",
@@ -232,9 +250,10 @@ const sourceTypeScriptTests = new Set([
   "scripts/test-retired-relay-compat.mjs",
 ]);
 export function nodeArgs(test) { return sourceTypeScriptTests.has(test) ? ["--import", "tsx", path.join(root,test)] : [path.join(root,test)]; }
-export async function runTest(test, env = {}) {
+export async function runTest(test, env = {}, options = {}) {
+  const fixture = await createIsolatedTestEnv(path.basename(test), env);
   return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, nodeArgs(test), { cwd: root, env: {...process.env,...env}, stdio: "inherit" });
+    const child = spawn(process.execPath, [...nodeArgs(test), ...(options.args || [])], { cwd: root, env: fixture.env, windowsHide: true, stdio: "inherit" });
     child.once("error", reject);
     child.once("close", code => code === 0 ? resolve() : reject(new Error(`${test} exit ${code}`)));
   });

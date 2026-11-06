@@ -7,6 +7,7 @@ import { promisify } from "node:util";
 import { pathToFileURL } from "node:url";
 import { chromium, type Browser, type BrowserServer, type Page } from "playwright-core";
 import { closeOwnedBrowserServer } from "./owned-browser-cleanup.js";
+import { privateOfficeAutomationScript } from "./visual-review-office.js";
 import { validatePath } from "./path-security.js";
 import {
   fileSignature,
@@ -1023,25 +1024,8 @@ async function officeProcessIds(processName: "WINWORD" | "POWERPNT"): Promise<nu
       { windowsHide: true, timeout: 5000, maxBuffer: 64 * 1024 }
     );
     return stdout.trim().split(",").map((value) => Number.parseInt(value, 10)).filter(Number.isFinite);
-  } catch {
-    return [];
-  }
-}
-
-async function terminateProcessTree(pid: number): Promise<void> {
-  if (!Number.isFinite(pid) || pid <= 0) return;
-  if (process.platform === "win32") {
-    await execFileAsync("taskkill", ["/PID", String(pid), "/T", "/F"], { windowsHide: true, timeout: 5000 }).catch(() => undefined);
-  } else {
-    try { process.kill(-pid, "SIGKILL"); } catch {}
-  }
-}
-
-async function cleanupNewOfficeProcesses(processName: "WINWORD" | "POWERPNT", before: number[]): Promise<void> {
-  const previous = new Set(before);
-  const after = await officeProcessIds(processName);
-  for (const pid of after) {
-    if (!previous.has(pid)) await terminateProcessTree(pid);
+  } catch (error) {
+    throw new Error(`OFFICE_PROCESS_INSPECTION_FAILED: Cannot safely inspect ${processName}`, { cause: error });
   }
 }
 
@@ -1058,17 +1042,16 @@ async function runPowerShellScript(
     throw new Error(`${officeProcessName} is already running. Safe Office rendering was skipped to avoid touching the user's open Office session. Close it or set allow_office_running=true.`);
   }
   let child: ReturnType<typeof spawn> | undefined;
-  const abort = async (): Promise<void> => {
-    await terminateProcessTree(child?.pid || 0);
-    await cleanupNewOfficeProcesses(officeProcessName, before);
-  };
+  // ChildProcess retains the exact PowerShell process handle on Windows.
+  // Closing that helper also closes its private Office kill-on-close job.
+  const abort = (): void => { child?.kill(); };
   return withVisualDeadline(
     "Office renderer",
     deadline,
     () => new Promise((resolve, reject) => {
       child = spawn(
         "powershell.exe",
-        ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", scriptPath, ...args],
+        ["-NoProfile", "-NonInteractive", "-Sta", "-ExecutionPolicy", "Bypass", "-File", scriptPath, ...args],
         { windowsHide: true, stdio: ["ignore", "pipe", "pipe"] }
       );
       let stdout = "";
@@ -1076,21 +1059,19 @@ async function runPowerShellScript(
       let settled = false;
       child.stdout?.on("data", (chunk: Buffer) => { stdout = (stdout + chunk.toString()).slice(-100000); });
       child.stderr?.on("data", (chunk: Buffer) => { stderr = (stderr + chunk.toString()).slice(-100000); });
-      child.on("error", async (error) => {
+      child.on("error", (error) => {
         if (settled) return;
         settled = true;
-        await cleanupNewOfficeProcesses(officeProcessName, before);
         reject(error);
       });
-      child.on("close", async (code) => {
+      child.on("close", (code) => {
         if (settled) return;
         settled = true;
-        await cleanupNewOfficeProcesses(officeProcessName, before);
         if (code === 0) resolve({ stdout: stdout.trim(), stderr: stderr.trim() });
-        else reject(new Error(stderr.trim() || stdout.trim() || `Office renderer exited with code ${code}`));
+        else reject(new Error([stderr.trim(), stdout.trim()].filter(Boolean).join("\n") || `Office renderer exited with code ${code}`));
       });
     }),
-    () => { void abort().catch(() => undefined); }
+    abort
   );
 }
 
@@ -1104,31 +1085,21 @@ async function exportPptx(
 ): Promise<string[]> {
   const slideDir = path.join(outputDir, "slides");
   await fs.mkdir(slideDir, { recursive: true });
+  const isolatedInput = path.join(outputDir, `office-input-${randomUUID()}.pptx`);
+  await fs.copyFile(sourcePath, isolatedInput);
   const scriptPath = path.join(outputDir, "export-pptx.ps1");
-  await fs.writeFile(scriptPath, String.raw`param([string]$InputPath,[string]$OutputDir,[int]$Width,[int]$Height)
-$ErrorActionPreference='Stop'
-$app=$null
-$presentation=$null
-try {
-  $app=New-Object -ComObject PowerPoint.Application
-  $presentation=$app.Presentations.Open($InputPath,$true,$true,$false)
-  New-Item -ItemType Directory -Force $OutputDir | Out-Null
-  $presentation.Export($OutputDir,'PNG',$Width,$Height)
-} finally {
-  if($presentation){$presentation.Close()}
-  if($app){$app.Quit()}
-}
-`, "utf-8");
+  await fs.writeFile(scriptPath, privateOfficeAutomationScript, "utf-8");
   try {
     await runPowerShellScript(
       scriptPath,
-      ["-InputPath", sourcePath, "-OutputDir", slideDir, "-Width", String(width), "-Height", String(height)],
+      ["-InputPath", isolatedInput, "-OutputPath", slideDir, "-Kind", "pptx", "-Width", String(width), "-Height", String(height)],
       deadline,
       "POWERPNT",
       allowOfficeRunning
     );
   } finally {
     await fs.rm(scriptPath, { force: true }).catch(() => undefined);
+    await fs.rm(isolatedInput, { force: true }).catch(() => undefined);
   }
   const names = (await fs.readdir(slideDir)).filter((name) => /\.png$/i.test(name));
   names.sort((left, right) => {
@@ -1147,32 +1118,21 @@ async function exportDocxToPdf(
   allowOfficeRunning: boolean
 ): Promise<string> {
   const pdfPath = path.join(outputDir, "document.pdf");
+  const isolatedInput = path.join(outputDir, `office-input-${randomUUID()}.docx`);
+  await fs.copyFile(sourcePath, isolatedInput);
   const scriptPath = path.join(outputDir, "export-docx.ps1");
-  await fs.writeFile(scriptPath, String.raw`param([string]$InputPath,[string]$OutputPdf)
-$ErrorActionPreference='Stop'
-$app=$null
-$document=$null
-try {
-  $app=New-Object -ComObject Word.Application
-  $app.Visible=$false
-  $app.DisplayAlerts=0
-  $document=$app.Documents.Open($InputPath,$false,$true)
-  $document.ExportAsFixedFormat($OutputPdf,17)
-} finally {
-  if($document){$document.Close($false)}
-  if($app){$app.Quit()}
-}
-`, "utf-8");
+  await fs.writeFile(scriptPath, privateOfficeAutomationScript, "utf-8");
   try {
     await runPowerShellScript(
       scriptPath,
-      ["-InputPath", sourcePath, "-OutputPdf", pdfPath],
+      ["-InputPath", isolatedInput, "-OutputPath", pdfPath, "-Kind", "docx"],
       deadline,
       "WINWORD",
       allowOfficeRunning
     );
   } finally {
     await fs.rm(scriptPath, { force: true }).catch(() => undefined);
+    await fs.rm(isolatedInput, { force: true }).catch(() => undefined);
   }
   const stat = await fs.stat(pdfPath).catch(() => null);
   if (!stat?.isFile() || stat.size === 0) throw new Error("Word finished without exporting a PDF");

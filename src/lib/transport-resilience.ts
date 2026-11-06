@@ -107,6 +107,22 @@ function compactDuplicateText(result: CallToolResult): CallToolResult {
   return changed ? { ...result, content } : result;
 }
 
+// Spilled results are each over 6 MiB and were never deleted. The model reads
+// them right after the call; keep a week, and at most the newest 40.
+const SPILL_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+const SPILL_MAX_FILES = 40;
+async function pruneSpilledResults(dir: string): Promise<void> {
+  try {
+    const now = Date.now();
+    const files = (await Promise.all((await fs.readdir(dir)).filter((name) => name.endsWith(".json"))
+      .map(async (name) => ({ file: path.join(dir, name), mtime: (await fs.stat(path.join(dir, name)).catch(() => null))?.mtimeMs ?? 0 }))))
+      .sort((a, b) => b.mtime - a.mtime);
+    for (const [index, entry] of files.entries()) {
+      if (index >= SPILL_MAX_FILES - 1 || now - entry.mtime > SPILL_RETENTION_MS) await fs.rm(entry.file, { force: true }).catch(() => undefined);
+    }
+  } catch { /* pruning never blocks the spill */ }
+}
+
 export interface GuardOptions {
   budget?: number;
   stage?: "handler" | "wire";
@@ -144,6 +160,7 @@ export async function guardToolResult(context: InvocationContext, input: CallToo
   let saved = false;
   try {
     await fs.mkdir(dir, { recursive: true });
+    await pruneSpilledResults(dir);
     await fs.writeFile(file, serialized, { flag: "wx", mode: 0o600 });
     saved = true;
   } catch { /* Never claim that a failed spill is recoverable from this file. */ }

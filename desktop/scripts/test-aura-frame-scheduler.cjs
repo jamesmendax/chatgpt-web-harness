@@ -72,9 +72,13 @@ function events() {
     emit(name, payload) { for (const fn of listeners.get(name) || []) fn(payload); }
   };
 }
-function harness({ reduced = false, still = false, tier = "high" } = {}) {
-  const time = clock(), draws = [], nodes = new Map(), activity = new Map();
-  const document = Object.assign(events(), { hidden: false });
+function harness({ reduced = false, still = false, tier = "high", drawFaults = 0 } = {}) {
+  const time = clock(), draws = [], nodes = new Map(), activity = new Map(), rebases = [];
+  let faults = drawFaults, scenes = 0, clockBase = time.now();
+  const rootClasses = new Set();
+  const document = Object.assign(events(), { hidden: false, documentElement: { dataset: {}, classList: {
+    add: name => rootClasses.add(name), remove: name => rootClasses.delete(name),
+    toggle: (name, on) => (on ? rootClasses.add(name) : rootClasses.delete(name)), contains: name => rootClasses.has(name) } } });
   const windowEvents = events();
   const RM = Object.assign(events(), { matches: reduced });
   const rect = { left: 80, top: 80, width: 160, height: 160, bottom: 240 };
@@ -108,16 +112,25 @@ function harness({ reduced = false, still = false, tier = "high" } = {}) {
     pending: new Set(), activity: [], info: { isolated: true }
   };
   const ui = { view: "workspace", liveKey: "", lastSig: {} };
-  const scene = {
+  const makeScene = () => ({
+    id: ++scenes,
     freeze() {},
-    draw(value) { draws.push({ at: time.now(), ...value }); return true; }
-  };
+    whenReady(fn) { fn(); return () => {}; },
+    clock: () => (time.now() - clockBase) / 1000,
+    rebase(limit = 0) { if ((time.now() - clockBase) / 1000 <= limit) return false; clockBase = time.now(); rebases.push(limit); return true; },
+    draw(value) {
+      if (faults > 0) { faults--; throw new Error("fixture draw fault"); }
+      draws.push({ at: time.now(), ...value }); return true;
+    }
+  });
+  const scene = makeScene();
   const context = {
-    document, RM, ui, scene,
-    AuraQuality: Quality, AuraMotion: Motion, qualityChoice: tier, graphicsBlocked: false, closingGraphics: false,
+    document, RM, ui, scene, console: { error() {} },
+    AuraQuality: Quality, AuraMotion: Motion, qualityChoice: tier, graphicsBlocked: false, graphicsBlockedBy: null, closingGraphics: false,
     curtainChoice: null, curtainEnabled: () => tier === "high" || tier === "ultra",
     currentTier: () => Quality.tiers[tier], motionStopped: () => RM.matches || tier === "static",
-    sceneOwner: { status: () => ({ live: 1 }) },
+    sceneOwner: { status: () => ({ live: context.scene ? 1 : 0, created: scenes }), enable: on => on ? makeScene() : null },
+    renderGraphicsGuard() {}, cancelSceneReady: null,
     params: new URLSearchParams(still ? "still" : ""),
     requestAnimationFrame: time.raf, cancelAnimationFrame: time.cancel,
     setTimeout: time.timeout, clearTimeout: time.cancel,
@@ -139,7 +152,8 @@ function harness({ reduced = false, still = false, tier = "high" } = {}) {
   context.subject.placePresence(true); context.subject.kick();
   return {
     time, draws, document, RM, orb, state, subject: context.subject, tier: Quality.tiers[tier],
-    memoryGuard: context.AuraMemoryGuard,
+    memoryGuard: context.AuraMemoryGuard, context, rebases,
+    setClock: seconds => { clockBase = time.now() - seconds * 1000; },
     emitActivity: payload => activity.get("activity")(payload)
   };
 }
@@ -286,6 +300,63 @@ test("changing reduced-motion preference stops and resumes decorative idle frame
   h.RM.matches = false; h.RM.emit("change");
   h.time.advance(1000);
   assert.ok(h.draws.length > before, "A preference change must wake the scene");
+});
+
+test("a throwing frame never wedges the scheduler; three in a row fall back to the static UI", () => {
+  const once = harness({ drawFaults: 1 });
+  once.time.advance(300);
+  assert.ok(once.draws.length > 0, "the frame after a single fault must still draw");
+  assert.equal(once.memoryGuard.status().blocked, false);
+  assert.equal(once.memoryGuard.status().frameFaults, 0, "a good frame clears the fault streak");
+  once.time.advance(8000);
+  assert.ok(once.time.pending() <= 1, "fault recovery must not add a second frame task");
+  const broken = harness({ drawFaults: 1000 });
+  broken.time.advance(3000);
+  const state = broken.memoryGuard.status();
+  assert.equal(state.blocked, true); assert.equal(state.blockedBy, "frame");
+  assert.equal(broken.time.pending(), 0, "a failing scene must not keep a frame task alive");
+  assert.equal(broken.draws.length, 0);
+});
+
+test("a lost WebGL context is rebuilt; a third loss within ten minutes keeps the static UI", () => {
+  const h = harness();
+  h.time.advance(1000);
+  assert.equal(h.memoryGuard.contextLost(), true);
+  let state = h.memoryGuard.status();
+  assert.equal(state.blocked, false); assert.equal(state.restorePending, true);
+  assert.equal(state.resources.live, 0); assert.equal(h.time.pending(), 1, "only the restore timer remains");
+  h.time.advance(2100);
+  state = h.memoryGuard.status();
+  assert.equal(state.restorePending, false); assert.equal(state.resources.live, 1, "a fresh scene replaces the lost one");
+  const before = h.draws.length;
+  h.time.advance(500);
+  assert.ok(h.draws.length > before, "the rebuilt scene animates");
+  h.memoryGuard.contextLost(); h.time.advance(4100);
+  assert.equal(h.memoryGuard.status().blocked, false, "a second loss is still rebuilt");
+  assert.equal(h.memoryGuard.status().resources.live, 1);
+  h.memoryGuard.contextLost();
+  state = h.memoryGuard.status();
+  assert.equal(state.blocked, true); assert.equal(state.blockedBy, "context"); assert.equal(state.restorePending, false);
+  h.time.advance(10000);
+  assert.equal(h.time.pending(), 0); assert.equal(h.memoryGuard.status().resources.live, 0);
+});
+
+test("float32 shader clocks restart only where the jump cannot be seen", () => {
+  const h = harness();
+  h.time.advance(5000);
+  h.document.hidden = true; h.document.emit("visibilitychange");
+  h.time.advance(10 * 60 * 1000);
+  h.document.hidden = false; h.document.emit("visibilitychange");
+  assert.deepEqual(h.rebases, [], "a short hide keeps the running clock");
+  h.document.hidden = true; h.document.emit("visibilitychange");
+  h.time.advance(2 * 3600 * 1000);
+  h.document.hidden = false; h.document.emit("visibilitychange");
+  assert.deepEqual(h.rebases, [3600], "showing the window restarts a clock that ran while unseen");
+  assert.ok(h.context.scene.clock() < 1);
+  h.time.advance(2000);
+  assert.deepEqual(h.rebases, [3600], "visible frames never restart a young clock");
+  h.setClock(90000); h.subject.kick(); h.time.advance(100);
+  assert.deepEqual(h.rebases, [3600, 86400], "an always-visible window restarts at most once a day");
 });
 
 test("the real scene does not retain the previous drawing buffer", () => {

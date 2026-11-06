@@ -146,9 +146,13 @@ export function processScopeKind(record: ProcessOwnership): ProcessScopeKind {
 export function processScopeMatches(record: ProcessOwnership, scope: CapturedProcessScope): boolean {
   if (!capturedProcessScopes.has(scope)) return false;
   const kind = processScopeKind(record);
-  if (kind === "goal") return scope.scope_kind === "goal" && record.goal_id === scope.goal_id;
-  if (kind === "session") return scope.scope_kind === "session" && record.owner_session_id === scope.owner_session_id;
-  return false;
+  if (kind === "unknown") return false;
+  // The conversation that started a process keeps control of it after it
+  // creates, replaces or finishes a Goal. Other conversations never match;
+  // a verified successor of the same Goal still matches by Goal.
+  const ownerSession = typeof record.owner_session_id === "string" && record.owner_session_id ? record.owner_session_id : null;
+  if (ownerSession && scope.owner_session_id === ownerSession) return true;
+  return kind === "goal" && scope.scope_kind === "goal" && record.goal_id === scope.goal_id;
 }
 
 export async function upsertProcessJournalRecord(

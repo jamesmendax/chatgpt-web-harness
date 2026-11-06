@@ -1,4 +1,5 @@
 import { physicalPromises as fs } from "./physical-fs.js";
+import { constants as fsConstants } from "node:fs";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 
@@ -8,6 +9,17 @@ export interface SafeTextWriteOptions {
   readonly beforePublish?: () => Promise<void>;
   /** Revalidate action authorization under the lock before each publish attempt. */
   readonly beforeCommit?: () => Promise<void>;
+  /** Byte revision read by an edit before it computes the replacement. */
+  readonly expectedRevision?: SafeFileRevision;
+  /** Preserve the source's mode when an edit is published to a new path. */
+  readonly mode?: number;
+}
+
+export interface SafeFileRevision {
+  readonly canonicalPath: string;
+  readonly sha256: string;
+  readonly identity: string;
+  readonly mode: number;
 }
 
 export interface SafeTextWriteResult {
@@ -17,7 +29,7 @@ export interface SafeTextWriteResult {
   readonly created: boolean;
   readonly expected_sha256_checked: boolean;
   readonly create_only_checked: boolean;
-  readonly publish_strategy: "rename_replace" | "link_create";
+  readonly publish_strategy: "rename_replace" | "link_create" | "copy_create";
 }
 
 const sha256 = (value: Buffer | string) => createHash("sha256").update(value).digest("hex");
@@ -40,6 +52,8 @@ interface LockSnapshot {
   readonly owner: LockOwner | null;
 }
 
+const REALPATH_UNSUPPORTED = new Set(["EISDIR", "EPERM", "EINVAL", "ENOTSUP", "EOPNOTSUPP", "ENOSYS", "EACCES", "UNKNOWN"]);
+
 // CodexPro fsOps.ts: canonicalize an existing target or its deepest existing
 // parent so path aliases share a lock. Only ENOENT permits parent traversal.
 async function canonicalTarget(file: string): Promise<string> {
@@ -48,7 +62,12 @@ async function canonicalTarget(file: string): Promise<string> {
   for (;;) {
     try { return path.join(await fs.realpath(current), ...suffix); }
     catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      const code = (error as NodeJS.ErrnoException).code;
+      // Some RAM disks and virtual drives reject the native realpath
+      // (GetFinalPathNameByHandle). Lock the resolved path there instead of
+      // refusing every write; only alias canonicalization is lost.
+      if (code && REALPATH_UNSUPPORTED.has(code)) return path.join(current, ...suffix);
+      if (code !== "ENOENT") throw error;
       const parent = path.dirname(current);
       if (parent === current) throw error;
       suffix.unshift(path.basename(current));
@@ -237,7 +256,43 @@ export async function withCanonicalFileLock<T>(file: string, action: (target: st
   finally { await release(); }
 }
 
-async function readExisting(file: string) {
+export interface CanonicalFileLockScope {
+  /** Publishes only to a target held by this scope, without reacquiring it. */
+  writeBytes(file: string, content: Buffer, options?: SafeTextWriteOptions): Promise<SafeTextWriteResult>;
+}
+
+/** Moves hold both source and destination in a stable order. Canonical aliases
+ * are deduplicated so a scope never waits on its own per-file lock. */
+export async function withCanonicalFileLocks<T>(files: readonly string[], action: (scope: CanonicalFileLockScope) => Promise<T>): Promise<T> {
+  const targets = new Map<string, string>();
+  for (const file of files) {
+    const target = await canonicalTarget(file);
+    targets.set(process.platform === "win32" ? target.toLowerCase() : target, target);
+  }
+  const ordered = [...targets.entries()].sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0);
+  const releases: Array<() => Promise<void>> = [];
+  let active = true;
+  try {
+    for (const [, target] of ordered) {
+      await fs.mkdir(path.dirname(target), { recursive: true });
+      releases.push(await acquireLock(target));
+    }
+    return await action({ writeBytes: async (file, content, options = {}) => {
+      if (!active) throw new Error("WRITE_LOCK_BUSY: file lock scope has ended");
+      const bytes = Buffer.from(content);
+      const resolved = await canonicalTarget(file);
+      const key = process.platform === "win32" ? resolved.toLowerCase() : resolved;
+      const target = targets.get(key);
+      if (!target) throw new Error("WRITE_CONFLICT: publication target is not locked by this scope");
+      return writeFileBytesCasLocked(file, target, bytes, options);
+    } });
+  } finally {
+    active = false;
+    for (const release of releases.reverse()) await release();
+  }
+}
+
+async function readExisting(file: string, retainBytes = false) {
   let handle;
   try { handle = await fs.open(file, "r"); }
   catch (error) {
@@ -245,15 +300,40 @@ async function readExisting(file: string) {
     throw error;
   }
   try {
-    const before = await handle.stat();
-    if (!before.isFile()) throw new Error("WRITE_CONFLICT: target is not a regular file");
+    const before = await handle.stat({ bigint: true });
+    const namedBefore = await fs.lstat(file, { bigint: true });
+    if (!before.isFile() || !namedBefore.isFile() || namedBefore.isSymbolicLink() ||
+        before.dev !== namedBefore.dev || before.ino !== namedBefore.ino) throw new Error("WRITE_CONFLICT: target is not the same regular file");
     const data = await handle.readFile();
-    const after = await handle.stat();
-    if (before.size !== after.size || before.mtimeMs !== after.mtimeMs || before.ctimeMs !== after.ctimeMs) {
+    const after = await handle.stat({ bigint: true });
+    const namedAfter = await fs.lstat(file, { bigint: true });
+    if (before.dev !== after.dev || before.ino !== after.ino || before.size !== after.size ||
+        before.mtimeNs !== after.mtimeNs || before.ctimeNs !== after.ctimeNs || before.mode !== after.mode ||
+        !namedAfter.isFile() || namedAfter.isSymbolicLink() || after.dev !== namedAfter.dev || after.ino !== namedAfter.ino ||
+        after.size !== namedAfter.size || after.mtimeNs !== namedAfter.mtimeNs || after.ctimeNs !== namedAfter.ctimeNs) {
       throw new Error("WRITE_CONFLICT: target changed during read");
     }
-    return { sha256: sha256(data), mode: before.mode };
+    return { data: retainBytes ? data : null, sha256: sha256(data), mode: Number(before.mode), identity: `${before.dev}:${before.ino}` };
   } finally { await handle.close(); }
+}
+
+function samePath(left: string, right: string): boolean {
+  return process.platform === "win32" ? path.resolve(left).toLowerCase() === path.resolve(right).toLowerCase() : path.resolve(left) === path.resolve(right);
+}
+
+/** Capture exact encoded bytes and physical identity before computing an edit. */
+export async function readFileForEdit(file: string): Promise<{ bytes: Buffer; revision: SafeFileRevision }> {
+  const target = await canonicalTarget(file);
+  const value = await readExisting(target, true);
+  if (!value) throw new Error("WRITE_CONFLICT: edit target is missing");
+  if (!samePath(await canonicalTarget(file), target)) throw new Error("WRITE_CONFLICT: edit target path changed during read");
+  return { bytes: value.data!, revision: { canonicalPath: target, sha256: value.sha256, identity: value.identity, mode: value.mode } };
+}
+
+export async function assertFileRevision(file: string, revision: SafeFileRevision): Promise<void> {
+  const target = await canonicalTarget(file);
+  if (!samePath(target, revision.canonicalPath)) throw new Error("WRITE_CONFLICT: edit target path changed since it was read");
+  await assertPrecondition(target, { expectedRevision: revision });
 }
 
 async function assertPrecondition(file: string, options: SafeTextWriteOptions) {
@@ -262,60 +342,125 @@ async function assertPrecondition(file: string, options: SafeTextWriteOptions) {
   if (options.expectedSha256 !== undefined && value?.sha256 !== options.expectedSha256.toLowerCase()) {
     throw new Error(`WRITE_CONFLICT: expected_sha256=${options.expectedSha256}, actual_sha256=${value?.sha256 ?? "missing"}`);
   }
+  if (options.expectedRevision && (!samePath(file, options.expectedRevision.canonicalPath) ||
+      value?.sha256 !== options.expectedRevision.sha256 || value?.identity !== options.expectedRevision.identity || value?.mode !== options.expectedRevision.mode)) {
+    throw new Error("WRITE_CONFLICT: edit target bytes, identity or mode changed since it was read");
+  }
   return value;
+}
+
+function sameRevision(left: Awaited<ReturnType<typeof readExisting>>, right: Awaited<ReturnType<typeof readExisting>>): boolean {
+  return left?.sha256 === right?.sha256 && left?.identity === right?.identity && left?.mode === right?.mode;
 }
 
 /** Atomic publication between cooperating writers, with bounded external-edit
  * detection. Arbitrary programs that ignore the lock are not transactional. */
+// FAT32/exFAT, many network shares and virtual drives cannot create hard
+// links, so no new file could be written there at all. An exclusive copy keeps
+// the no-clobber guarantee (EEXIST when a racing creator won); only those
+// volumes lose atomic publication of the new file's content.
+const LINK_UNSUPPORTED = new Set(["EPERM", "EACCES", "ENOTSUP", "EOPNOTSUPP", "ENOSYS", "EISDIR", "EXDEV", "EINVAL"]);
+
+export async function publishNewFile(source: string, target: string): Promise<"link_create" | "copy_create"> {
+  try {
+    await fs.link(source, target);
+    return "link_create";
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code ?? "";
+    if (code === "EEXIST") throw new Error("WRITE_CONFLICT: target created during publication");
+    if (!LINK_UNSUPPORTED.has(code)) throw error;
+  }
+  try {
+    await fs.copyFile(source, target, fsConstants.COPYFILE_EXCL);
+    return "copy_create";
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") throw new Error("WRITE_CONFLICT: target created during publication");
+    throw error;
+  }
+}
+
 export async function writeTextFileCas(file: string, content: string, options: SafeTextWriteOptions = {}): Promise<SafeTextWriteResult> {
+  return writeFileBytesCas(file, Buffer.from(content, "utf8"), options);
+}
+
+/** Publish already-encoded bytes; edit callers keep GBK, UTF-16 and BOM exactly. */
+export async function writeFileBytesCas(file: string, content: Buffer, options: SafeTextWriteOptions = {}): Promise<SafeTextWriteResult> {
+  const bytes = Buffer.from(content);
   if (options.expectedSha256 !== undefined &&
       (typeof options.expectedSha256 !== "string" || !/^[a-f0-9]{64}$/i.test(options.expectedSha256))) {
     throw new Error("Invalid expected_sha256");
   }
-  const target = await canonicalTarget(file);
-  await fs.mkdir(path.dirname(target), { recursive: true });
-  const release = await acquireLock(target);
+  return withCanonicalFileLock(file, target => writeFileBytesCasLocked(file, target, bytes, options));
+}
+
+async function writeFileBytesCasLocked(file: string, target: string, content: Buffer, options: SafeTextWriteOptions): Promise<SafeTextWriteResult> {
+  const buffer = content;
+  const contentSha256 = sha256(buffer);
+  if (options.expectedSha256 !== undefined &&
+      (typeof options.expectedSha256 !== "string" || !/^[a-f0-9]{64}$/i.test(options.expectedSha256))) {
+    throw new Error("Invalid expected_sha256");
+  }
+  if (options.expectedRevision && !samePath(target, options.expectedRevision.canonicalPath)) throw new Error("WRITE_CONFLICT: edit target path changed since it was read");
   let temporary: string | undefined;
+  let temporaryIdentity: string | undefined;
   try {
     const initial = await assertPrecondition(target, options);
     await options.beforePublish?.();
-    const buffer = Buffer.from(content, "utf8");
     temporary = `${target}.${process.pid}.${randomUUID()}.cas-tmp`;
-    const handle = await fs.open(temporary, "wx", initial?.mode ?? 0o600);
-    try { await handle.writeFile(buffer); await handle.sync(); }
+    const mode = initial?.mode ?? options.mode ?? 0o600;
+    const handle = await fs.open(temporary, "wx", mode);
+    try {
+      const created = await handle.stat({ bigint: true }); temporaryIdentity = `${created.dev}:${created.ino}`;
+      await handle.writeFile(buffer);
+      // Creation is subject to umask; restore the old file's exact mode before
+      // publication rather than letting an edit silently remove execute bits.
+      if (initial || options.mode !== undefined) await handle.chmod(mode & 0o7777);
+      await handle.sync();
+    }
     finally { await handle.close(); }
     const current = await assertPrecondition(target, options);
-    if (initial?.sha256 !== current?.sha256) throw new Error("WRITE_CONFLICT: target changed during write preparation");
+    if (!sameRevision(initial, current)) throw new Error("WRITE_CONFLICT: target changed during write preparation");
+    const beforePublication = async () => {
+      await options.beforeCommit?.();
+      const staged = await fs.lstat(temporary!, { bigint: true });
+      if (!staged.isFile() || staged.isSymbolicLink() || staged.nlink !== 1n || `${staged.dev}:${staged.ino}` !== temporaryIdentity) {
+        throw new Error("WRITE_CONFLICT: prepared file was linked or replaced");
+      }
+      const prepared = await readExisting(temporary!);
+      if (prepared?.identity !== temporaryIdentity || prepared.sha256 !== contentSha256) throw new Error("WRITE_CONFLICT: prepared bytes changed before publication");
+      if (!samePath(await canonicalTarget(file), target)) throw new Error("WRITE_CONFLICT: target path changed during write preparation");
+      const latest = await assertPrecondition(target, options);
+      if (!sameRevision(initial, latest)) throw new Error("WRITE_CONFLICT: target changed before publication");
+    };
     let strategy: SafeTextWriteResult["publish_strategy"];
     if (!current) {
       // Atomic no-clobber publication; rename alone overwrites a racing creator.
-      await options.beforeCommit?.();
-      try { await fs.link(temporary, target); }
-      catch (error) {
-        if ((error as NodeJS.ErrnoException).code === "EEXIST") throw new Error("WRITE_CONFLICT: target created during publication");
-        throw error;
-      }
-      strategy = "link_create";
+      await beforePublication();
+      strategy = await publishNewFile(temporary, target);
     } else {
       // A Windows reader can briefly prevent replacement. Keep our lock and
       // recheck the revision before retrying; never move/delete the old target.
       const attempts = process.platform === "win32" ? 10 : 1;
       for (let attempt = 0; ; attempt++) {
-        await options.beforeCommit?.();
+        await beforePublication();
         try { await fs.rename(temporary, target); break; }
         catch (error) {
           if (attempt + 1 >= attempts || !["EPERM", "EACCES", "EBUSY"].includes((error as NodeJS.ErrnoException).code ?? "")) throw error;
           await sleep(10 * (attempt + 1));
           const latest = await assertPrecondition(target, options);
-          if (initial?.sha256 !== latest?.sha256) throw new Error("WRITE_CONFLICT: target changed while publication was blocked");
+          if (!sameRevision(initial, latest)) throw new Error("WRITE_CONFLICT: target changed while publication was blocked");
         }
       }
       strategy = "rename_replace";
     }
-    return { bytes: buffer.length, previous_sha256: initial?.sha256 ?? null, sha256: sha256(buffer), created: !initial,
+    return { bytes: buffer.length, previous_sha256: initial?.sha256 ?? null, sha256: contentSha256, created: !initial,
       expected_sha256_checked: options.expectedSha256 !== undefined, create_only_checked: options.createOnly === true, publish_strategy: strategy };
   } finally {
-    if (temporary) await fs.unlink(temporary).catch(() => undefined);
-    await release();
+    if (temporary && temporaryIdentity) {
+      const staged = await fs.lstat(temporary, { bigint: true }).catch(() => null);
+      if (staged?.isFile() && !staged.isSymbolicLink() && `${staged.dev}:${staged.ino}` === temporaryIdentity) {
+        await fs.unlink(temporary).catch(() => undefined);
+      }
+    }
   }
 }

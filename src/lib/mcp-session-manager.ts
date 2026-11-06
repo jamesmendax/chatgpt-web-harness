@@ -7,11 +7,11 @@ import {
   SUPPORTED_PROTOCOL_VERSIONS,
 } from "@modelcontextprotocol/sdk/types.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { resetHarnessSnapshotRetention } from "./context-broker.js";
+import { requestHarnessSnapshotRetentionReset } from "./context-broker.js";
 import { getUpstreamManager } from "./mcp-upstream-manager.js";
 import { refreshProxiedTools } from "./mcp-tool-proxy.js";
 import { runCodexSessionStartHooks } from "./codex-hooks.js";
-import { runWithMcpRequestIdentity } from "./mcp-request-identity.js";
+import { runWithMcpRequestIdentity, runtimePrincipalId } from "./mcp-request-identity.js";
 import { appendActivity } from "./activity-log.js";
 import { PersistentMcpEventStore } from "./mcp-event-store.js";
 import { disposeBrowserUseProvider } from "./browser-use-registry.js";
@@ -177,6 +177,7 @@ export function createSessionManager(config: SessionManagerConfig): SessionManag
   const deleteGraceTimers: Record<string, ReturnType<typeof setTimeout>> = {};
   const closingSessions = new Set<string>();
   const activeRequestCounts = new Map<string, number>();
+  const activeGetCounts = new Map<string, number>();
   const initializingServers = new Set<McpServer>();
   let cleanupTimer: ReturnType<typeof setInterval> | null = null;
 
@@ -191,13 +192,17 @@ export function createSessionManager(config: SessionManagerConfig): SessionManag
     enforceSessionLimit();
   }
 
-  function isSessionBusy(sessionId: string): boolean {
+  function hasRequestsToDrain(sessionId: string): boolean {
     const session = sessions[sessionId];
     return (
       (activeRequestCounts.get(sessionId) ?? 0) > 0 ||
       sessionOpChains.has(sessionId) ||
       Boolean(session && initializingServers.has(session.server))
     );
+  }
+
+  function isSessionBusy(sessionId: string): boolean {
+    return hasRequestsToDrain(sessionId) || (activeGetCounts.get(sessionId) ?? 0) > 0;
   }
 
   function touch(sessionId: string): void {
@@ -227,7 +232,7 @@ export function createSessionManager(config: SessionManagerConfig): SessionManag
         closingSessions.delete(sessionId);
         return;
       }
-      if (isSessionBusy(sessionId)) {
+      if (hasRequestsToDrain(sessionId)) {
         // DELETE is an admission fence, not permission to abandon an already
         // accepted side effect. Keep the transport alive until every request
         // that entered before DELETE has drained, while rejecting all new
@@ -237,7 +242,9 @@ export function createSessionManager(config: SessionManagerConfig): SessionManag
         deleteGraceTimers[sessionId].unref?.();
         return;
       }
-      removeSession(sessionId, "client DELETE (grace expired)");
+      // GET is a long-lived notification stream, not an accepted side effect.
+      // Once other requests have drained, close it along with the transport.
+      removeSession(sessionId, "client DELETE (grace expired)", true);
     };
     deleteGraceTimers[sessionId] = setTimeout(finalize, SESSION_DELETE_GRACE_MS);
     deleteGraceTimers[sessionId].unref?.();
@@ -255,6 +262,7 @@ export function createSessionManager(config: SessionManagerConfig): SessionManag
     delete lastTransportErrors[sessionId];
     sessionOpChains.delete(sessionId);
     activeRequestCounts.delete(sessionId);
+    activeGetCounts.delete(sessionId);
     initializingServers.delete(session.server);
     if (closeTransport) void session.transport.close().catch(() => undefined);
     console.log(`[MCP] Session removed (${reason}): ${sessionId}`);
@@ -323,9 +331,13 @@ export function createSessionManager(config: SessionManagerConfig): SessionManag
         };
         clearPendingRecovery(sid);
         enforceSessionLimit(sid);
-        // Per-session snapshot retention: a fresh ChatGPT conversation must
-        // re-receive the harness snapshot on its first tool result.
-        resetHarnessSnapshotRetention(config.workspaceRoot, sid);
+        // Ordinary transport changes can belong to the same trusted ChatGPT
+        // conversation. Only an explicit recovery asks for redelivery; resolve
+        // its actual conversation namespace at the next tool callback.
+        if (preferredSessionId) requestHarnessSnapshotRetentionReset(config.workspaceRoot, sid, {
+          principalId: runtimePrincipalId(config.workspaceRoot),
+          tunnelProfile: process.env.CHATGPT_TUNNEL_PROFILE?.trim() || undefined,
+        });
         console.log(`[MCP] Session initialized: ${sid}`);
       },
       onsessionclosed: (sid) => {
@@ -350,7 +362,21 @@ export function createSessionManager(config: SessionManagerConfig): SessionManag
       console.log(`[MCP] Transport closed for ${sid} (session kept for recovery)`);
     };
 
-    await mcpServer.connect(transport);
+    try {
+      await mcpServer.connect(transport);
+    } catch (error) {
+      // connect() can fail after attaching the transport. No session has been
+      // published yet, so this instance is solely ours to unregister and close.
+      // Closing the transport also detaches it from the SDK protocol object.
+      getUpstreamManager().unregisterMcpServer(mcpServer);
+      await Promise.all([
+        transport.close().catch((cleanupError) =>
+          console.warn("[MCP] Failed transport cleanup after connect error:", cleanupError)),
+        disposeBrowserUseProvider(mcpServer).catch((cleanupError) =>
+          console.warn("[MCP] Browser Use cleanup after connect error:", cleanupError)),
+      ]);
+      throw error;
+    }
     // Native tools must be available immediately. Upstream discovery can spawn
     // local processes or wait on remote MCPs, so publish it when ready instead.
     void refreshProxiedTools(mcpServer, getUpstreamManager())
@@ -471,6 +497,21 @@ export function createSessionManager(config: SessionManagerConfig): SessionManag
           initializingServers.delete(session.server);
           if (sid) endSessionRequest(sid);
           else enforceSessionLimit();
+          // The SDK can reject an initialize request before assigning a session
+          // id (for example, an unacceptable Accept header). createServer has
+          // already registered this instance with the upstream manager, so it
+          // must be disposed even though there is no session id to remove.
+          // Check ownership by server identity: a stale recovery header can name
+          // a different live session by the time this request finishes.
+          const becameActive = Object.values(sessions).some(
+            (active) => active.server === session.server
+          );
+          if (!becameActive) {
+            getUpstreamManager().unregisterMcpServer(session.server);
+            void disposeBrowserUseProvider(session.server).catch((error) =>
+              console.warn("[MCP] Uninitialized Browser Use cleanup failed:", error));
+            void session.transport.close().catch(() => undefined);
+          }
         }
       };
 
@@ -513,13 +554,26 @@ export function createSessionManager(config: SessionManagerConfig): SessionManag
       }
       if (sid) touch(sid);
       const run = async () => {
-        if (sid) beginSessionRequest(sid);
+        const isGet = req.method === "GET";
+        if (sid) {
+          if (isGet) activeGetCounts.set(sid, (activeGetCounts.get(sid) ?? 0) + 1);
+          else beginSessionRequest(sid);
+        }
         try {
           await runWithMcpRequestIdentity(req.headers, sid, () =>
             session.transport.handleRequest(req, res, body), body
           );
         } finally {
-          if (sid) endSessionRequest(sid);
+          if (sid && isGet) {
+            // Closing an old stream can complete after the same id has been
+            // recovered. Never decrement the replacement session's counters.
+            if (sessions[sid]?.server === session.server) {
+              const next = (activeGetCounts.get(sid) ?? 1) - 1;
+              if (next > 0) activeGetCounts.set(sid, next);
+              else activeGetCounts.delete(sid);
+              enforceSessionLimit();
+            }
+          } else if (sid) endSessionRequest(sid);
         }
       };
       // Only initialization changes transport setup. A long-running tools/call

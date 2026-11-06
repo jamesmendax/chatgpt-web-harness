@@ -10,12 +10,13 @@ import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import isolation from "../desktop/scripts/lib/test-isolation.cjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const dist = process.env.HARNESS_TEST_DIST_ROOT ? path.resolve(process.env.HARNESS_TEST_DIST_ROOT) : path.join(root, "dist");
 const reportIndex = process.argv.indexOf("--report");
 const reportPath = reportIndex >= 0 ? path.resolve(process.argv[reportIndex + 1]) : undefined;
-const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "harness-browser-lifecycle-"));
+const tmp = isolation.artifactRoot("browser-use-session-lifecycle");
 const workspace = path.join(tmp, "workspace");
 const otherWorkspace = path.join(tmp, "other-workspace");
 const runtimeRoot = path.join(tmp, "vendor", "browser-use");

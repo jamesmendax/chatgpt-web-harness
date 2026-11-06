@@ -46,6 +46,26 @@ function eventStoreRoot(workspaceRoot: string): string {
   return path.join(home, "chatgpt-local-coder", "mcp-sse-events", sha256(path.resolve(workspaceRoot)));
 }
 
+// One store file per transport session (ChatGPT opens one per call) was never
+// removed, so months of use left one small file per call. A file untouched for
+// longer than the retention window holds only expired events: delete it, at
+// most once an hour per workspace. A later write simply recreates it.
+const sweptAt = new Map<string, number>();
+async function sweepExpiredStores(root: string, retentionMs: number): Promise<void> {
+  const now = Date.now();
+  if (now - (sweptAt.get(root) ?? 0) < 60 * 60_000) return;
+  sweptAt.set(root, now);
+  let names: string[];
+  try { names = await fs.readdir(root); } catch { return; }
+  for (const name of names) {
+    if (!/^[0-9a-f]{64}\.json$/.test(name)) continue;
+    const file = path.join(root, name);
+    try {
+      if (now - (await fs.stat(file)).mtimeMs > retentionMs) await fs.rm(file, { force: true });
+    } catch { /* busy or already gone */ }
+  }
+}
+
 function cloneMessage(message: JSONRPCMessage): JSONRPCMessage {
   // The SDK also uses an empty object as a resumability priming event. JSON
   // round-tripping gives the durable store a detached, serializable snapshot.
@@ -102,6 +122,7 @@ export class PersistentMcpEventStore implements EventStore {
     this.maxEvents = boundedInt(options.maxEvents, 2048, 1, 16_384);
     this.maxBytes = boundedInt(options.maxBytes, 16 * 1024 * 1024, 1024, 128 * 1024 * 1024);
     this.retentionMs = boundedInt(options.retentionMs, 24 * 60 * 60_000, 60_000, 7 * 24 * 60 * 60_000);
+    void sweepExpiredStores(path.dirname(this.file), this.retentionMs).catch(() => undefined);
   }
 
   private enqueue<T>(operation: () => Promise<T>): Promise<T> {

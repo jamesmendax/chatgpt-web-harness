@@ -20,6 +20,7 @@ async function test(name, fn) {
 
 const make = () => new FileOAuthClientProvider({
   serverId: "test-server",
+  serverUrl: "https://oauth.example.test/mcp",
   authDir: dir,
   callbackBase: "http://127.0.0.1:3999",
   openBrowser: false,
@@ -54,5 +55,11 @@ await test("oauth disconnect removes tokens without client registration", async 
   assert.equal((await a.clientInformation())?.client_id, "client-1");
 });
 
-await fs.rm(dir, { recursive: true, force: true });
+const [realTemp, realDir] = await Promise.all([fs.realpath(os.tmpdir()), fs.realpath(dir)]);
+const normalizeForComparison = (value) => process.platform === "win32" ? value.toLowerCase() : value;
+if (normalizeForComparison(path.dirname(realDir)) !== normalizeForComparison(realTemp) ||
+    !path.basename(realDir).startsWith("local-coder-oauth-")) {
+  throw new Error("Refusing to remove OAuth test directory outside the expected temporary root");
+}
+await fs.rm(realDir, { recursive: true, force: true });
 console.log(`\n${passed} passed, 0 failed`);

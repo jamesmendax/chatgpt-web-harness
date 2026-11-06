@@ -1,13 +1,15 @@
 "use strict";
 // 无界面冒烟测试：electron scripts/smoke.js
 // 在临时 userData 与测试端口上验证：配置加密存储、MCP 子进程启动/健康/停止、状态聚合、日志缓冲。
-// 设置 SMOKE_TUNNEL_DOCTOR=1 时，额外从旧 .secrets 导入 Business 密钥并运行 tunnel-client doctor（只读校验）。
+// This regression never reads legacy credentials or probes a live service.
 const { app } = require("electron");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const { createHash } = require("crypto");
 const { pathToFileURL } = require("url");
+const { privatePorts } = require("./lib/test-isolation.cjs");
+if (process.env.SMOKE_TUNNEL_DOCTOR === "1") throw new Error("Credential-backed tunnel doctor is separate acceptance; it cannot run inside desktop smoke.");
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "clc-smoke-"));
 app.setPath("userData", tmp);
@@ -15,6 +17,7 @@ app.setPath("userData", tmp);
 process.env.CLC_RUNTIME_DIR = path.join(tmp, "runtime");
 
 const results = [];
+let ownedServices;
 function check(name, ok, detail = "") {
   results.push({ name, ok, detail });
   console.log(`${ok ? "PASS" : "FAIL"} ${name}${detail ? ` — ${detail}` : ""}`);
@@ -82,9 +85,7 @@ async function main() {
   cfg.tunnelId = "tunnel_" + "a".repeat(32);
   cfg.apiKeyEnc = configStore.encryptKey("sk-smoke-not-a-real-key");
   cfg.workspacePath = path.join(tmp, "ws");
-  cfg.mcpPort = 3999;
-  cfg.adminPort = 3998;
-  cfg.tunnelPort = 8099;
+  [cfg.mcpPort, cfg.adminPort, cfg.tunnelPort] = await privatePorts(3);
   cfg.setupDone = true;
   fs.mkdirSync(cfg.workspacePath, { recursive: true });
   configStore.save(cfg);
@@ -103,7 +104,7 @@ async function main() {
   configStore.save(reloaded);
   const profile = harness.writeTunnelProfile(reloaded);
   const yaml = fs.readFileSync(profile, "utf8");
-  check("launcher.yaml 生成", yaml.includes(`tunnel_id: ${cfg.tunnelId}`) && yaml.includes("127.0.0.1:8099") && yaml.includes("http://127.0.0.1:3999/mcp") && yaml.includes("env:OPENAI_TUNNEL_API_KEY"), profile);
+  check("launcher.yaml 生成", yaml.includes(`tunnel_id: ${cfg.tunnelId}`) && yaml.includes(`127.0.0.1:${cfg.tunnelPort}`) && yaml.includes(`http://127.0.0.1:${cfg.mcpPort}/mcp`) && yaml.includes("env:OPENAI_TUNNEL_API_KEY"), profile);
   const mcpSpec = harness.mcpSpawnSpec(reloaded);
   check(
     "MCP 环境边界与显式运行目录",
@@ -113,7 +114,7 @@ async function main() {
       mcpSpec.env.CHATGPT_PLUGINS_CONFIG === path.join(paths.runtimeDir(), "profiles", "plugins.json") &&
       mcpSpec.env.MCP_UPSTREAM_CONFIG === path.join(paths.runtimeDir(), "profiles", "mcp-upstream.json") &&
       mcpSpec.env.MCP_SHELL_STATE_DIR === path.join(paths.runtimeDir(), ".mcp-state") &&
-      mcpSpec.env.ELECTRON_RUN_AS_NODE === "1" && mcpSpec.env.PORT === "3999"
+      mcpSpec.env.ELECTRON_RUN_AS_NODE === "1" && mcpSpec.env.PORT === String(cfg.mcpPort)
   );
   const previousMcpToken = process.env.MCP_TOKEN;
   const previousMcpApiKey = process.env.MCP_API_KEY;
@@ -186,27 +187,29 @@ async function main() {
       }
       res.writeHead(404).end();
     });
-    server.listen(8099, '127.0.0.1', () => {
+    server.listen(Number(process.argv[3]), '127.0.0.1', () => {
       console.log('mock tunnel loopback ready');
     });
   `;
   const tunnelFixturePath = path.join(tmp, "mock-tunnel.cjs");
   fs.writeFileSync(tunnelFixturePath, tunnelFixture);
   harness.tunnelSpawnSpec = async () => ({
-    command: process.execPath, args: [tunnelFixturePath, cfg.tunnelId], cwd: tmp,
+    command: process.execPath, args: [tunnelFixturePath, cfg.tunnelId, String(cfg.tunnelPort)], cwd: tmp,
     env: { SystemRoot: process.env.SystemRoot, ELECTRON_RUN_AS_NODE: "1" },
     proxyInfo: { mode: "direct", source: "loopback-fixture" },
   });
-  const services = new Services();
+  const services = ownedServices = new Services();
   const logs = [];
   services.on("log", (e) => logs.push(e));
-  const before = await status.probeMcp(3999);
-  check("测试端口 3999 空闲", !before);
+  const before = await status.probeMcp(cfg.mcpPort);
+  if (before) throw new Error("Private smoke port was acquired by another process; refusing to interact with its MCP");
+  check("独立测试端口空闲", !before, String(cfg.mcpPort));
   await services.startAll().catch((err) => {
     console.log("startAll 本地模拟认证失败:", err.message.slice(0, 120));
   });
-  if (services.tunnel.isAlive()) await fetch("http://127.0.0.1:8099/emit-401");
-  const health = await status.probeMcp(3999);
+  if (services.tunnel.isAlive()) await fetch(`http://127.0.0.1:${cfg.tunnelPort}/emit-401`);
+  const health = await status.probeMcp(cfg.mcpPort);
+  if (health && health.runtime?.pid !== services.mcp.pid) throw new Error("MCP health does not belong to this smoke child");
   // Compare the actual registered catalog with the slim profile from the same
   // runtime payload. The release verification separately checks payload provenance.
   const { SLIM_CHATGPT_TOOLS } = await import(pathToFileURL(path.join(path.dirname(paths.distEntry()), "lib", "tool-profile.js")).href);
@@ -218,7 +221,7 @@ async function main() {
     const { StreamableHTTPClientTransport } = await import("@modelcontextprotocol/sdk/client/streamableHttp.js");
     const client = new Client({ name: "desktop-smoke", version: "1.0.0" });
     try {
-      await client.connect(new StreamableHTTPClientTransport(new URL("http://127.0.0.1:3999/mcp")));
+      await client.connect(new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${cfg.mcpPort}/mcp`)));
       listedTools = (await client.listTools()).tools.map(tool => tool.name).sort();
     } finally { await client.close(); }
   }
@@ -240,13 +243,10 @@ async function main() {
   );
   check("MCP 日志已捕获", logs.some((e) => e.name === "mcp" && /Codex MCP Server|Runtime build/.test(e.line)));
   check("Tunnel 日志已捕获", logs.some((e) => e.name === "tunnel"));
-  const live = await status.probeMcp(3000);
-  check("线上 3000 未受影响", !live || live.runtime.pid !== health?.runtime?.pid, live ? `live pid=${live.runtime.pid}` : "3000 not running");
-
   await services.stopAll();
-  const after = await status.probeMcp(3999);
-  check("MCP 已停止且端口释放", !after && (await status.listeningPids(3999)).length === 0);
-  check("Tunnel 已停止且端口释放", (await status.listeningPids(8099)).length === 0);
+  const after = await status.probeMcp(cfg.mcpPort);
+  check("MCP 已停止且端口释放", !after && (await status.listeningPids(cfg.mcpPort)).length === 0);
+  check("Tunnel 已停止且端口释放", (await status.listeningPids(cfg.tunnelPort)).length === 0);
   check("日志文件落盘", fs.existsSync(path.join(paths.logsDir(), "mcp.log")));
 
   fs.writeFileSync(path.join(paths.runtimeDir(), "profiles", "mcp-upstream.json"), JSON.stringify({ version: 1, servers: [{ id: "smoke-server", type: "stdio", command: "node" }] }, null, 2));
@@ -256,21 +256,6 @@ async function main() {
   const resetUpstream = JSON.parse(fs.readFileSync(reset.upstream, "utf8"));
   const resetBackupExists = fs.readdirSync(path.dirname(reset.plugins)).some((name) => /^plugins\.json\.reset-.*\.bak$/.test(name));
   check("profiles reset 只重置配置", resetPlugins.schema_version === 2 && resetPlugins.skills.length === 0 && resetUpstream.servers.length === 0 && fs.readFileSync(path.join(paths.runtimeDir(), "profiles", "local-skills", "smoke-installed", "SKILL.md"), "utf8") === beforeResetSkill && resetBackupExists);
-
-  // 4. 可选：真实凭据 doctor
-  if (process.env.SMOKE_TUNNEL_DOCTOR === "1") {
-    const legacy = require("../src/legacy");
-    const files = legacy.legacyKeyFiles();
-    const entry = files.find((f) => f.label === "Business") || files[0];
-    if (entry) {
-      const key = await legacy.readLegacyKey(entry.file);
-      const realCfg = { ...reloaded, tunnelId: legacy.readProfileTunnelId("business-local.yaml") || legacy.readDotEnvValue("OPENAI_TUNNEL_ID"), tunnelPort: 8099 };
-      const doctor = await services.runDoctor(realCfg, key, (line) => console.log("  doctor:", line.slice(0, 160)));
-      check("tunnel-client doctor（真实凭据，只读）", doctor.ok, `exit=${doctor.code} 输出不含密钥=${!doctor.output.includes(key)}`);
-    } else {
-      check("旧密钥文件存在", false, "未找到 .secrets/*.xml");
-    }
-  }
 
   if (previousAdminToken === undefined) delete process.env.ADMIN_TOKEN;
   else process.env.ADMIN_TOKEN = previousAdminToken;
@@ -285,7 +270,8 @@ async function main() {
   app.exit(failed.length ? 1 : 0);
 }
 
-app.whenReady().then(() => main().catch((err) => {
+app.whenReady().then(() => main().catch(async (err) => {
   console.error("SMOKE ERROR", err);
+  if (ownedServices) await ownedServices.shutdown().catch(error => console.error("SMOKE owned-child cleanup failed", error));
   app.exit(2);
 }));

@@ -21,7 +21,6 @@ import { registerCodeIntelligenceTool } from "./tools/code-intelligence.js";
 import { isBrowserUseEnabled, isComputerUseEnabled } from "./lib/plugin-config.js";
 import { buildServerInstructions } from "./lib/quickstart.js";
 import type { McpUpstreamManager } from "./lib/mcp-upstream-manager.js";
-import { resetHarnessSnapshotRetention } from "./lib/context-broker.js";
 import { createWebHarnessResultPipeline } from "./lib/result-pipeline.js";
 import {
   EffectiveToolRegistry,
@@ -34,6 +33,7 @@ import {
 } from "./lib/invocation-gateway.js";
 import { setAllowedRoots, setDefaultCwd, setFullDiskAccess } from "./lib/path-security.js";
 import { runtimePrincipalId } from "./lib/mcp-request-identity.js";
+import { installMcpFinalOutcomeObserver } from "./lib/mcp-final-outcome.js";
 import { APP_VERSION, setRuntimeToolCatalog } from "./lib/runtime-manifest.js";
 
 const NOOP_TOOL = {
@@ -84,6 +84,7 @@ function configureToolRegistration(
   workspaceRoot: string,
   workspaceRoots: string[]
 ): McpServerHarnessRuntime {
+  installMcpFinalOutcomeObserver(server.server);
   const registry = new EffectiveToolRegistry();
   setRuntimeToolCatalog(registry);
   const tunnelProfile = process.env.CHATGPT_TUNNEL_PROFILE?.trim() || undefined;
@@ -147,9 +148,8 @@ export function createMcpServer(
   setDefaultCwd(workspaceRoot);
   setAllowedRoots(workspaceRoots.length ? workspaceRoots : [workspaceRoot]);
   setFullDiskAccess(fullDiskAccess);
-  // Each MCP session is a fresh ChatGPT conversation: its first tool result
-  // must carry a snapshot even if the process already delivered one elsewhere.
-  resetHarnessSnapshotRetention(workspaceRoot);
+  // Runtime context is retained by trusted conversation, not by transport.
+  // Recovery requests an exact scoped reset in the session manager.
   const server = new McpServer(
     {
       name: "codex-mcp-server",
@@ -160,6 +160,11 @@ export function createMcpServer(
         logging: {},
         tools: { listChanged: true },
       },
+      // McpServer.sendToolListChanged() drops the send promise, so one failed
+      // event-store write became an unhandled rejection that ended the whole
+      // server. The debounced path catches the error (onerror) and also merges
+      // a burst of registrations into one notification.
+      debouncedNotificationMethods: ["notifications/tools/list_changed"],
       instructions: buildServerInstructions(
         workspaceRoot,
         workspaceRoots,

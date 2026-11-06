@@ -53,8 +53,8 @@ test('10000 dynamic changes reuse one scene; 1000 static roundtrips release ever
   for(let i=0;i<1000;i++){owner.enable(false);assert.equal(creates,releases);assert.equal(owner.status().live,0);owner.enable(true);assert.equal(creates-releases,1);}
   owner.destroy();owner.destroy();assert.equal(creates,releases);assert.equal(owner.enable(true),null);assert.equal(replaces,1000);
 });
-function fakeScene({pending=false,badLink=false,width=960,height=540}={}){
-  let now=0,id=0,disabled=0;const timers=new Map(),events=new Map(),windowEvents=new Map(),uploaded=new Map();
+function fakeScene({pending=false,badLink=false,width=960,height=540,recoverable=false}={}){
+  let now=0,id=0,disabled=0,lost=0;const timers=new Map(),events=new Map(),windowEvents=new Map(),uploaded=new Map();
   const resources={buffers:new Set(),programs:new Set(),shaders:new Set(),observers:new Set()};
   const create=type=>{const h={id:++id,type};resources[type].add(h);return h;};
   const del=(type,h)=>{assert.ok(resources[type].delete(h),'delete exactly once '+type);};
@@ -66,12 +66,33 @@ function fakeScene({pending=false,badLink=false,width=960,height=540}={}){
     getUniformLocation:(p,n)=>n,uniform2f(){},uniform1f(n,v){uploaded.set(n,v);},uniform4fv(n,v){uploaded.set(n,Array.from(v));},viewport(){},drawArrays(){},isContextLost:()=>false,
     getExtension:name=>name==='KHR_parallel_shader_compile'?(pending?{COMPLETION_STATUS_KHR:9}:null):name==='WEBGL_lose_context'?{loseContext(){}}:null};
   const canvas={width:0,height:0,clientWidth:width,clientHeight:height,getContext:()=>gl,addEventListener:(n,f)=>events.set(n,f),removeEventListener:(n,f)=>{if(events.get(n)===f)events.delete(n);}};
-  const global={devicePixelRatio:2,AuraMemoryGuard:{disable(){disabled++;}},addEventListener:(n,f)=>windowEvents.set(n,f),removeEventListener:(n,f)=>{if(windowEvents.get(n)===f)windowEvents.delete(n);},ResizeObserver:class{constructor(cb){this.cb=cb;resources.observers.add(this);}observe(){}disconnect(){resources.observers.delete(this);}}};
+  const guard=recoverable?{disable(){disabled++;},contextLost(){lost++;}}:{disable(){disabled++;}};
+  const global={devicePixelRatio:2,AuraMemoryGuard:guard,addEventListener:(n,f)=>windowEvents.set(n,f),removeEventListener:(n,f)=>{if(windowEvents.get(n)===f)windowEvents.delete(n);},ResizeObserver:class{constructor(cb){this.cb=cb;resources.observers.add(this);}observe(){}disconnect(){resources.observers.delete(this);}}};
   const context={window:global,document:{documentElement:{classList:{add(){}}}},console:{error(){}},performance:{now:()=>now},setTimeout:(fn)=>{const key=++id;timers.set(key,fn);return key;},clearTimeout:key=>timers.delete(key)};
   vm.runInNewContext(sceneCode,context);const scene=global.AuraScene.create(canvas);
   const args={orb:[240,180,90,1],mood:[0,0,0,0],minis:[],on:1,active:0,pulse:0,night:0,dim:0,quality:1};
-  return{scene,canvas,args,resources,events,windowEvents,timers,uploaded,get disabled(){return disabled;},advance(ms){now+=ms;for(const [key,fn]of Array.from(timers)){timers.delete(key);fn();}}};
+  return{scene,canvas,args,resources,events,windowEvents,timers,uploaded,get disabled(){return disabled;},get lost(){return lost;},advance(ms){now+=ms;for(const [key,fn]of Array.from(timers)){timers.delete(key);fn();}}};
 }
+test('a lost context is reported as recoverable, releases everything and never blocks graphics itself',()=>{
+  const f=fakeScene({recoverable:true});
+  f.events.get('webglcontextlost')({preventDefault(){}});
+  assert.equal(f.lost,1);assert.equal(f.disabled,0,'transient loss must not permanently disable WebGL');
+  assert.equal(f.scene.stats().disposed,true);for(const v of Object.values(f.resources))assert.equal(v.size,0);
+  assert.equal(f.events.size,0);assert.equal(f.scene.draw(f.args),false);
+  const legacy=fakeScene();legacy.events.get('webglcontextlost')({preventDefault(){}});
+  assert.equal(legacy.disabled,1,'an owner without recovery keeps the old static fallback');
+});
+test('the float32 shader clock restarts only past its limit and keeps drawing continuously',()=>{
+  const f=fakeScene();f.args.visual=Q.tiers.high;
+  f.advance(7200000);f.scene.draw(f.args);
+  assert.ok(Math.abs(f.uploaded.get('uTime')-7200)<.001);assert.ok(Math.abs(f.scene.clock()-7200)<.001);
+  assert.equal(f.scene.rebase(86400),false,'a two-hour clock is still precise');
+  assert.equal(f.scene.rebase(3600),true);
+  assert.ok(f.scene.clock()<.001);f.advance(500);f.scene.draw(f.args);
+  assert.ok(Math.abs(f.uploaded.get('uTime')-.5)<.001);assert.ok(Math.abs(f.uploaded.get('uCurtainTime')-.5)<.001);
+  assert.equal(f.scene.stats().resizes,1,'restarting the clock allocates nothing');
+  f.scene.dispose();assert.equal(f.scene.rebase(0),false);
+});
 test('changing visual effects reuses one shader program and uploads every tier',()=>{
   const f=fakeScene();f.scene.freeze(10);
   for(let i=0;i<120;i++)for(const name of ['ultra','high','standard']){

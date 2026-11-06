@@ -57,6 +57,15 @@ function canonicalDirectory(value) {
     }
   }
 }
+// Another account's workspace may sit on a drive that is offline (USB stick,
+// network share). Compare it by its resolved path instead of letting realpath's
+// ENOENT block every other account from starting or saving.
+function comparableDirectory(value) {
+  try { return canonicalDirectory(value); } catch (_) {
+    const resolved = path.resolve(value);
+    return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+  }
+}
 function overlaps(a, b) {
   const inside = (base, target) => {
     const relative = path.relative(base, target);
@@ -208,7 +217,8 @@ class AccountManager extends EventEmitter {
   }
   async allocatePorts() {
     const used = new Set(this.registry.accounts.flatMap((row) => {
-      const cfg = this.readConfig(row.id);
+      let cfg;
+      try { cfg = this.readConfig(row.id); } catch (_) { return []; }
       return PORT_KEYS.map((key) => cfg[key]);
     }));
     // Bounded probing; never seize or kill an existing listener.
@@ -230,10 +240,13 @@ class AccountManager extends EventEmitter {
     const ownWorkspace = cfg.workspacePath ? canonicalDirectory(cfg.workspacePath) : null;
     for (const other of this.registry.accounts) {
       if (other.id === id) continue;
-      const saved = this.readConfig(other.id);
+      // An account whose config is missing cannot start either, so there is
+      // nothing to collide with; it must not block this one.
+      let saved;
+      try { saved = this.readConfig(other.id); } catch (_) { continue; }
       if (PORT_KEYS.some((key) => ownPorts.includes(saved[key]))) throw new Error(`端口与账号「${other.name}」重复，请使用独立端口。`);
       if (cfg.tunnelId && cfg.tunnelId === saved.tunnelId) throw new Error(`Tunnel ID 已属于账号「${other.name}」，请切换到该已有账户继续使用；无需创建新 Tunnel。`);
-      if (ownWorkspace && saved.workspacePath && overlaps(ownWorkspace, canonicalDirectory(saved.workspacePath))) {
+      if (ownWorkspace && saved.workspacePath && overlaps(ownWorkspace, comparableDirectory(saved.workspacePath))) {
         throw new Error(`工作区与账号「${other.name}」相同或互相包含，请选择互不重叠的目录。`);
       }
     }
@@ -448,8 +461,10 @@ class AccountManager extends EventEmitter {
         // Workspace contents are never account-owned, including hand-edited
         // legacy configurations that place a workspace inside a profile leaf.
         for (const row of this.registry.accounts) {
-          const cfg = this.readConfig(row.id);
-          if (cfg.workspacePath && sources.some(source => overlaps(canonicalDirectory(cfg.workspacePath), path.join(canonicalDirectory(path.dirname(source.file)), path.basename(source.file))))) {
+          // A broken account (missing config) must still be removable.
+          let cfg;
+          try { cfg = this.readConfig(row.id); } catch (_) { continue; }
+          if (cfg.workspacePath && sources.some(source => overlaps(comparableDirectory(cfg.workspacePath), path.join(canonicalDirectory(path.dirname(source.file)), path.basename(source.file))))) {
             throw new Error("账号数据与工作区重叠，已拒绝归档；请先将工作区移到独立目录。");
           }
         }
@@ -491,9 +506,12 @@ class AccountManager extends EventEmitter {
       selectedId: this.selectedId, maxAccounts: MAX_ACCOUNTS, registryPath: this.registryFile(),
       securityBoundary: "运行配置档隔离；不是 Windows 用户或系统安全沙箱",
       accounts: this.registry.accounts.map((row) => {
-        const cfg = this.readConfig(row.id);
+        // One unreadable config shows as an error on its own row instead of
+        // failing the whole list (and an error toast every few seconds).
+        let cfg = null, configError = "";
+        try { cfg = this.readConfig(row.id); } catch (error) { configError = error.message; }
         const item = this.instances.get(row.id);
-        return { ...row, config: this.config.publicView(cfg), dataDir: this.scope(row.id).dataDir,
+        return { ...row, config: cfg ? this.config.publicView(cfg) : null, ...(configError ? { configError } : {}), dataDir: this.scope(row.id).dataDir,
           mcp: { state: item?.services.mcp.state || "stopped", pid: item?.services.mcp.pid || null, owned: Boolean(item?.services.mcp.isAlive()) },
           tunnel: { state: item?.services.tunnel.state || "stopped", pid: item?.services.tunnel.pid || null, owned: Boolean(item?.services.tunnel.isAlive()), cloudState: item?.snapshot?.tunnel?.cloudState || "unknown" },
           busy: Boolean(item?.services.busy), lastError: item?.lastError || "" };

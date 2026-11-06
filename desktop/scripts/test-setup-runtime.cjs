@@ -6,7 +6,7 @@ const fs = require("node:fs"), path = require("node:path"), net = require("node:
 const { EventEmitter } = require("node:events");
 const electron = require("electron"), { app } = electron;
 const desktop = path.resolve(__dirname, "..");
-const artifacts = path.resolve(desktop, "../.validation/setup-runtime");
+const artifacts = require("./lib/test-isolation.cjs").artifactRoot("setup-runtime");
 fs.mkdirSync(artifacts, { recursive: true });
 const fixture = fs.mkdtempSync(path.join(artifacts, "run-"));
 const workspace = path.join(fixture, "workspace");

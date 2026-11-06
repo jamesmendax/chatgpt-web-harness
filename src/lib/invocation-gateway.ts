@@ -163,9 +163,23 @@ export class InvocationGateway {
 
     const extra = handlerCallbackArgs[handlerCallbackArgs.length - 1];
     const requestExtra = isRequestContextLike(extra) ? extra : undefined;
+    const rejectBeforeExecution = (code: string): CallToolResult => {
+      const result = toolError(toolName, code, {
+        error_code: code, failure_phase: "validation", operation_started: false,
+        failure_class: "validation", retry_policy: "retry_with_changed_args",
+      });
+      observeMcpToolResult({ requestId: scope.requestId, tool: toolName,
+        invocationId: scope.invocationId, result });
+      try { appendActivity({ kind: "tool", action: "tools/call", tool: toolName,
+        status: "error", duration_ms: elapsedMs(startedAt),
+        session_id: getMcpRequestIdentity()?.transportSessionId,
+        summary: code, details: { invocation_id: scope.invocationId,
+          canonical_lifecycle: true, ...toolFailureDiagnostic(result) } }); } catch {}
+      return result;
+    };
     let metadata: ReturnType<typeof operationRequestMetadata>;
     try { metadata = operationRequestMetadata(requestExtra?._meta); }
-    catch { return toolError(toolName, "INVALID_OPERATION_METADATA"); }
+    catch { return rejectBeforeExecution("INVALID_OPERATION_METADATA"); }
 
     // Execution no longer depends on intent, Goal/Driver admission, or legacy
     // recovery grants. Concrete resources and the operation journal retain their
@@ -353,7 +367,7 @@ export class InvocationGateway {
     const identity = scopedOperationIdentity({
       ...identityNamespace, goalId: scope.goalId,
     }, transport, scope.requestId, metadata.id);
-    if ((metadata.id || metadata.observe) && !identity) return toolError(toolName, "OPERATION_SCOPE_REQUIRED");
+    if ((metadata.id || metadata.observe) && !identity) return rejectBeforeExecution("OPERATION_SCOPE_REQUIRED");
     // Ordinary read-only control calls remain live observations. Clients that
     // omit identity cannot gain cross-session duplicate protection by guessing
     // from tool arguments: identical commands can be intentional new work.
@@ -362,17 +376,31 @@ export class InvocationGateway {
     }
     return withDriverExecutionFence(() => runWithRuntimeScope(scope, async () => {
       let entered = false;
+      let handlerResult: CallToolResult | undefined;
+      const journalStartedAt = Date.now();
       const result = await executeOperation({
         workspaceRoot: scope.workspaceRoot, identity, tool: toolName,
         goalId: scope.goalId, ownerSessionId: scope.goalOwnerSessionId, legacyIdentity,
         args: context.rawArgs, signal: scope.signal, observe: metadata.observe,
-      }, () => { entered = true; return executeOnce(); });
+      }, async () => { entered = true; handlerResult = await executeOnce(); return handlerResult; });
       // A replay/observation is still a tool response for this RPC. It does not
       // rerun result hooks (including evidence creation) from the first call.
       if (!entered) observeMcpToolResult({
         requestId: scope.requestId, tool: toolName,
         invocationId: scope.invocationId, result,
       });
+      else if (handlerResult !== undefined && result !== handlerResult) {
+        // The handler ran, but its final receipt could not be persisted and the
+        // client received OPERATION_OUTCOME_UNKNOWN. Log what the client got,
+        // not the handler's own "ok", or diagnostics contradict the response.
+        observeMcpToolResult({ requestId: scope.requestId, tool: toolName, invocationId: scope.invocationId, result });
+        const failure = toolFailureDiagnostic(result);
+        try { appendActivity({ kind: "tool", action: "tools/call", tool: toolName,
+          status: failure?.outcome_kind === "unknown" ? "unknown" : failure ? "error" : "ok",
+          duration_ms: elapsedMs(journalStartedAt), session_id: getMcpRequestIdentity()?.transportSessionId,
+          summary: failure?.error_summary || "outcome unknown after execution",
+          details: { invocation_id: scope.invocationId, canonical_lifecycle: true, journal_replaced_result: true, ...(failure ?? {}) } }); } catch {}
+      }
       return result;
     }));
   }

@@ -11,6 +11,7 @@ import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import isolation from "../desktop/scripts/lib/test-isolation.cjs";
 
 const sourceRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const distRoot = process.env.HARNESS_TEST_DIST_ROOT
@@ -20,7 +21,7 @@ const reportTarget = reportArgumentIndex >= 0
   ? process.argv[reportArgumentIndex + 1] : process.env.HARNESS_CU_SESSION_REPORT;
 const reportFile = reportTarget ? path.resolve(reportTarget) : undefined;
 const startedAt = new Date().toISOString();
-const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "harness-cu-persistence-"));
+const tempRoot = isolation.artifactRoot("computer-use-session-persistence");
 const workspace = path.join(tempRoot, "workspace");
 const otherWorkspace = path.join(tempRoot, "other-workspace");
 const environment = {

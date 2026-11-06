@@ -77,9 +77,16 @@
         : finish < 1 ? outcome < 0 ? "failed" : outcome === 1 ? "complete" : "uncertain" : "idle";
       return result;
     }
-    function status() { return { account, running, seen: seen.size, energy, phase: result.phase, destroyed: ended }; }
+    // The material clock is float32 on the GPU, so it steps visibly after
+    // days. Restart it only where the caller knows the jump cannot be seen.
+    function rebase(limit = 0) {
+      if (ended || !(flow > limit)) return false;
+      flow = 9; orbit[2] = flow;
+      return true;
+    }
+    function status() { return { account, running, seen: seen.size, energy, phase: result.phase, flow, destroyed: ended }; }
     function destroy() { reset(); ended = true; result.phase = "disposed"; }
-    return Object.freeze({ sync, event, sample, reset, status, destroy });
+    return Object.freeze({ sync, event, sample, reset, rebase, status, destroy });
   }
   global.AuraMotion = Object.freeze({ create });
   if (typeof module !== "undefined" && module.exports) module.exports = global.AuraMotion;

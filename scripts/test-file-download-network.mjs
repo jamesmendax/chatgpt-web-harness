@@ -23,7 +23,23 @@ await test('no-proxy-domain-and-port-respected',async()=>{assert.equal((await re
 await test('https-specific-system-proxy-used',async()=>assert.equal(parseWindowsFileProxy({...system,server:'http=127.0.0.1:8000;https=127.0.0.1:8001'},target).url,'http://127.0.0.1:8001'));
 await test('http-only-system-rule-does-not-proxy-https',async()=>assert.equal(parseWindowsFileProxy({...system,server:'http=127.0.0.1:8000'},target).mode,'direct'));
 await test('system-bypass-does-not-leak-to-other-domains',async()=>{assert.equal(parseWindowsFileProxy(system,new URL('https://a.example.org/')).mode,'direct');assert.equal(parseWindowsFileProxy(system,new URL('https://example.org.evil.test/')).mode,'proxy')});
-await test('PAC-fails-clearly-with-no-direct-fallback',async()=>assert.throws(()=>parseWindowsFileProxy({...system,pac:'https://proxy.example/pac'},target),/PAC_UNSUPPORTED/));
+// A PAC used to fail every download. It is read as text (never executed): its
+// named proxy wins, then the manual proxy, then a direct attempt.
+await test('PAC-uses-its-named-proxy-then-manual-then-direct',async()=>{
+  const pac={...system,pac:'http://127.0.0.1:7890/pac'};
+  assert.deepEqual(parseWindowsFileProxy(pac,target,'http://127.0.0.1:7891'),{mode:'proxy',source:'windows-pac',url:'http://127.0.0.1:7891'});
+  assert.equal(parseWindowsFileProxy(pac,target).url,'http://127.0.0.1:7890');
+  assert.equal(parseWindowsFileProxy({...pac,enabled:false},target).mode,'direct');
+  assert.deepEqual(await resolveFileProxy(target,{env:{},platform:'win32',readSystem:async()=>({...pac,enabled:false}),readPacProxy:async()=>'http://127.0.0.1:7897'}),{mode:'proxy',source:'windows-pac',url:'http://127.0.0.1:7897'});
+  assert.equal((await resolveFileProxy(target,{env:{},platform:'win32',readSystem:async()=>({...pac,enabled:false}),readPacProxy:async()=>{throw new Error('PAC unreachable')}})).mode,'direct');
+});
+await test('PAC-text-hint-reads-first-proxy-directive-without-running-it',async()=>{
+  const {pacProxyHint}=await import(pathToFileURL(path.join(dist,'lib/file-download-network.js')).href);
+  const file=path.join(root,'.validation','pac-hint-'+process.pid+'.pac');
+  await fs.mkdir(path.dirname(file),{recursive:true});
+  await fs.writeFile(file,'function FindProxyForURL(url,host){ if (isPlainHostName(host)) return "DIRECT"; return "PROXY 127.0.0.1:7890; DIRECT"; }');
+  try { assert.equal(await pacProxyHint(pathToFileURL(file).href),'http://127.0.0.1:7890'); } finally { await fs.rm(file,{force:true}); }
+});
 await test('proxy-credentials-and-unsupported-protocol-rejected',async()=>{for(const u of ['socks5://127.0.0.1:1080','http://user:password@127.0.0.1:7890','http://127.0.0.1:7890/path'])assert.throws(()=>validateFileProxy(u),/FILE_PROXY_INVALID/)});
 await test('disabled-system-proxy-means-direct',async()=>assert.equal(parseWindowsFileProxy({...system,enabled:false},target).mode,'direct'));
 await test('non-Windows-without-environment-does-not-read-registry',async()=>assert.equal((await resolveFileProxy(target,{env:{},platform:'linux',readSystem:()=>{throw Error('no registry')}})).mode,'direct'));

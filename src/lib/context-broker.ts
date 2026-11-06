@@ -8,6 +8,8 @@ import { createRuntimeScope, getRuntimeScope, runWithRuntimeScope } from "./runt
 import { readGoalRun, type GoalRunEnvelope, type GoalRunProjectionParity } from "./goal-run-store.js";
 import { renderGoalRunPolicyText } from "./goal-run-policy.js";
 import { advanceGoalWorkHistory, goalWorkHistoryIsStalled, goalWorkObservation, type GoalWorkHistory, type GoalWorkObservation } from "./goal-work-progress.js";
+import { getMcpRequestIdentity } from "./mcp-request-identity.js";
+import { BoundedContextCache, boundedCacheEnv } from "./bounded-context-cache.js";
 
 
 export interface BrokerEvidenceSummary {
@@ -151,10 +153,19 @@ function workspaceKey(workspaceRoot: string): string {
   return path.resolve(workspaceRoot).toLowerCase();
 }
 
-function scopeCacheKey(workspaceRoot: string, sessionId?: string): string {
-  const scope = getRuntimeScope();
-  return `${workspaceKey(workspaceRoot)}::${JSON.stringify([scope?.principalId ?? "local", scope?.tunnelProfile ?? "default", sessionId ?? "legacy"])}`;
+export interface HarnessContextNamespace {
+  principalId?: string;
+  tunnelProfile?: string;
 }
+
+function scopeCacheKey(workspaceRoot: string, sessionId?: string, namespace?: HarnessContextNamespace): string {
+  const scope = getRuntimeScope();
+  const owner = namespace ?? scope;
+  return `${workspaceKey(workspaceRoot)}::${JSON.stringify([owner?.principalId ?? "local", owner?.tunnelProfile ?? "default", sessionId ?? "legacy"])}`;
+}
+
+const contextCacheCapacity = () => boundedCacheEnv("HARNESS_CONTEXT_CACHE_MAX_ENTRIES", 256, 1, 4096);
+const contextCacheIdleMs = () => boundedCacheEnv("HARNESS_CONTEXT_CACHE_IDLE_MS", 30 * 60_000, 1, 7 * 24 * 60 * 60_000);
 
 function scopesOverlap(left: string[], right: string[]): boolean {
   return left.some((a) => right.some((b) => isPathWithinRoot(a, b) || isPathWithinRoot(b, a)));
@@ -223,7 +234,7 @@ async function loadCoreState(workspaceRoot: string, sessionId?: string): Promise
   return { goal, goalRun: goalRunRead.goalRun, goalRunError: goalRunRead.error, task, activeTaskId };
 }
 
-const coreStateCache = new Map<string, { expires: number; promise: Promise<CoreState> }>();
+const coreStateCache = new BoundedContextCache<{ expires: number; promise: Promise<CoreState> }>(contextCacheCapacity, contextCacheIdleMs);
 
 // Goal/task mutations drop the cache for their workspace immediately; the TTL
 // only bounds staleness from external file edits.
@@ -240,8 +251,11 @@ function getCachedCoreState(workspaceRoot: string, sessionId?: string): Promise<
   const cached = coreStateCache.get(key);
   if (cached && cached.expires > now) return cached.promise;
   const promise = loadCoreState(workspaceRoot, sessionId);
-  coreStateCache.set(key, { expires: now + stateCacheTtlMs(), promise });
-  void promise.catch(() => coreStateCache.delete(key));
+  const entry = { expires: now + stateCacheTtlMs(), promise };
+  coreStateCache.set(key, entry);
+  void promise.catch(() => {
+    if (coreStateCache.peek(key) === entry) coreStateCache.delete(key);
+  });
   return promise;
 }
 
@@ -254,14 +268,23 @@ interface EvidenceWindow {
   items: EvidenceWindowItem[];
   offset: number;
   repairs: number;
+  fileIdentity?: string;
 }
 
-const evidenceWindows = new Map<string, EvidenceWindow>();
+interface EvidenceWindowEntry { window: EvidenceWindow; pending?: Promise<EvidenceWindowItem[]> }
+const evidenceWindows = new BoundedContextCache<EvidenceWindowEntry>(contextCacheCapacity, contextCacheIdleMs);
 
 async function refreshEvidenceWindow(workspaceRoot: string, sessionId?: string): Promise<EvidenceWindowItem[]> {
   const key = scopeCacheKey(workspaceRoot, sessionId);
+  let entry = evidenceWindows.get(key);
+  if (entry?.pending) return entry.pending;
   const generation = harnessRepairCount(workspaceRoot);
-  const win = evidenceWindows.get(key) ?? { items: [], offset: 0, repairs: generation };
+  if (!entry) {
+    entry = { window: { items: [], offset: 0, repairs: generation } };
+    evidenceWindows.set(key, entry);
+  }
+  const currentEntry = entry;
+  const win = { ...entry.window, items: [...entry.window.items] };
   if (win.repairs !== generation) {
     // The log was rewritten (migration/repair/quarantine): byte offsets no
     // longer mean anything — rescan from the start.
@@ -269,8 +292,10 @@ async function refreshEvidenceWindow(workspaceRoot: string, sessionId?: string):
     win.offset = 0;
     win.repairs = generation;
   }
-  try {
-    const tail = await readHarnessEventTail(workspaceRoot, win.offset);
+  const pending = (async () => { try {
+    const tail = await readHarnessEventTail(workspaceRoot, win.offset, {
+      limit: EVIDENCE_WINDOW, type: "evidence/recorded", require_evidence_kind: true, file_identity: win.fileIdentity,
+    });
     if (tail.reset) win.items = [];
     for (const event of tail.events) {
       if (event.type !== "evidence/recorded" || !event.evidence_kind) continue;
@@ -285,12 +310,17 @@ async function refreshEvidenceWindow(workspaceRoot: string, sessionId?: string):
       });
     }
     win.offset = tail.next_offset;
+    win.fileIdentity = tail.file_identity;
     if (win.items.length > EVIDENCE_WINDOW) win.items = win.items.slice(-EVIDENCE_WINDOW);
-    evidenceWindows.set(key, win);
+    if (evidenceWindows.peek(key) === currentEntry) currentEntry.window = win;
   } catch {
     // Evidence is advisory; a failed incremental read keeps the last window.
   }
   return win.items;
+  })();
+  currentEntry.pending = pending;
+  try { return await pending; }
+  finally { if (currentEntry.pending === pending) currentEntry.pending = undefined; }
 }
 
 export async function buildHarnessRuntimeContext(
@@ -527,7 +557,9 @@ interface RetainedSnapshot {
   workHistory?: GoalWorkHistory;
 }
 
-const retainedByWorkspace = new Map<string, RetainedSnapshot>();
+interface RetentionSlot { snapshot?: RetainedSnapshot }
+const retainedByWorkspace = new BoundedContextCache<RetentionSlot>(contextCacheCapacity, contextCacheIdleMs);
+const pendingRetentionResets = new BoundedContextCache<true>(contextCacheCapacity, contextCacheIdleMs);
 
 /**
  * Typed evidence and snapshot revisions can change on every tool result even
@@ -597,8 +629,26 @@ function nextContinuationStreak(
  * retained text is unchanged — otherwise a new chat could stay blind to the
  * goal for up to the refresh interval.
  */
-export function resetHarnessSnapshotRetention(workspaceRoot: string, sessionId?: string): void {
-  retainedByWorkspace.delete(scopeCacheKey(workspaceRoot, sessionId));
+export function resetHarnessSnapshotRetention(
+  workspaceRoot: string, sessionId?: string, namespace?: HarnessContextNamespace
+): void {
+  retainedByWorkspace.delete(scopeCacheKey(workspaceRoot, sessionId, namespace));
+}
+
+/** A recovered transport has no trusted conversation identity until its first tool request. */
+export function requestHarnessSnapshotRetentionReset(
+  workspaceRoot: string, transportSessionId: string, namespace: HarnessContextNamespace
+): void {
+  pendingRetentionResets.set(scopeCacheKey(workspaceRoot, transportSessionId, namespace), true);
+}
+
+function consumeSnapshotRetentionReset(workspaceRoot: string, effectiveSessionId?: string): void {
+  const transport = getMcpRequestIdentity()?.transportSessionId;
+  if (!transport) return;
+  const pendingKey = scopeCacheKey(workspaceRoot, transport);
+  if (pendingRetentionResets.get(pendingKey) && pendingRetentionResets.delete(pendingKey)) {
+    resetHarnessSnapshotRetention(workspaceRoot, effectiveSessionId);
+  }
 }
 
 function withStructuredHarnessContext(result: unknown, context: HarnessRuntimeContext): unknown {
@@ -650,6 +700,19 @@ export async function appendHarnessRuntimeContextToResult(
   // Session scoping: the goal snapshot/tail only reaches the ChatGPT window
   // that owns (or is bound to) the active goal. Other windows are unaffected.
   const sessionId = getRuntimeScope()?.mcpSessionId;
+  consumeSnapshotRetentionReset(workspaceRoot, sessionId);
+  const key = scopeCacheKey(workspaceRoot, sessionId);
+  let slot = retainedByWorkspace.get(key);
+  if (!slot) {
+    slot = {};
+    retainedByWorkspace.set(key, slot);
+  }
+  const ownSlot = slot;
+  // Invalidation/eviction while the state read is in flight must not resurrect
+  // stale retention. This call can still deliver its own conservative snapshot.
+  const retain = (snapshot: RetainedSnapshot): void => {
+    if (retainedByWorkspace.peek(key) === ownSlot) ownSlot.snapshot = snapshot;
+  };
 
   let context: HarnessRuntimeContext;
   try {
@@ -659,7 +722,6 @@ export async function appendHarnessRuntimeContextToResult(
     return result;
   }
 
-  const key = scopeCacheKey(workspaceRoot, sessionId);
   // Keep visible active records concise; completed Goals do not make Task
   // completion or any additional tool call a delivery prerequisite.
   const activeNeedsWork = Boolean(
@@ -673,8 +735,8 @@ export async function appendHarnessRuntimeContextToResult(
     // It describes verification facts without requiring another tool call.
     if (!activeNeedsWork || !canCarryText) {
       if (!activeNeedsWork) {
-        const retained = retainedByWorkspace.get(key);
-        retainedByWorkspace.set(key, {
+        const retained = ownSlot.snapshot;
+        retain({
           text: retained?.text ?? "",
           at: retained?.at ?? 0,
           tailStreak: 0,
@@ -683,12 +745,12 @@ export async function appendHarnessRuntimeContextToResult(
       }
       return withStructured;
     }
-    const retained = retainedByWorkspace.get(key) ?? { text: "", at: 0, tailStreak: 0, progressKey: "" };
+    const retained = ownSlot.snapshot ?? { text: "", at: 0, tailStreak: 0, progressKey: "" };
     const next = nextContinuationStreak(context, retained, observation);
     retained.tailStreak = next.streak;
     retained.progressKey = next.progressKey;
-      retained.workHistory = next.workHistory;
-    retainedByWorkspace.set(key, retained);
+    retained.workHistory = next.workHistory;
+    retain(retained);
     return withTextEntry(withStructured, continuationTail(context, retained.tailStreak, {
       ...tailOptions,
       repeatedResults: next.workHistory?.repeated,
@@ -698,7 +760,7 @@ export async function appendHarnessRuntimeContextToResult(
   }
 
   const text = formatHarnessRuntimeContext(context);
-  const retained = retainedByWorkspace.get(key);
+  const retained = ownSlot.snapshot;
   const cleared = text === CLEARED_TEXT;
   let inject: boolean;
   if (cleared) {
@@ -719,10 +781,9 @@ export async function appendHarnessRuntimeContextToResult(
       if (retained) {
         retained.tailStreak = next.streak;
         retained.progressKey = next.progressKey;
-      retained.workHistory = next.workHistory;
+        retained.workHistory = next.workHistory;
       }
-      retainedByWorkspace.set(
-        key,
+      retain(
         retained ?? { text, at: Date.now(), tailStreak: next.streak, progressKey: next.progressKey, workHistory: next.workHistory }
       );
       return withTextEntry(result, continuationTail(context, next.streak, {
@@ -737,7 +798,7 @@ export async function appendHarnessRuntimeContextToResult(
 
   const next = nextContinuationStreak(context, retained, observation);
   const tailStreak = activeNeedsWork && canCarryText ? next.streak : 0;
-  retainedByWorkspace.set(key, {
+  retain({
     text,
     at: Date.now(),
     tailStreak,

@@ -195,7 +195,11 @@ try {
   assert.equal((await invoke("process_input", { id: startedSession.id, text: "session-ok", append_newline: true }, scopeSession())).accepted, true);
   await waitFor(startedSession.id, scopeSession(), (value) => value.stdout.includes("ECHO:session-ok"));
   await deny("process_output", { id: startedSession.id }, scope(undefined, "another-session"));
-  await deny("process_input", { id: startedSession.id, text: "forbidden-new-goal" }, scope("new-goal", "session-without-goal"));
+  // The same conversation keeps control of its own process after it creates a Goal.
+  assert.equal((await invoke("process_input", { id: startedSession.id, text: "same-session-new-goal", append_newline: true }, scope("new-goal", "session-without-goal"))).accepted, true);
+  await waitFor(startedSession.id, scope("new-goal", "session-without-goal"), (value) => value.stdout.includes("ECHO:same-session-new-goal"));
+  assert.equal((await invoke("process_status", { id: startedSession.id }, scope("new-goal", "session-without-goal"))).processes.length, 1);
+  await deny("process_input", { id: startedSession.id, text: "forbidden-other-session-goal" }, scope("new-goal", "another-session"));
   await deny("stop_process", { id: startedSession.id, force: true }, scopeA());
   assert.deepEqual((await invoke("process_status", { id: startedSession.id }, scopeA())).processes, []);
   await deny("start_process", { command: commandFor(childPath), working_directory: sandbox }, scope(undefined, ""), /PROCESS_SCOPE_REQUIRED/);

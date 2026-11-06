@@ -161,3 +161,37 @@ test("repeated unchanged service status does not starve an in-flight poll", asyn
     assert.equal(events.length, 1);
   } finally { client.getJson = original; }
 });
+
+test("a tunnel log response cut off mid-body settles the poll instead of hanging the feed", async () => {
+  const http = require("node:http");
+  const server = http.createServer((_req, res) => {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.write('{"events":[{"seq":1,');
+    setTimeout(() => res.socket.destroy(), 20);
+  });
+  await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const feed = new ActivityFeeds();
+    feed.configure({ adminPort: 0, tunnelPort: server.address().port, adminToken: "" });
+    const settled = await Promise.race([feed.pollTunnelLogs().then(() => true), new Promise(resolve => setTimeout(() => resolve(false), 5000).unref())]);
+    assert.equal(settled, true, "the poll must settle when the body is cut off");
+  } finally { server.closeAllConnections?.(); await new Promise(resolve => server.close(resolve)); }
+});
+
+test("after tunnel-client restarts, its log sequence starting again from 1 is shown, not hidden", async () => {
+  const http = require("node:http");
+  let events = [{ seq: 100, message: "before restart" }];
+  const server = http.createServer((_req, res) => { res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify({ events })); });
+  await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const feed = new ActivityFeeds(), shown = [];
+    feed.on("lines", ({ name, lines }) => { if (name === "tunnel") shown.push(...lines); });
+    feed.configure({ adminPort: 0, tunnelPort: server.address().port, adminToken: "" });
+    await feed.pollTunnelLogs();
+    assert.equal(feed.lastTunnelSeq, 100);
+    events = [{ seq: 1, message: "after restart" }, { seq: 2, message: "connected again" }];
+    await feed.pollTunnelLogs();
+    assert.ok(shown.some(line => /after restart/.test(line)) && shown.some(line => /connected again/.test(line)), JSON.stringify(shown));
+    assert.equal(feed.lastTunnelSeq, 2);
+  } finally { await new Promise(resolve => server.close(resolve)); }
+});
